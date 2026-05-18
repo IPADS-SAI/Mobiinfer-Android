@@ -17,7 +17,7 @@
 struct MiniCPMLM {
     struct llama_model   * model = nullptr;
     struct llama_context * ctx   = nullptr;
-    struct llama_vocab   * vocab = nullptr;
+    const struct llama_vocab * vocab = nullptr;
 
     int n_embd    = 0;   // 2048
     int n_layer   = 0;   // 28
@@ -33,6 +33,9 @@ struct MiniCPMLM {
 
     // Context parameters
     struct llama_context_params cparams;
+
+    // Number of output embeddings/logits produced by the last decode call.
+    int last_n_outputs = 0;
 
     /**
      * Initialize from GGUF file.

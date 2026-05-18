@@ -29,6 +29,8 @@ bool MiniCPMLM::init(const std::string & path, int n_gpu_layers) {
     n_head    = llama_model_n_head(model);
     n_kv_head = llama_model_n_head_kv(model);
     head_dim  = n_embd / n_head;    // 2048 / 16 = 128
+    vocab     = llama_model_get_vocab(model);
+    n_vocab   = vocab ? llama_vocab_n_tokens(vocab) : 0;
 
     LOG_INF("MiniCPMLM: n_embd=%d, n_layer=%d, n_head=%d, n_kv_head=%d, head_dim=%d\n",
             n_embd, n_layer, n_head, n_kv_head, head_dim);
@@ -69,7 +71,7 @@ bool MiniCPMLM::ensure_batch_size(int n_tokens, bool is_embd) {
 bool MiniCPMLM::prefill(const float * embd, int n_tokens, int n_past) {
     if (!ctx || !embd || n_tokens <= 0) {
         LOG_ERR("prefill: invalid args (ctx=%p, embd=%p, n_tokens=%d)\n",
-                (void*)ctx, (void*)embd, n_tokens);
+                (void *) ctx, (const void *) embd, n_tokens);
         return false;
     }
 
@@ -98,6 +100,7 @@ bool MiniCPMLM::prefill(const float * embd, int n_tokens, int n_past) {
         return false;
     }
 
+    last_n_outputs = n_tokens;
     return true;
 }
 
@@ -125,6 +128,7 @@ bool MiniCPMLM::decode_step(const float * embd, int n_past) {
         return false;
     }
 
+    last_n_outputs = 1;
     return true;
 }
 
@@ -133,7 +137,7 @@ std::vector<float> MiniCPMLM::get_last_hidden() const {
         return {};
     }
 
-    const float * embd_out = llama_get_embeddings(ctx);
+    const float * embd_out = llama_get_embeddings_ith(ctx, -1);
     if (!embd_out) {
         return {};
     }
@@ -144,7 +148,18 @@ std::vector<float> MiniCPMLM::get_last_hidden() const {
 }
 
 std::vector<float> MiniCPMLM::get_all_hidden() const {
-    return get_last_hidden();
+    if (!ctx || last_n_outputs <= 0) {
+        return {};
+    }
+
+    const float * embd_out = llama_get_embeddings(ctx);
+    if (!embd_out) {
+        return {};
+    }
+
+    std::vector<float> result(static_cast<size_t>(n_embd) * static_cast<size_t>(last_n_outputs));
+    memcpy(result.data(), embd_out, result.size() * sizeof(float));
+    return result;
 }
 
 std::vector<float> MiniCPMLM::get_logits() const {
@@ -152,7 +167,7 @@ std::vector<float> MiniCPMLM::get_logits() const {
         return {};
     }
 
-    float * logits = llama_get_logits(ctx);
+    float * logits = llama_get_logits_ith(ctx, -1);
     if (!logits) {
         return {};
     }
@@ -165,14 +180,18 @@ std::vector<float> MiniCPMLM::get_logits() const {
 }
 
 void MiniCPMLM::clear_kv_cache() {
-    // KV cache clearing is handled at the omni level
+    if (ctx) {
+        llama_memory_clear(llama_get_memory(ctx), true);
+    }
+    last_n_outputs = 0;
 }
 
 int MiniCPMLM::get_kv_cache_size() const {
     if (!ctx) {
         return 0;
     }
-    return 0;
+    const llama_pos max_pos = llama_memory_seq_pos_max(llama_get_memory(ctx), 0);
+    return max_pos < 0 ? 0 : static_cast<int>(max_pos + 1);
 }
 
 void MiniCPMLM::free() {
@@ -188,4 +207,7 @@ void MiniCPMLM::free() {
         llama_model_free(model);
         model = nullptr;
     }
+    vocab = nullptr;
+    n_vocab = 0;
+    last_n_outputs = 0;
 }

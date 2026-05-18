@@ -94,6 +94,56 @@ endif()
 target_link_libraries  (${TARGET} PRIVATE common omni Threads::Threads)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
+# VoxCPM2 MiniCPMLM wrapper (shared with omni and test)
+add_library(voxcpm2_llm STATIC
+    voxcpm2/voxcpm2_llm.cpp
+    voxcpm2/voxcpm2_llm.h
+)
+target_link_libraries     (voxcpm2_llm PUBLIC llama common)
+target_include_directories(voxcpm2_llm PUBLIC  . voxcpm2)
+target_include_directories(voxcpm2_llm PRIVATE ../..)
+target_compile_features   (voxcpm2_llm PRIVATE cxx_std_17)
+
+# VoxCPM2 FSQ module
+add_library(voxcpm2_fsq STATIC
+    voxcpm2/voxcpm2_fsq.cpp
+    voxcpm2/voxcpm2_fsq.h
+)
+target_link_libraries     (voxcpm2_fsq PUBLIC ggml common)
+target_include_directories(voxcpm2_fsq PUBLIC  . voxcpm2)
+target_include_directories(voxcpm2_fsq PRIVATE ../..)
+target_compile_features   (voxcpm2_fsq PRIVATE cxx_std_17)
+
+# VoxCPM2 acoustic transformer helpers (LocEnc / LocDiT)
+add_library(voxcpm2_acoustic STATIC
+    voxcpm2/voxcpm2_transformer.cpp
+    voxcpm2/voxcpm2_transformer.h
+    voxcpm2/voxcpm2_localenc.cpp
+    voxcpm2/voxcpm2_localenc.h
+    voxcpm2/voxcpm2_locdit.cpp
+    voxcpm2/voxcpm2_locdit.h
+    voxcpm2/voxcpm2_cfm.cpp
+    voxcpm2/voxcpm2_cfm.h
+    voxcpm2/voxcpm2_components.cpp
+    voxcpm2/voxcpm2_components.h
+    voxcpm2/voxcpm2_audiovae.cpp
+    voxcpm2/voxcpm2_audiovae.h
+)
+target_link_libraries     (voxcpm2_acoustic PUBLIC ggml common)
+target_include_directories(voxcpm2_acoustic PUBLIC  . voxcpm2)
+target_include_directories(voxcpm2_acoustic PRIVATE ../..)
+target_compile_features   (voxcpm2_acoustic PRIVATE cxx_std_17)
+
+# VoxCPM2 integrated runtime
+add_library(voxcpm2_runtime STATIC
+    voxcpm2/voxcpm2_runtime.cpp
+    voxcpm2/voxcpm2_runtime.h
+)
+target_link_libraries     (voxcpm2_runtime PUBLIC voxcpm2_llm voxcpm2_fsq voxcpm2_acoustic llama ggml common)
+target_include_directories(voxcpm2_runtime PUBLIC  . voxcpm2)
+target_include_directories(voxcpm2_runtime PRIVATE ../..)
+target_compile_features   (voxcpm2_runtime PRIVATE cxx_std_17)
+
 # 双工模式测试
 set(TARGET_DUPLEX_TEST llama-omni-test-duplex)
 add_executable         (${TARGET_DUPLEX_TEST} test/test-duplex.cpp)

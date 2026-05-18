@@ -425,8 +425,19 @@ bool voxcpm2_bind_transformer_weights(const std::unordered_map<std::string, ggml
 
     weights.layers.assign(static_cast<size_t>(cfg.n_layer), {});
 
-    if (!bind_tensor(tensors, prefix + ".norm.weight", &weights.norm)) {
-        return false;
+    {
+        const std::string norm_name        = prefix + ".norm.weight";
+        const std::string output_norm_name = prefix + ".output_norm.weight";
+        const auto        norm_it          = tensors.find(norm_name);
+        const auto        output_norm_it   = tensors.find(output_norm_name);
+        if (norm_it != tensors.end()) {
+            weights.norm = norm_it->second;
+        } else if (output_norm_it != tensors.end()) {
+            weights.norm = output_norm_it->second;
+        } else {
+            LOG_ERR("VoxCPM2Transformer: missing tensor %s or %s\n", norm_name.c_str(), output_norm_name.c_str());
+            return false;
+        }
     }
 
     bool ok = true;
