@@ -337,16 +337,9 @@ def export_baselm(sf: SafeTensorFile, config: dict, output_path: str):
     gguf_writer.add_tensor("output_norm.weight",
                            to_f32_if_norm("output_norm.weight", sf.get_tensor("base_lm.norm.weight")))
 
-    # LongRoPE global factors — DISABLED
-    # llama.cpp MINICPM loader creates per-layer rope tensors (blk.{i}.rope_factors_long.weight)
-    # but the GGUF stores them as global (rope_factors_long), causing name mismatch.
-    # The rope factors are embedded in the model config and computed at runtime.
-    # if long_factors:
-    #     rope_long = np.array(long_factors, dtype=np.float32)
-    #     gguf_writer.add_tensor("rope_factors_long", rope_long)
-    # if short_factors:
-    #     rope_short = np.array(short_factors, dtype=np.float32)
-    #     gguf_writer.add_tensor("rope_factors_short", rope_short)
+    # Store LongRoPE factors as GGUF metadata (not tensors) to avoid per-layer
+    # naming mismatch with llama.cpp's MiniCPM loader. VoxCPM2Transformer reads
+    # them from these metadata keys, falling back to hardcoded defaults if absent.
 
     # Per-layer tensors
     for i in range(n_layer):
@@ -443,6 +436,13 @@ def export_acoustic(sf: SafeTensorFile, vae_state_dict: dict, config: dict, outp
     if sr_bins:
         gguf_writer.add_array("voxcpm2.audiovae.sr_bin_boundaries", list(sr_bins))
     gguf_writer.add_string("voxcpm2.audiovae.cond_type", vae_cfg.get('cond_type', 'scale_bias'))
+
+    # LongRoPE frequency factors for LocEnc/LocDiT (read from lm_config)
+    rope_scaling = lm_cfg.get('rope_scaling', None)
+    if rope_scaling and rope_scaling.get('type') == 'longrope':
+        long_factors = rope_scaling.get('long_factor', None)
+        if long_factors:
+            gguf_writer.add_array("voxcpm2.rope.long_factor", [float(v) for v in long_factors])
 
     print("  Writing acoustic tensors...")
 
