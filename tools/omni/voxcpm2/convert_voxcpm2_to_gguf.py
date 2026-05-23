@@ -167,6 +167,22 @@ def to_f32_if_norm(name: str, tensor: np.ndarray) -> np.ndarray:
     return tensor
 
 
+def ensure_dtype(name: str, tensor: np.ndarray, target_dtype: str) -> np.ndarray:
+    """Convert tensor to target dtype, with norm tensors always forced to F32.
+
+    Norm tensors must be F32 due to ggml binary_op constraint:
+    ggml_mul(f32_rms_out, weight) requires weight to be F32.
+    """
+    # Always force norm tensors to F32
+    tensor = to_f32_if_norm(name, tensor)
+
+    # For non-norm tensors, convert to target dtype if needed
+    target_np = np.float16 if target_dtype == "f16" else np.float32
+    if tensor.dtype != target_np and "norm" not in name.lower() and "rms" not in name.lower():
+        tensor = tensor.astype(target_np)
+    return tensor
+
+
 # ==============================================================================
 # BF16 conversion helper
 # ==============================================================================
@@ -345,8 +361,9 @@ def _write_voxcpm2_tokenizer(
 class SafeTensorFile:
     """Lightweight safetensors reader that doesn't require torch."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, target_dtype: str = "f16"):
         self.path = path
+        self.target_dtype = target_dtype  # "f16" or "f32"
         self._file = open(path, "rb")
         header_size = struct.unpack("<Q", self._file.read(8))[0]
         self.header = json.loads(self._file.read(header_size).decode("utf-8"))
@@ -386,10 +403,18 @@ class SafeTensorFile:
         if dtype == "F32":
             return np.frombuffer(raw, dtype=np.float32).reshape(shape).copy()
         elif dtype == "F16":
-            return np.frombuffer(raw, dtype=np.float16).reshape(shape).copy()
+            data = np.frombuffer(raw, dtype=np.float16).reshape(shape).copy()
+            if self.target_dtype == "f32":
+                return data.astype(np.float32)
+            return data
         elif dtype == "BF16":
             data = np.frombuffer(raw, dtype=np.uint16).reshape(shape).copy()
-            return bf16_to_f16(data)
+            # Convert BF16 → F32 or BF16 → F16
+            as_uint32 = data.astype(np.uint32) << 16
+            as_f32 = as_uint32.view(np.float32)
+            if self.target_dtype == "f16":
+                return as_f32.astype(np.float16)
+            return as_f32
         elif dtype == "I32":
             return np.frombuffer(raw, dtype=np.int32).reshape(shape).copy()
         elif dtype == "I64":
@@ -405,7 +430,7 @@ class SafeTensorFile:
 # BaseLM GGUF writer
 # ==============================================================================
 def export_baselm(
-    sf: SafeTensorFile, config: dict, output_path: str, tokenizer_dir: str
+    sf: SafeTensorFile, config: dict, output_path: str, tokenizer_dir: str, dtype: str = "f16"
 ):
     """Export BaseLM (28-layer causal decoder) as standard LLM_ARCH_MINICPM GGUF."""
     lm_cfg = config["lm_config"]
@@ -423,12 +448,15 @@ def export_baselm(
     scale_emb = lm_cfg.get("scale_emb", 12)
     dim_model_base = lm_cfg.get("dim_model_base", 256)
     scale_depth = lm_cfg.get("scale_depth", 1.4)
-    use_mup = lm_cfg.get("use_mup", False)
     rope_scaling = lm_cfg.get("rope_scaling", None)
 
     # Compute derived params
     f_embedding_scale = float(scale_emb)
-    f_residual_scale = (scale_depth / np.sqrt(float(n_layer))) if use_mup else 0.0
+    # llama.cpp's MiniCPM graph applies this residual scale whenever the
+    # metadata value is non-zero, and its built-in MiniCPM default is 1.4/sqrt(n_layer).
+    # Do not gate this on HF use_mup, or a newly exported GGUF overrides the
+    # working llama.cpp default with 0.0 and changes BaseLM hidden states.
+    f_residual_scale = scale_depth / np.sqrt(float(n_layer))
     f_logit_scale = dim_model_base / n_embd
 
     print(
@@ -492,9 +520,9 @@ def export_baselm(
 
     # Embedding
     embed = sf.get_tensor("base_lm.embed_tokens.weight")  # [vocab, embd]
-    gguf_writer.add_tensor("token_embd.weight", embed)
+    gguf_writer.add_tensor("token_embd.weight", ensure_dtype("token_embd.weight", embed, dtype))
     # lm_head tied with embedding → duplicate as output.weight
-    gguf_writer.add_tensor("output.weight", embed)
+    gguf_writer.add_tensor("output.weight", ensure_dtype("output.weight", embed, dtype))
     # Final norm (F32 to avoid ggml f32×f16 type mismatch in build_norm)
     gguf_writer.add_tensor(
         "output_norm.weight",
@@ -518,19 +546,19 @@ def export_baselm(
         )
         gguf_writer.add_tensor(
             f"{gguf_prefix}.attn_q.weight",
-            sf.get_tensor(f"{pt_prefix}.self_attn.q_proj.weight"),
+            ensure_dtype("attn_q.weight", sf.get_tensor(f"{pt_prefix}.self_attn.q_proj.weight"), dtype),
         )
         gguf_writer.add_tensor(
             f"{gguf_prefix}.attn_k.weight",
-            sf.get_tensor(f"{pt_prefix}.self_attn.k_proj.weight"),
+            ensure_dtype("attn_k.weight", sf.get_tensor(f"{pt_prefix}.self_attn.k_proj.weight"), dtype),
         )
         gguf_writer.add_tensor(
             f"{gguf_prefix}.attn_v.weight",
-            sf.get_tensor(f"{pt_prefix}.self_attn.v_proj.weight"),
+            ensure_dtype("attn_v.weight", sf.get_tensor(f"{pt_prefix}.self_attn.v_proj.weight"), dtype),
         )
         gguf_writer.add_tensor(
             f"{gguf_prefix}.attn_output.weight",
-            sf.get_tensor(f"{pt_prefix}.self_attn.o_proj.weight"),
+            ensure_dtype("attn_output.weight", sf.get_tensor(f"{pt_prefix}.self_attn.o_proj.weight"), dtype),
         )
         gguf_writer.add_tensor(
             f"{gguf_prefix}.ffn_norm.weight",
@@ -541,15 +569,15 @@ def export_baselm(
         )
         gguf_writer.add_tensor(
             f"{gguf_prefix}.ffn_gate.weight",
-            sf.get_tensor(f"{pt_prefix}.mlp.gate_proj.weight"),
+            ensure_dtype("ffn_gate.weight", sf.get_tensor(f"{pt_prefix}.mlp.gate_proj.weight"), dtype),
         )
         gguf_writer.add_tensor(
             f"{gguf_prefix}.ffn_up.weight",
-            sf.get_tensor(f"{pt_prefix}.mlp.up_proj.weight"),
+            ensure_dtype("ffn_up.weight", sf.get_tensor(f"{pt_prefix}.mlp.up_proj.weight"), dtype),
         )
         gguf_writer.add_tensor(
             f"{gguf_prefix}.ffn_down.weight",
-            sf.get_tensor(f"{pt_prefix}.mlp.down_proj.weight"),
+            ensure_dtype("ffn_down.weight", sf.get_tensor(f"{pt_prefix}.mlp.down_proj.weight"), dtype),
         )
 
         # Per-layer LongRoPE factors — DISABLED
@@ -582,7 +610,7 @@ def export_baselm(
 # Acoustic GGUF writer
 # ==============================================================================
 def export_acoustic(
-    sf: SafeTensorFile, vae_state_dict: dict, config: dict, output_path: str
+    sf: SafeTensorFile, vae_state_dict: dict, config: dict, output_path: str, dtype: str = "f16"
 ):
     """Export acoustic components as custom voxcpm2-acoustic GGUF."""
     lm_cfg = config["lm_config"]
@@ -833,7 +861,7 @@ def export_acoustic(
     )
 
     # ---- AudioVAE (from audiovae.pth) ----
-    _write_audiovae_weights(gguf_writer, vae_state_dict, vae_cfg)
+    _write_audiovae_weights(gguf_writer, vae_state_dict, vae_cfg, dtype)
 
     gguf_writer.open_output_file(Path(output_path))
     gguf_writer.write_header_to_file()
@@ -843,9 +871,10 @@ def export_acoustic(
     print(f"  → {output_path}")
 
 
-def _write_audiovae_weights(gguf_writer: GGUFWriter, state_dict: dict, vae_cfg: dict):
+def _write_audiovae_weights(gguf_writer: GGUFWriter, state_dict: dict, vae_cfg: dict, dtype: str = "f16"):
     """Write AudioVAE weights, merging weight_norm (weight_g + weight_v) to single tensors."""
     print("  Writing AudioVAE weights (merging weight_norm)...")
+    target_np = np.float16 if dtype == "f16" else np.float32
 
     encoder_dim = vae_cfg.get("encoder_dim", 128)
     decoder_dim = vae_cfg.get("decoder_dim", 2048)
@@ -890,21 +919,21 @@ def _write_audiovae_weights(gguf_writer: GGUFWriter, state_dict: dict, vae_cfg: 
         if "weight_g" in parts and "weight_v" in parts:
             # Merge weight_norm
             merged = merge_weight_norm(parts["weight_g"], parts["weight_v"])
-            merged = merged.astype(np.float16)
+            merged = merged.astype(target_np)
             gguf_writer.add_tensor(gguf_name, merged)
             written.add(base_name)
         elif "weight" in parts:
-            gguf_writer.add_tensor(gguf_name, parts["weight"].astype(np.float16))
+            gguf_writer.add_tensor(gguf_name, parts["weight"].astype(target_np))
             written.add(base_name)
         elif "direct" in parts:
-            gguf_writer.add_tensor(gguf_name, parts["direct"].astype(np.float16))
+            gguf_writer.add_tensor(gguf_name, parts["direct"].astype(target_np))
             written.add(base_name)
 
         # Bias
         if "bias" in parts:
             bias_key = base_name + ".bias" if base_name in written else base_name
             gguf_name_bias = map_audiovae_key(base_name) + ".bias"
-            gguf_writer.add_tensor(gguf_name_bias, parts["bias"].astype(np.float16))
+            gguf_writer.add_tensor(gguf_name_bias, parts["bias"].astype(target_np))
 
         # Alpha (Snake activation parameter)
         if "alpha" in parts:
@@ -913,7 +942,7 @@ def _write_audiovae_weights(gguf_writer: GGUFWriter, state_dict: dict, vae_cfg: 
             if alpha_tensor.ndim == 1:
                 alpha_tensor = alpha_tensor[:, np.newaxis]
             gguf_name_alpha = map_audiovae_key(base_name) + ".alpha"
-            gguf_writer.add_tensor(gguf_name_alpha, alpha_tensor.astype(np.float16))
+            gguf_writer.add_tensor(gguf_name_alpha, alpha_tensor.astype(target_np))
 
     print(
         f"    Wrote {len(written)} AudioVAE weight tensors (incl. merged weight_norm)"
@@ -938,7 +967,16 @@ def main():
         default=None,
         help="Directory containing tokenizer.json/tokenizer_config.json (default: directory of --config)",
     )
+    parser.add_argument(
+        "--dtype",
+        default="f16",
+        choices=["f16", "f32"],
+        help="Output weight dtype (default: f16). Use f32 for quantization input.",
+    )
     args = parser.parse_args()
+
+    dtype = args.dtype
+    dtype_upper = dtype.upper()
 
     os.makedirs(args.output, exist_ok=True)
 
@@ -946,10 +984,11 @@ def main():
     with open(args.config, "r") as f:
         config = json.load(f)
     print(f"Architecture: {config.get('architecture', 'unknown')}")
+    print(f"Output dtype: {dtype}")
 
     # Load model tensors
     print(f"Loading safetensors: {args.model}")
-    sf = SafeTensorFile(args.model)
+    sf = SafeTensorFile(args.model, target_dtype=dtype)
     print(f"  {len(sf.keys())} tensors")
 
     # Load AudioVAE
@@ -961,14 +1000,14 @@ def main():
 
     # Export BaseLM
     print("\n=== Exporting BaseLM ===")
-    base_lm_path = os.path.join(args.output, "VoxCPM2-BaseLM-F16.gguf")
+    base_lm_path = os.path.join(args.output, f"VoxCPM2-BaseLM-{dtype_upper}.gguf")
     tokenizer_dir = args.tokenizer_dir or os.path.dirname(os.path.abspath(args.config))
-    export_baselm(sf, config, base_lm_path, tokenizer_dir)
+    export_baselm(sf, config, base_lm_path, tokenizer_dir, dtype)
 
     # Export Acoustic
     print("\n=== Exporting Acoustic ===")
-    acoustic_path = os.path.join(args.output, "VoxCPM2-Acoustic-F16.gguf")
-    export_acoustic(sf, vae_state_dict, config, acoustic_path)
+    acoustic_path = os.path.join(args.output, f"VoxCPM2-Acoustic-{dtype_upper}.gguf")
+    export_acoustic(sf, vae_state_dict, config, acoustic_path, dtype)
 
     sf.close()
 

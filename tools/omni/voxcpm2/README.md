@@ -11,13 +11,58 @@ cd tools/omni/voxcpm2
 pip install torch safetensors numpy gguf
 
 python convert_voxcpm2_to_gguf.py \
-    --model-dir /path/to/VoxCPM2 \
-    --output-dir /path/to/output
+    --model /path/to/model.safetensors \
+    --vae /path/to/audiovae.pth \
+    --config /path/to/config.json \
+    --output /path/to/output
 ```
 
-Produces two files:
+By default, this produces F16 GGUF files (~4.7GB total):
 - `VoxCPM2-BaseLM-F16.gguf` — BaseLM (28 layers, ~3.0GB)
 - `VoxCPM2-Acoustic-F16.gguf` — ResidualLM + LocEnc + LocDiT + FSQ + AudioVAE + Projections (~1.7GB)
+
+To produce F32 GGUF files (needed for quantization):
+
+```bash
+python convert_voxcpm2_to_gguf.py \
+    --model /path/to/model.safetensors \
+    --vae /path/to/audiovae.pth \
+    --config /path/to/config.json \
+    --output /path/to/output \
+    --dtype f32
+```
+
+## BaseLM Quantization (Q8_0)
+
+The BaseLM GGUF can be quantized to Q8_0 to reduce model size by ~2x with minimal quality loss. Quantization requires F32 input:
+
+```bash
+# 1. Convert to F32
+python convert_voxcpm2_to_gguf.py \
+    --model /path/to/model.safetensors \
+    --vae /path/to/audiovae.pth \
+    --config /path/to/config.json \
+    --output ./gguf \
+    --dtype f32
+
+# 2. Build llama-quantize if not already built
+cmake --build build -j$(nproc) --target llama-quantize
+
+# 3. Quantize BaseLM to Q8_0 (~1.5GB vs ~3.0GB F16)
+./build/bin/llama-quantize \
+    ./gguf/VoxCPM2-BaseLM-F32.gguf \
+    ./gguf/VoxCPM2-BaseLM-Q8_0.gguf \
+    Q8_0
+
+# 4. Run inference with quantized BaseLM
+./build/bin/voxcpm2-cli \
+    -t "Hello, welcome to VoxCPM2." \
+    -o output.wav \
+    ./gguf/VoxCPM2-BaseLM-Q8_0.gguf \
+    ./gguf/VoxCPM2-Acoustic-F32.gguf
+```
+
+**Note**: `llama-quantize` supports Q8_0 but not Q8_K. Q8_0 provides near-identical quality to F16 for BaseLM inference (~3.0GB → ~1.5GB).
 
 ## Build
 
