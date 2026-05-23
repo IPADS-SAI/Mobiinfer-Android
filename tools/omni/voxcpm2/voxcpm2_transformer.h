@@ -83,6 +83,47 @@ struct VoxCPM2TransformerWeights {
     }
 };
 
+// Lightweight KV cache for VoxCPM2 ResidualLM.
+//
+// ResidualLM shares the same architecture as MiniCPM but with no_rope=true.
+// Because it is loaded standalone via VoxCPM2GGUFWeightStore (not through llama_model / llama_decode), it cannot reuse the framework's llama_memory KV cache — hence this custom implementation.
+//
+// TODO: consider merging ResidualLM into the framework's modeling layer so it
+// can share the native KV cache and graph-building infrastructure.
+//
+// Layout: K/V [head_dim, n_kv_heads, max_length] per layer — aligned with
+// projection output so get_k_write uses standard strides (no custom stride swap).
+struct VoxCPM2KVCache {
+    int n_layer    = 0;
+    int n_kv_heads = 0;
+    int max_length = 0;
+    int head_dim   = 0;
+
+    std::vector<ggml_tensor *> k_caches;  // per-layer, [head_dim, max_length, n_kv_heads]
+    std::vector<ggml_tensor *> v_caches;
+
+    ggml_context *        ctx_kv = nullptr;
+    ggml_backend_buffer_t buf_kv = nullptr;
+
+    VoxCPM2KVCache() = default;
+    ~VoxCPM2KVCache();
+
+    VoxCPM2KVCache(const VoxCPM2KVCache &)             = delete;
+    VoxCPM2KVCache & operator=(const VoxCPM2KVCache &) = delete;
+
+    bool init(int n_layer, int n_kv_heads, int max_length, int head_dim, ggml_backend_t backend);
+    void clear();
+    void free();
+
+    // View into past K/V for attention: [head_dim, seq_len, n_kv_heads] (via permute)
+    ggml_tensor * get_k(ggml_context * ctx, int layer, int seq_len) const;
+    ggml_tensor * get_v(ggml_context * ctx, int layer, int seq_len) const;
+
+    // Write slot for new K/V: [head_dim, n_kv_heads, n_tokens] (standard strides)
+    ggml_tensor * get_k_write(ggml_context * ctx, int layer, int start, int n_tokens) const;
+    ggml_tensor * get_v_write(ggml_context * ctx, int layer, int start, int n_tokens) const;
+};
+
 int voxcpm2_infer_layer_count(const std::unordered_map<std::string, ggml_tensor *> & tensors,
                               const std::string &                                    prefix);
 
@@ -121,3 +162,20 @@ ggml_tensor * voxcpm2_transformer_forward(ggml_context *                    ctx,
                                           ggml_tensor *                     input,
                                           ggml_tensor *                     positions      = nullptr,
                                           ggml_tensor *                     attention_mask = nullptr);
+
+// Single-token decode step with KV cache (for ResidualLM incremental decode).
+// Processes 1 token at `position`, writes K/V to cache, attends to [0..position].
+ggml_tensor * voxcpm2_transformer_forward_step(ggml_context *                    ctx,
+                                               const VoxCPM2TransformerConfig &  cfg,
+                                               const VoxCPM2TransformerWeights & weights,
+                                               ggml_tensor *                     input,
+                                               int                               position,
+                                               VoxCPM2KVCache &                  kv_cache);
+
+// Multi-token prefill with KV cache (populates cache positions 0..n_tokens-1).
+ggml_tensor * voxcpm2_transformer_forward_prefill(ggml_context *                    ctx,
+                                                  const VoxCPM2TransformerConfig &  cfg,
+                                                  const VoxCPM2TransformerWeights & weights,
+                                                  ggml_tensor *                     input,
+                                                  int                               n_tokens,
+                                                  VoxCPM2KVCache &                  kv_cache);

@@ -688,3 +688,261 @@ ggml_tensor * voxcpm2_transformer_forward(ggml_context *                    ctx,
 
     return rms_norm(ctx, hidden, weights.norm, cfg.rms_norm_eps);
 }
+
+// ---------------------------------------------------------------------------
+// VoxCPM2KVCache
+// ---------------------------------------------------------------------------
+
+VoxCPM2KVCache::~VoxCPM2KVCache() {
+    free();
+}
+
+bool VoxCPM2KVCache::init(int n_layer_in, int n_kv_heads_in, int max_length_in, int head_dim_in,
+                           ggml_backend_t backend) {
+    free();
+    if (n_layer_in <= 0 || n_kv_heads_in <= 0 || max_length_in <= 0 || head_dim_in <= 0 || !backend) {
+        return false;
+    }
+
+    n_layer    = n_layer_in;
+    n_kv_heads = n_kv_heads_in;
+    max_length = max_length_in;
+    head_dim   = head_dim_in;
+
+    const size_t ctx_size = ggml_tensor_overhead() * static_cast<size_t>(n_layer) * 2 + 1024;
+    ggml_init_params params{};
+    params.mem_size   = ctx_size;
+    params.mem_buffer = nullptr;
+    params.no_alloc   = true;
+    ctx_kv = ggml_init(params);
+    if (!ctx_kv) {
+        return false;
+    }
+
+    k_caches.reserve(static_cast<size_t>(n_layer));
+    v_caches.reserve(static_cast<size_t>(n_layer));
+    for (int i = 0; i < n_layer; ++i) {
+        // Layout: [head_dim, n_kv_heads, max_length] — aligns with K/V projection output
+        // so get_k_write uses standard strides (no custom stride swap).
+        k_caches.push_back(ggml_new_tensor_3d(ctx_kv, GGML_TYPE_F32, head_dim, n_kv_heads, max_length));
+        v_caches.push_back(ggml_new_tensor_3d(ctx_kv, GGML_TYPE_F32, head_dim, n_kv_heads, max_length));
+    }
+
+    buf_kv = ggml_backend_alloc_ctx_tensors(ctx_kv, backend);
+    if (!buf_kv) {
+        free();
+        return false;
+    }
+
+    clear();
+    return true;
+}
+
+void VoxCPM2KVCache::clear() {
+    if (buf_kv) {
+        ggml_backend_buffer_clear(buf_kv, 0);
+    }
+}
+
+void VoxCPM2KVCache::free() {
+    if (buf_kv) {
+        ggml_backend_buffer_free(buf_kv);
+        buf_kv = nullptr;
+    }
+    if (ctx_kv) {
+        ggml_free(ctx_kv);
+        ctx_kv = nullptr;
+    }
+    k_caches.clear();
+    v_caches.clear();
+    n_layer = n_kv_heads = max_length = head_dim = 0;
+}
+
+ggml_tensor * VoxCPM2KVCache::get_k(ggml_context * ctx, int layer, int seq_len) const {
+    GGML_ASSERT(layer >= 0 && layer < n_layer);
+    GGML_ASSERT(seq_len >= 0 && seq_len <= max_length);
+    ggml_tensor * k = k_caches[static_cast<size_t>(layer)];
+    // View [head_dim, n_kv_heads, seq_len] with standard strides, then permute
+    // to [head_dim, seq_len, n_kv_heads] for attention matmul.
+    ggml_tensor * v = ggml_view_3d(ctx, k, head_dim, n_kv_heads, seq_len, k->nb[1], k->nb[2], 0);
+    return ggml_permute(ctx, v, 0, 2, 1, 3);
+}
+
+ggml_tensor * VoxCPM2KVCache::get_v(ggml_context * ctx, int layer, int seq_len) const {
+    GGML_ASSERT(layer >= 0 && layer < n_layer);
+    GGML_ASSERT(seq_len >= 0 && seq_len <= max_length);
+    ggml_tensor * v = v_caches[static_cast<size_t>(layer)];
+    ggml_tensor * r = ggml_view_3d(ctx, v, head_dim, n_kv_heads, seq_len, v->nb[1], v->nb[2], 0);
+    return ggml_permute(ctx, r, 0, 2, 1, 3);
+}
+
+ggml_tensor * VoxCPM2KVCache::get_k_write(ggml_context * ctx, int layer, int start, int n_tokens) const {
+    GGML_ASSERT(layer >= 0 && layer < n_layer);
+    GGML_ASSERT(start >= 0 && start + n_tokens <= max_length);
+    ggml_tensor * k      = k_caches[static_cast<size_t>(layer)];
+    // Storage layout [head_dim, n_kv_heads, max_length] matches write source exactly.
+    // offset in token dim (ne[2]), standard strides — no custom stride swap.
+    const size_t offset = static_cast<size_t>(start) * k->nb[2];
+    return ggml_view_3d(ctx, k, head_dim, n_kv_heads, n_tokens, k->nb[1], k->nb[2], offset);
+}
+
+ggml_tensor * VoxCPM2KVCache::get_v_write(ggml_context * ctx, int layer, int start, int n_tokens) const {
+    GGML_ASSERT(layer >= 0 && layer < n_layer);
+    GGML_ASSERT(start >= 0 && start + n_tokens <= max_length);
+    ggml_tensor * v      = v_caches[static_cast<size_t>(layer)];
+    const size_t  offset = static_cast<size_t>(start) * v->nb[2];
+    return ggml_view_3d(ctx, v, head_dim, n_kv_heads, n_tokens, v->nb[1], v->nb[2], offset);
+}
+
+// ---------------------------------------------------------------------------
+// Attention with KV cache (for forward_step and forward_prefill)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+static ggml_tensor * attention_forward_kv(ggml_context *                         ctx,
+                                          const VoxCPM2TransformerConfig &       cfg,
+                                          const VoxCPM2TransformerWeights &      weights,
+                                          ggml_tensor *                          hidden,
+                                          ggml_tensor *                          positions,
+                                          const VoxCPM2TransformerLayerWeights & lw,
+                                          int                                    layer_idx,
+                                          int                                    n_tokens,
+                                          int                                    n_past,
+                                          VoxCPM2KVCache &                       kv_cache) {
+    const int total_len = n_past + n_tokens;
+
+    ggml_tensor * q = ggml_mul_mat(ctx, lw.wq, hidden);
+    ggml_tensor * k = ggml_mul_mat(ctx, lw.wk, hidden);
+    ggml_tensor * v = ggml_mul_mat(ctx, lw.wv, hidden);
+
+    q = ggml_reshape_3d(ctx, q, cfg.head_dim, cfg.n_heads, n_tokens);
+    k = ggml_reshape_3d(ctx, k, cfg.head_dim, cfg.n_kv_heads, n_tokens);
+    v = ggml_reshape_3d(ctx, v, cfg.head_dim, cfg.n_kv_heads, n_tokens);
+
+    q = apply_rope(ctx, cfg, weights, q, positions, total_len);
+    k = apply_rope(ctx, cfg, weights, k, positions, total_len);
+
+    // Write current K/V to cache for future decode steps
+    ggml_tensor * k_write_target = kv_cache.get_k_write(ctx, layer_idx, n_past, n_tokens);
+    ggml_tensor * v_write_target = kv_cache.get_v_write(ctx, layer_idx, n_past, n_tokens);
+    ggml_tensor * k_write = ggml_cpy(ctx, k, k_write_target);
+    ggml_tensor * v_write = ggml_cpy(ctx, v, v_write_target);
+
+    // Create a zero-valued sync tensor that depends on the writes.
+    // This ensures KV cache write ops are included in the graph and forces
+    // the graph scheduler to complete writes before reads in decode path.
+    ggml_tensor * kv_sync = ggml_add(ctx, ggml_sum(ctx, ggml_cont(ctx, k_write)),
+                                          ggml_sum(ctx, ggml_cont(ctx, v_write)));
+    kv_sync = ggml_scale(ctx, kv_sync, 0.0f);
+
+    // Permute K/V for attention: [head_dim, n_kv_heads, n_tokens] → [head_dim, n_tokens, n_kv_heads]
+    ggml_tensor * k_cur = ggml_permute(ctx, k, 0, 2, 1, 3);
+    ggml_tensor * v_cur = ggml_permute(ctx, v, 0, 2, 1, 3);
+
+    // For prefill (n_past == 0): use fresh k/v directly — matches Python/VoxCPM.cpp behavior.
+    // For decode (n_past > 0): concat past KV from cache with current K/V.
+    ggml_tensor * k_all = k_cur;
+    ggml_tensor * v_all = v_cur;
+    if (n_past > 0) {
+        ggml_tensor * k_past = kv_cache.get_k(ctx, layer_idx, n_past);
+        ggml_tensor * v_past = kv_cache.get_v(ctx, layer_idx, n_past);
+        k_all = ggml_concat(ctx, k_past, k_cur, 1);  // concat on token dim (dim 1)
+        v_all = ggml_concat(ctx, v_past, v_cur, 1);
+    }
+
+    q = ggml_permute(ctx, q, 0, 2, 1, 3);  // [head_dim, n_heads, n_tokens] → [head_dim, n_tokens, n_heads]
+
+    const float attn_scale = 1.0f / std::sqrt(static_cast<float>(cfg.head_dim));
+
+    ggml_tensor * kq = ggml_mul_mat(ctx, k_all, q);
+    ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+
+    // Causal mask: for prefill, need causal mask. For decode (n_tokens==1), no mask.
+    ggml_tensor * mask = nullptr;
+    if (n_tokens > 1) {
+        mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, total_len, n_tokens);
+        ggml_set_input(mask);
+    }
+
+    kq = ggml_soft_max_ext(ctx, kq, mask, attn_scale, 0.0f);
+
+    ggml_tensor * v_t  = ggml_cont(ctx, ggml_transpose(ctx, v_all));
+    ggml_tensor * kqv  = ggml_mul_mat(ctx, v_t, kq);
+    ggml_tensor * attn = ggml_permute(ctx, kqv, 0, 2, 1, 3);
+    attn               = ggml_cont_2d(ctx, attn, cfg.n_heads * cfg.head_dim, n_tokens);
+
+    // Add kv_sync to output to enforce write-before-read ordering AND to
+    // ensure KV cache write ops are included in the computation graph.
+    // kv_sync is [1] with value 0.0f; ggml_add broadcasts it to attn's shape.
+    attn = ggml_add(ctx, attn, kv_sync);
+
+    return ggml_mul_mat(ctx, lw.wo, attn);
+}
+
+}  // namespace
+
+ggml_tensor * voxcpm2_transformer_forward_step(ggml_context *                    ctx,
+                                               const VoxCPM2TransformerConfig &  cfg,
+                                               const VoxCPM2TransformerWeights & weights,
+                                               ggml_tensor *                     input,
+                                               int                               position,
+                                               VoxCPM2KVCache &                  kv_cache) {
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(input != nullptr);
+
+    ggml_tensor * hidden = input;
+    if (ggml_n_dims(hidden) == 1) {
+        hidden = ggml_reshape_2d(ctx, hidden, hidden->ne[0], 1);
+    }
+
+    ggml_tensor * positions = ggml_view_1d(ctx, voxcpm2_build_positions(ctx, position + 1),
+                                            1, static_cast<size_t>(position) * sizeof(int32_t));
+
+    for (int i = 0; i < cfg.n_layer; ++i) {
+        const VoxCPM2TransformerLayerWeights & lw = weights.layers[static_cast<size_t>(i)];
+
+        ggml_tensor * residual = hidden;
+        ggml_tensor * normed   = rms_norm(ctx, hidden, lw.attn_norm, cfg.rms_norm_eps);
+        ggml_tensor * attn_out = attention_forward_kv(ctx, cfg, weights, normed, positions, lw, i, 1, position, kv_cache);
+        hidden                 = ggml_add(ctx, residual, attn_out);
+
+        residual              = hidden;
+        normed                = rms_norm(ctx, hidden, lw.ffn_norm, cfg.rms_norm_eps);
+        ggml_tensor * mlp_out = mlp_forward(ctx, normed, lw);
+        hidden                = ggml_add(ctx, residual, mlp_out);
+    }
+
+    hidden = rms_norm(ctx, hidden, weights.norm, cfg.rms_norm_eps);
+    return ggml_reshape_1d(ctx, hidden, hidden->ne[0]);
+}
+
+ggml_tensor * voxcpm2_transformer_forward_prefill(ggml_context *                    ctx,
+                                                  const VoxCPM2TransformerConfig &  cfg,
+                                                  const VoxCPM2TransformerWeights & weights,
+                                                  ggml_tensor *                     input,
+                                                  int                               n_tokens,
+                                                  VoxCPM2KVCache &                  kv_cache) {
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(input != nullptr);
+    GGML_ASSERT(input->ne[0] == cfg.hidden_size);
+
+    ggml_tensor * positions = voxcpm2_build_positions(ctx, n_tokens);
+
+    ggml_tensor * hidden = input;
+    for (int i = 0; i < cfg.n_layer; ++i) {
+        const VoxCPM2TransformerLayerWeights & lw = weights.layers[static_cast<size_t>(i)];
+
+        ggml_tensor * residual = hidden;
+        ggml_tensor * normed   = rms_norm(ctx, hidden, lw.attn_norm, cfg.rms_norm_eps);
+        ggml_tensor * attn_out = attention_forward_kv(ctx, cfg, weights, normed, positions, lw, i, n_tokens, 0, kv_cache);
+        hidden                 = ggml_add(ctx, residual, attn_out);
+
+        residual              = hidden;
+        normed                = rms_norm(ctx, hidden, lw.ffn_norm, cfg.rms_norm_eps);
+        ggml_tensor * mlp_out = mlp_forward(ctx, normed, lw);
+        hidden                = ggml_add(ctx, residual, mlp_out);
+    }
+
+    return rms_norm(ctx, hidden, weights.norm, cfg.rms_norm_eps);
+}
