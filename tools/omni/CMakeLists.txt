@@ -156,3 +156,13 @@ target_compile_features(${TARGET_DUPLEX_TEST} PRIVATE cxx_std_17)
 # target_link_libraries(token2wav-example PRIVATE common omni Threads::Threads)
 # target_compile_features(token2wav-example PRIVATE cxx_std_17)
 
+# VoxCPM2 CLI demo
+set(TARGET_VOXCPM2_CLI voxcpm2-cli)
+add_executable         (${TARGET_VOXCPM2_CLI} voxcpm2/voxcpm2_cli.cpp)
+set_target_properties  (${TARGET_VOXCPM2_CLI} PROPERTIES OUTPUT_NAME voxcpm2-cli)
+target_link_libraries  (${TARGET_VOXCPM2_CLI} PRIVATE voxcpm2_runtime common ggml Threads::Threads)
+target_include_directories(${TARGET_VOXCPM2_CLI} PRIVATE voxcpm2)
+target_compile_features(${TARGET_VOXCPM2_CLI} PRIVATE cxx_std_17)
+if(LLAMA_TOOLS_INSTALL)
+    install(TARGETS ${TARGET_VOXCPM2_CLI} RUNTIME)
+endif()
