@@ -428,7 +428,7 @@ def export_baselm(
 
     # Compute derived params
     f_embedding_scale = float(scale_emb)
-    f_residual_scale = scale_depth / np.sqrt(float(n_layer)) if not use_mup else 1.0
+    f_residual_scale = (scale_depth / np.sqrt(float(n_layer))) if use_mup else 0.0
     f_logit_scale = dim_model_base / n_embd
 
     print(
@@ -560,6 +560,15 @@ def export_baselm(
         #                            np.array(long_factors, dtype=np.float32))
         #     gguf_writer.add_tensor(f"{gguf_prefix}.rope_factors_short",
         #                            np.array(short_factors, dtype=np.float32))
+
+    # LongRoPE factors for llama.cpp MINICPM loader
+    # MINICPM arch uses GLOBAL names (no blk.%d. prefix) for these tensors.
+    # Layer 0 loads as TENSOR_NOT_REQUIRED; layers 1+ are TENSOR_DUPLICATED.
+    if long_factors:
+        gguf_writer.add_tensor("rope_factors_long.weight",
+                               np.array(long_factors, dtype=np.float32))
+        gguf_writer.add_tensor("rope_factors_short.weight",
+                               np.array(short_factors, dtype=np.float32))
 
     gguf_writer.open_output_file(Path(output_path))
     gguf_writer.write_header_to_file()
