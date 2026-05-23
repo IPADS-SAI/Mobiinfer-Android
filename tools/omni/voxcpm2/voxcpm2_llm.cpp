@@ -15,7 +15,9 @@
 bool MiniCPMLM::init(const std::string & path, int n_gpu_layers) {
     // Load model
     struct llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = n_gpu_layers;
+    if (n_gpu_layers >= 0) {
+        model_params.n_gpu_layers = n_gpu_layers;
+    }
 
     model = llama_model_load_from_file(path.c_str(), model_params);
     if (!model) {
