@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 std::vector<float> UnifiedCFMSolver::build_timesteps(int n_steps, float sway_sampling_coef) {
     GGML_ASSERT(n_steps > 0);
@@ -142,4 +143,178 @@ ggml_tensor * UnifiedCFMSolver::solve(ggml_context *      ctx,
     }
 
     return x;
+}
+
+// ---------------------------------------------------------------------------
+// Staged solver helpers
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct CfmGgmlContextGuard {
+    ggml_context * ctx = nullptr;
+
+    explicit CfmGgmlContextGuard(size_t mem_size, bool no_alloc = true) {
+        ggml_init_params params{};
+        params.mem_size   = mem_size;
+        params.mem_buffer = nullptr;
+        params.no_alloc   = no_alloc;
+        ctx               = ggml_init(params);
+    }
+
+    ~CfmGgmlContextGuard() {
+        if (ctx) {
+            ggml_free(ctx);
+        }
+    }
+
+    ggml_context * get() const { return ctx; }
+};
+
+struct CfmBackendBufferGuard {
+    ggml_backend_buffer_t buffer = nullptr;
+
+    explicit CfmBackendBufferGuard(ggml_backend_buffer_t buf) : buffer(buf) {}
+
+    ~CfmBackendBufferGuard() {
+        if (buffer) {
+            ggml_backend_buffer_free(buffer);
+        }
+    }
+};
+
+static std::vector<float> cfm_tensor_to_vec(ggml_tensor * t) {
+    std::vector<float> out(static_cast<size_t>(ggml_nelements(t)));
+    ggml_backend_tensor_get(t, out.data(), 0, out.size() * sizeof(float));
+    return out;
+}
+
+static bool cfm_finite_vec(const std::vector<float> & v) {
+    return std::all_of(v.begin(), v.end(), [](float f) { return std::isfinite(f); });
+}
+
+constexpr size_t kCfmGraphMem   = 256ull * 1024 * 1024;
+constexpr size_t kCfmGraphNodes = 65536;
+
+}  // namespace
+
+std::vector<float> UnifiedCFMSolver::solve_per_step(ggml_backend_t             backend,
+                                                    const std::vector<float> & noise,
+                                                    const std::vector<float> & lm_hidden,
+                                                    const std::vector<float> & residual_hidden,
+                                                    const std::vector<float> & prefix_feat_cond,
+                                                    const LocDiTModel &        dit_model,
+                                                    const VoxCPM2Projections & projections,
+                                                    int                        n_steps,
+                                                    float                      cfg_rate,
+                                                    float                      temperature,
+                                                    float                      sway_sampling_coef,
+                                                    bool                       use_cfg_zero_star) const {
+    const int feat_dim    = dit_model.config.feat_dim;
+    const int patch_size  = dit_model.config.patch_size;
+    const int patch_elems = feat_dim * patch_size;
+
+    if (!backend) {
+        return {};
+    }
+    if (static_cast<int>(noise.size()) != patch_elems) {
+        return {};
+    }
+    if (n_steps <= 0) {
+        return noise;
+    }
+
+    const auto t_span          = build_timesteps(n_steps, sway_sampling_coef);
+    const int  zero_init_steps = n_steps > 1 ? std::max(1, static_cast<int>(t_span.size() * 0.04f)) : 0;
+
+    // Euler state (CPU-side)
+    std::vector<float> x_data = noise;
+    if (temperature != 1.0f) {
+        for (float & v : x_data) {
+            v *= temperature;
+        }
+    }
+    float t  = t_span[0];
+    float dt = t_span[0] - t_span[1];
+
+    for (int step = 1; step <= n_steps; ++step) {
+        std::vector<float> velocity(patch_elems, 0.0f);
+
+        if (!(use_cfg_zero_star && step <= zero_init_steps)) {
+            // Build a fresh ggml context + graph for this Euler step.
+            // Everything (mu, cond_proj, time_token) computed in-graph —
+            // no pre-computed tensor passing across graph boundaries.
+            CfmGgmlContextGuard ctx_guard(kCfmGraphMem, true);
+            ggml_context *      ctx = ctx_guard.get();
+            if (!ctx) {
+                return {};
+            }
+
+            // Input tensors
+            ggml_tensor * x_t    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, feat_dim, patch_size);
+            ggml_tensor * lm_t   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, static_cast<int64_t>(lm_hidden.size()));
+            ggml_tensor * res_t  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, static_cast<int64_t>(residual_hidden.size()));
+            ggml_tensor * cond_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, feat_dim, patch_size);
+            // NOTE: deliberately NOT using ggml_set_input — matching the standalone
+            // test_cfm_euler_step.cpp which achieves COS=0.999999 with Python.
+
+            // Compute mu = build_dit_condition(lm, res) — FRESH in this graph
+            ggml_tensor * mu = projections.build_dit_condition(ctx, lm_t, res_t);
+
+            // Build time scalars
+            ggml_tensor * t_scalar  = ggml_arange(ctx, t, t + 1.0f, 1.0f);
+            ggml_tensor * dt_scalar = ggml_arange(ctx, 0.0f, 1.0f, 1.0f);
+
+            // forward_cfg_pair handles project_input, project_condition,
+            // build_time_token, and forward_cfg_pair_projected internally
+            ggml_tensor * conditioned   = nullptr;
+            ggml_tensor * unconditioned = nullptr;
+            dit_model.forward_cfg_pair(ctx, x_t, mu, t_scalar, cond_t, dt_scalar, &conditioned, &unconditioned);
+
+            // CFG blending — also in-graph for bit-exactness
+            ggml_tensor * vel;
+            if (use_cfg_zero_star) {
+                ggml_tensor * dot_p     = ggml_sum(ctx, ggml_mul(ctx, conditioned, unconditioned));
+                ggml_tensor * sq_n      = ggml_sum(ctx, ggml_mul(ctx, unconditioned, unconditioned));
+                ggml_tensor * eps_t     = ggml_arange(ctx, 1.0e-8f, 1.0e-8f + 1.0f, 1.0f);
+                ggml_tensor * st_star   = ggml_div(ctx, dot_p, ggml_add(ctx, sq_n, eps_t));
+                ggml_tensor * sc_uncond = ggml_mul(ctx, unconditioned, ggml_repeat(ctx, st_star, unconditioned));
+                vel = ggml_add(ctx, sc_uncond, ggml_scale(ctx, ggml_sub(ctx, conditioned, sc_uncond), cfg_rate));
+            } else {
+                vel =
+                    ggml_add(ctx, unconditioned, ggml_scale(ctx, ggml_sub(ctx, conditioned, unconditioned), cfg_rate));
+            }
+
+            ggml_cgraph * graph = ggml_new_graph_custom(ctx, kCfmGraphNodes, false);
+            ggml_set_output(vel);
+            ggml_build_forward_expand(graph, vel);
+
+            CfmBackendBufferGuard buf(ggml_backend_alloc_ctx_tensors(ctx, backend));
+            if (!buf.buffer) {
+                return {};
+            }
+
+            ggml_backend_tensor_set(x_t, x_data.data(), 0, x_data.size() * sizeof(float));
+            ggml_backend_tensor_set(lm_t, lm_hidden.data(), 0, lm_hidden.size() * sizeof(float));
+            ggml_backend_tensor_set(res_t, residual_hidden.data(), 0, residual_hidden.size() * sizeof(float));
+            ggml_backend_tensor_set(cond_t, prefix_feat_cond.data(), 0, prefix_feat_cond.size() * sizeof(float));
+
+            if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+                return {};
+            }
+
+            velocity = cfm_tensor_to_vec(vel);
+        }
+
+        // CPU-side Euler update
+        for (size_t i = 0; i < x_data.size(); ++i) {
+            x_data[i] -= dt * velocity[i];
+        }
+        t -= dt;
+        if (step < n_steps) {
+            dt = t - t_span[static_cast<size_t>(step + 1)];
+        }
+    }
+
+    return cfm_finite_vec(x_data) ? x_data : std::vector<float>{};
 }

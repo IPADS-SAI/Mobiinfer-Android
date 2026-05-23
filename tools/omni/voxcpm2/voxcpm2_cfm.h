@@ -1,5 +1,8 @@
 #pragma once
 
+#include "ggml-alloc.h"
+#include "ggml.h"
+#include "voxcpm2_components.h"
 #include "voxcpm2_locdit.h"
 
 #include <vector>
@@ -30,6 +33,22 @@ struct UnifiedCFMSolver {
                         ggml_tensor *       mu,
                         ggml_tensor *       cond,
                         const LocDiTModel & dit_model) const;
+
+    // Debug solver: one fresh ggml graph per Euler step (mu recomputed each step).
+    // Used for precision isolation — verifies that single-graph solve() produces
+    // the same result as per-step computation. Not used in production inference.
+    std::vector<float> solve_per_step(ggml_backend_t             backend,
+                                      const std::vector<float> & noise,
+                                      const std::vector<float> & lm_hidden,
+                                      const std::vector<float> & residual_hidden,
+                                      const std::vector<float> & prefix_feat_cond,
+                                      const LocDiTModel &        dit_model,
+                                      const VoxCPM2Projections & projections,
+                                      int                        n_steps,
+                                      float                      cfg_rate,
+                                      float                      temperature,
+                                      float                      sway_sampling_coef,
+                                      bool                       use_cfg_zero_star) const;
 
     ggml_tensor * solve(ggml_context *      ctx,
                         ggml_tensor *       noise,
