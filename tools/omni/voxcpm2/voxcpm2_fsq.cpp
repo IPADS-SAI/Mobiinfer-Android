@@ -114,8 +114,8 @@ bool FSQModule::load_metadata() {
         return false;
     }
 
-    gguf_get_u32_opt(ctx_gguf, "voxcpm2.fsq.latent_dim", config.latent_dim);
-    gguf_get_f32_opt(ctx_gguf, "voxcpm2.fsq.scale", config.scale);
+    gguf_get_u32_opt(ctx_gguf, "voxcpm.fsq.latent_dim", config.latent_dim);
+    gguf_get_f32_opt(ctx_gguf, "voxcpm.fsq.scale", config.scale);
 
     return true;
 }

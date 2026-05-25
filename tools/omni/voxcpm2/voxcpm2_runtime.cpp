@@ -391,14 +391,18 @@ bool VoxCPM2ResidualLM::init_from_gguf(const std::string & path, ggml_backend_t 
         return false;
     }
 
-    store->get_u32("voxcpm2.residual_lm.n_layer", config.n_layer);
-    store->get_u32("voxcpm2.residual_lm.n_embd", config.hidden_size);
+    store->get_u32("voxcpm.residual_lm.n_layer", config.n_layer);
+    store->get_u32("voxcpm.residual_lm.n_embd", config.hidden_size);
     config.n_heads        = 16;
     config.n_kv_heads     = 2;
     config.head_dim       = config.hidden_size / config.n_heads;
     config.max_length     = 32768;
-    config.no_rope        = true;
     config.use_flash_attn = false;
+
+    // Read no_rope from GGUF metadata; default to false for v0.5/v1.5 models
+    bool no_rope = false;
+    store->get_bool("voxcpm.residual_lm.no_rope", no_rope);
+    config.no_rope = no_rope;
 
     if (!voxcpm2_bind_transformer_weights(store->tensors, "residual_lm", config, weights)) {
         free();
@@ -1532,6 +1536,16 @@ std::vector<float> VoxCPM2Runtime::generate_tokens(const std::vector<int32_t> & 
         rng.seed(params.seed);
     }
 
+    // Auto-compute max_steps from text token count if not explicitly overridden.
+    // VoxCPM.cpp: max_len = text_tokens * ratio + 10, capped at 2000.
+    VoxCPM2GenerateParams effective_params = params;
+    if (params.max_steps >= 200) {  // default; user did not override via --steps
+        const int n_text_tokens    = static_cast<int>(token_ids.size());
+        const int auto_steps       = std::max(15, n_text_tokens * 3 + 15);
+        effective_params.max_steps = std::min(auto_steps, params.max_steps);
+        LOG_INF("VoxCPM2Runtime: auto max_steps=%d (text_tokens=%d)\n", effective_params.max_steps, n_text_tokens);
+    }
+
     std::vector<int32_t> prompt = token_ids;
     if (params.append_audio_start && (prompt.empty() || prompt.back() != kAudioStartToken)) {
         prompt.push_back(kAudioStartToken);
@@ -1539,15 +1553,15 @@ std::vector<float> VoxCPM2Runtime::generate_tokens(const std::vector<int32_t> & 
     if (!prefill_tokens(prompt)) {
         return {};
     }
-    decode_loop(params, nullptr);
+    decode_loop(effective_params, nullptr);
     if (!last_error_msg.empty()) {
         return {};
     }
-    return decode_to_waveform(params.target_sr);
+    return decode_to_waveform(effective_params.target_sr);
 }
 
 std::vector<float> VoxCPM2Runtime::generate(const std::string & text, const VoxCPM2GenerateParams & params) {
-    std::vector<int32_t> token_ids = tokenize_text(text, true, true);
+    std::vector<int32_t> token_ids = tokenize_text(text, false, true);
     if (token_ids.empty()) {
         if (last_error_msg.empty()) {
             fail("text tokenization produced no tokens");
@@ -1560,7 +1574,7 @@ std::vector<float> VoxCPM2Runtime::generate(const std::string & text, const VoxC
 std::vector<float> VoxCPM2Runtime::generate_with_clone(const std::string &           text,
                                                        const std::vector<float> &    reference_wav,
                                                        const VoxCPM2GenerateParams & params) {
-    std::vector<int32_t> token_ids = tokenize_text(text, true, true);
+    std::vector<int32_t> token_ids = tokenize_text(text, false, true);
     if (token_ids.empty()) {
         if (last_error_msg.empty()) {
             fail("text tokenization produced no tokens");
@@ -1657,7 +1671,7 @@ bool VoxCPM2Runtime::generate_tokens_streaming(const std::vector<int32_t> &     
 bool VoxCPM2Runtime::generate_streaming(const std::string &               text,
                                         const VoxCPM2AudioChunkCallback & callback,
                                         const VoxCPM2GenerateParams &     params) {
-    std::vector<int32_t> token_ids = tokenize_text(text, true, true);
+    std::vector<int32_t> token_ids = tokenize_text(text, false, true);
     if (token_ids.empty()) {
         if (last_error_msg.empty()) {
             fail("text tokenization produced no tokens");

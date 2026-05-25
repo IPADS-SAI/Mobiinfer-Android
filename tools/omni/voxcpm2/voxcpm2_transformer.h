@@ -31,6 +31,7 @@ struct VoxCPM2GGUFWeightStore {
     ggml_tensor * get(const std::string & name) const;
     bool          get_u32(const char * key, int & dst) const;
     bool          get_f32(const char * key, float & dst) const;
+    bool          get_bool(const char * key, bool & dst) const;
     bool          get_string(const char * key, std::string & dst) const;
     bool          get_i32_array(const char * key, std::vector<int> & dst) const;
     bool          get_f32_array(const char * key, std::vector<float> & dst) const;

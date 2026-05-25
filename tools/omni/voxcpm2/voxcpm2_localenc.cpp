@@ -53,10 +53,10 @@ bool LocEncModel::bind_from_store() {
         return false;
     }
 
-    store->get_u32("voxcpm2.patch_size", config.patch_size);
-    store->get_u32("voxcpm2.feat_dim", config.feat_dim);
-    store->get_u32("voxcpm2.locenc.n_layer", config.transformer.n_layer);
-    store->get_u32("voxcpm2.locenc.n_embd", config.transformer.hidden_size);
+    store->get_u32("voxcpm.patch_size", config.patch_size);
+    store->get_u32("voxcpm.feat_dim", config.feat_dim);
+    store->get_u32("voxcpm.locenc.n_layer", config.transformer.n_layer);
+    store->get_u32("voxcpm.locenc.n_embd", config.transformer.hidden_size);
     config.transformer.max_length = 4096;
     config.transformer.no_rope    = false;
 

@@ -1,18 +1,29 @@
 #!/usr/bin/env python3
 """
-Convert VoxCPM2 PyTorch weights to GGUF format for llama.cpp-omni.
+Convert VoxCPM / VoxCPM2 PyTorch weights to GGUF format for llama.cpp-omni.
+
+Supports both VoxCPM-0.5B (v1) and VoxCPM2 (v2) architectures.
+Auto-detects version from config.json architecture field.
 
 Usage:
+    # VoxCPM2 (safetensors)
     python convert_voxcpm2_to_gguf.py \\
-        --model /path/to/MiniCPM-o-4_5-gguf/model.safetensors \\
-        --vae /path/to/MiniCPM-o-4_5-gguf/audiovae.pth \\
-        --config /path/to/MiniCPM-o-4_5-gguf/config.json \\
+        --model /path/to/model.safetensors \\
+        --vae /path/to/audiovae.pth \\
+        --config /path/to/config.json \\
+        --output /path/to/output_dir
+
+    # VoxCPM-0.5B (pytorch_model.bin)
+    python convert_voxcpm2_to_gguf.py \\
+        --model /path/to/pytorch_model.bin \\
+        --vae /path/to/audiovae.pth \\
+        --config /path/to/config.json \\
         --output /path/to/output_dir
 
 Output:
     output_dir/
-    ├── VoxCPM2-BaseLM-F16.gguf       # arch=minicpm (28-layer causal decoder)
-    └── VoxCPM2-Acoustic-F16.gguf     # arch=voxcpm2-acoustic (ResidualLM + LocEnc + LocDiT + FSQ + AudioVAE + Projections)
+    ├── VoxCPM2-BaseLM-F16.gguf     (or VoxCPM-0.5B-BaseLM-F16.gguf)
+    └── VoxCPM2-Acoustic-F16.gguf   (or VoxCPM-0.5B-Acoustic-F16.gguf)
 """
 
 import argparse
@@ -427,12 +438,230 @@ class SafeTensorFile:
 
 
 # ==============================================================================
+# Dict-based weight source (for pytorch_model.bin)
+# ==============================================================================
+class DictWeightSource:
+    """Weight source backed by an in-memory dict of numpy arrays."""
+
+    def __init__(self, weights: dict, target_dtype: str = "f16"):
+        self.weights = weights
+        self.target_dtype = target_dtype
+        self.target_np = np.float16 if target_dtype == "f16" else np.float32
+
+    def keys(self):
+        return sorted(self.weights.keys())
+
+    def get_shape(self, key: str) -> list:
+        return list(self.weights[key].shape)
+
+    def get_dtype_str(self, key: str) -> str:
+        dtype = self.weights[key].dtype
+        if dtype == np.float32:
+            return "F32"
+        elif dtype == np.float16:
+            return "F16"
+        elif dtype == np.int32:
+            return "I32"
+        elif dtype == np.int64:
+            return "I64"
+        return "F32"
+
+    def get_tensor(self, key: str) -> np.ndarray:
+        if key not in self.weights:
+            raise KeyError(key)
+        tensor = self.weights[key].copy()
+        if tensor.dtype == np.float64:
+            tensor = tensor.astype(np.float32)
+        if tensor.dtype == np.float32 and self.target_dtype == "f16":
+            tensor = tensor.astype(np.float16)
+        elif tensor.dtype == np.float16 and self.target_dtype == "f32":
+            tensor = tensor.astype(np.float32)
+        return tensor
+
+    def close(self):
+        self.weights.clear()
+
+
+def _infer_audiovae_encoder_dim(vae_weights: dict) -> int:
+    """Infer AudioVAE encoder_dim from encoder.block.0.bias shape."""
+    for key in ("encoder.block.0.bias", "audio_vae.encoder.block.0.bias"):
+        tensor = vae_weights.get(key)
+        if tensor is not None:
+            return int(tensor.shape[0] if hasattr(tensor, 'shape') else len(tensor))
+    return 128
+
+
+def _infer_audiovae_decoder_dim(vae_weights: dict) -> int:
+    """Infer AudioVAE decoder_dim from decoder.model.1.bias shape."""
+    for key in ("decoder.model.1.bias", "audio_vae.decoder.model.1.bias"):
+        tensor = vae_weights.get(key)
+        if tensor is not None:
+            return int(tensor.shape[0] if hasattr(tensor, 'shape') else len(tensor))
+    return 2048
+
+
+def _infer_audiovae_latent_dim(vae_weights: dict) -> int:
+    """Infer AudioVAE latent_dim from encoder.fc_mu.bias shape."""
+    for key in ("encoder.fc_mu.bias", "audio_vae.encoder.fc_mu.bias"):
+        tensor = vae_weights.get(key)
+        if tensor is not None:
+            return int(tensor.shape[0] if hasattr(tensor, 'shape') else len(tensor))
+    return 64
+
+
+def _conv_stride_from_weight(tensor) -> int:
+    """Infer convolution stride from weight kernel size: stride = kernel // 2."""
+    if tensor is None:
+        return -1
+    shape = tensor.shape if hasattr(tensor, 'shape') else list(tensor.shape)
+    if len(shape) < 3:
+        return -1
+    kernel = int(shape[-1])
+    if kernel % 2 != 0:
+        return -1
+    return kernel // 2
+
+
+def _get_weight_tensor(vae_weights: dict, base_key: str) -> object:
+    """Get a weight tensor from vae_weights, handling both plain .weight and weight_norm (.weight_g / .weight_v) formats.
+
+    Priority: .weight_v > .weight > .weight_g — because weight_v has the full [OC, IC, K] shape
+    with the true kernel size, while weight_g is just [OC, 1, 1].
+    """
+    # Try plain weight first (safetensors / merged format)
+    tensor = vae_weights.get(base_key + ".weight")
+    if tensor is not None:
+        return tensor
+    # Try weight_v next: has the full kernel shape [OC, IC, K]
+    tensor = vae_weights.get(base_key + ".weight_v")
+    if tensor is not None:
+        return tensor
+    # Try weight_g as last resort
+    return vae_weights.get(base_key + ".weight_g")
+
+
+def _infer_audiovae_encoder_rates(vae_weights: dict) -> list:
+    """Infer encoder_rates from AudioVAE encoder block stride=2 conv layers."""
+    rates = []
+    for i in range(1, 16):
+        base_key = f"encoder.block.{i}.block.4"
+        tensor = _get_weight_tensor(vae_weights, base_key)
+        if tensor is None:
+            tensor = _get_weight_tensor(vae_weights, f"audio_vae.{base_key}")
+        if tensor is None:
+            break
+        stride = _conv_stride_from_weight(tensor)
+        if stride <= 0:
+            break
+        rates.append(stride)
+    return rates if rates else [2, 5, 8, 8]
+
+
+def _infer_audiovae_decoder_rates(vae_weights: dict) -> list:
+    """Infer decoder_rates from AudioVAE decoder model stride=2 conv layers."""
+    rates = []
+    for i in range(2, 32):
+        base_key = f"decoder.model.{i}.block.1"
+        tensor = _get_weight_tensor(vae_weights, base_key)
+        if tensor is None:
+            tensor = _get_weight_tensor(vae_weights, f"audio_vae.{base_key}")
+        if tensor is None:
+            break
+        stride = _conv_stride_from_weight(tensor)
+        if stride <= 0:
+            break
+        rates.append(stride)
+    return rates if rates else [8, 6, 5, 2, 2, 2]
+
+
+def infer_audio_vae_config(config: dict, vae_state_dict: dict) -> dict:
+    """Build a complete AudioVAE config, inferring values from weights when missing."""
+    if "audio_vae_config" in config and isinstance(config["audio_vae_config"], dict):
+        return dict(config["audio_vae_config"])
+
+    resolved = {}
+    resolved["encoder_dim"] = _infer_audiovae_encoder_dim(vae_state_dict)
+    resolved["latent_dim"] = _infer_audiovae_latent_dim(vae_state_dict)
+    resolved["decoder_dim"] = _infer_audiovae_decoder_dim(vae_state_dict)
+    resolved["encoder_rates"] = _infer_audiovae_encoder_rates(vae_state_dict)
+    resolved["decoder_rates"] = _infer_audiovae_decoder_rates(vae_state_dict)
+
+    # VoxCPM-0.5B defaults. cond_type, sr_bin_boundaries, out_sample_rate are left
+    # unset so export_acoustic can apply version-appropriate defaults.
+    resolved["sample_rate"] = 16000
+    resolved["out_sample_rate"] = 16000
+
+    print(f"  Inferred AudioVAE config: encoder_dim={resolved['encoder_dim']}, "
+          f"decoder_dim={resolved['decoder_dim']}, latent_dim={resolved['latent_dim']}")
+    print(f"    encoder_rates={resolved['encoder_rates']}, decoder_rates={resolved['decoder_rates']}")
+    return resolved
+
+
+def detect_model_version(config: dict) -> float:
+    """Detect VoxCPM architecture version from config.
+
+    Returns:
+        0.5 = VoxCPM-0.5B (arch=voxcpm, patch=2, no fusion_concat_proj)
+        1.5 = VoxCPM-1.5  (arch=voxcpm, patch=4, no fusion_concat_proj)
+        2.0 = VoxCPM2     (arch=voxcpm2, patch=4, has fusion_concat_proj)
+
+    The version float determines structural defaults (fusion path, no_rope, etc.),
+    NOT the output file name.
+    """
+    arch = config.get("architecture", "")
+    if isinstance(arch, str) and arch.strip().lower() == "voxcpm2":
+        return 2.0
+
+    # architecture == "voxcpm": distinguish 0.5B (patch=2) from 1.5 (patch=4)
+    if config.get("patch_size") == 2:
+        return 0.5
+    return 1.5
+
+
+def infer_model_name(config: dict, model_path_str: str, version: float) -> str:
+    """Infer a human-friendly model name for output file naming.
+
+    Priority:
+      1. config.model_name / config.name fields
+      2. Path hints (0.5B, 1.5, VoxCPM2, etc.)
+      3. Version-based fallback
+    """
+    # 1. Explicit config fields
+    for key in ("model_name", "name", "model_id"):
+        val = config.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+
+    # 2. Path hints
+    path_lower = model_path_str.lower()
+    patterns = [
+        ("0.5b", "VoxCPM-0.5B"),
+        ("0.5", "VoxCPM-0.5B"),
+        ("1.5b", "VoxCPM-1.5"),
+        ("1.5", "VoxCPM-1.5"),
+        ("2b", "VoxCPM2"),
+        ("voxcpm2", "VoxCPM2"),
+        ("minicpm-o", "VoxCPM2"),
+    ]
+    for pattern, name in patterns:
+        if pattern in path_lower:
+            return name
+
+    # 3. Version-based fallback
+    if version == 0.5:
+        return "VoxCPM-0.5B"
+    if version == 1.5:
+        return "VoxCPM-1.5"
+    return "VoxCPM2"
+
+
+# ==============================================================================
 # BaseLM GGUF writer
 # ==============================================================================
 def export_baselm(
-    sf: SafeTensorFile, config: dict, output_path: str, tokenizer_dir: str, dtype: str = "f16"
+    sf, config: dict, output_path: str, tokenizer_dir: str, dtype: str = "f16", version: float = 2.0
 ):
-    """Export BaseLM (28-layer causal decoder) as standard LLM_ARCH_MINICPM GGUF."""
+    """Export BaseLM as standard LLM_ARCH_MINICPM GGUF."""
     lm_cfg = config["lm_config"]
     n_layer = lm_cfg["num_hidden_layers"]
     n_embd = lm_cfg["hidden_size"]
@@ -448,15 +677,15 @@ def export_baselm(
     scale_emb = lm_cfg.get("scale_emb", 12)
     dim_model_base = lm_cfg.get("dim_model_base", 256)
     scale_depth = lm_cfg.get("scale_depth", 1.4)
+    use_mup = lm_cfg.get("use_mup", False)
     rope_scaling = lm_cfg.get("rope_scaling", None)
 
-    # Compute derived params
-    f_embedding_scale = float(scale_emb)
-    # llama.cpp's MiniCPM graph applies this residual scale whenever the
-    # metadata value is non-zero, and its built-in MiniCPM default is 1.4/sqrt(n_layer).
-    # Do not gate this on HF use_mup, or a newly exported GGUF overrides the
-    # working llama.cpp default with 0.0 and changes BaseLM hidden states.
-    f_residual_scale = scale_depth / np.sqrt(float(n_layer))
+    # PyTorch: when use_mup=False, scale_emb is forced to 1.0 (no scaling).
+    # Set embedding_scale=0.0 in GGUF so llama.cpp skips the scaling op.
+    f_embedding_scale = float(scale_emb) if use_mup else 0.0
+    # PyTorch applies residual scaling only when use_mup=True. A non-zero GGUF
+    # value makes llama.cpp scale both attention and FFN residual branches.
+    f_residual_scale = (scale_depth / np.sqrt(float(n_layer))) if use_mup else 0.0
     f_logit_scale = dim_model_base / n_embd
 
     print(
@@ -610,76 +839,112 @@ def export_baselm(
 # Acoustic GGUF writer
 # ==============================================================================
 def export_acoustic(
-    sf: SafeTensorFile, vae_state_dict: dict, config: dict, output_path: str, dtype: str = "f16"
+    sf, vae_state_dict: dict, config: dict, output_path: str, dtype: str = "f16", version: float = 2.0
 ):
-    """Export acoustic components as custom voxcpm2-acoustic GGUF."""
+    """Export acoustic components as custom voxcpm-acoustic GGUF."""
     lm_cfg = config["lm_config"]
     encoder_cfg = config.get("encoder_config", {})
     dit_cfg = config.get("dit_config", {})
     vae_cfg = config.get("audio_vae_config", {})
 
-    n_embd = lm_cfg["hidden_size"]  # 2048
-    n_residual_layers = config.get("residual_lm_num_layers", 8)
-    n_encoder_layers = encoder_cfg.get("num_layers", 12)
-    n_dit_layers = dit_cfg.get("num_layers", 12)
-    patch_size = config.get("patch_size", 4)
+    n_embd = lm_cfg["hidden_size"]
+
+    # Version-dependent defaults
+    if version == 0.5:      # VoxCPM-0.5B
+        def_n_res_lm = 6
+        def_n_enc = 4
+        def_n_dit = 4
+        def_patch = 2
+        def_fsq_dim = 256
+        def_no_rope = False
+        def_dec_dim = 1536
+        def_out_sr = 16000
+        def_cond_type = "none"
+        def_sr_bins = []
+    elif version == 1.5:    # VoxCPM-1.5
+        def_n_res_lm = 8
+        def_n_enc = 8
+        def_n_dit = 8
+        def_patch = 4
+        def_fsq_dim = 256
+        def_no_rope = False
+        def_dec_dim = 2048
+        def_out_sr = 44100
+        def_cond_type = "none"
+        def_sr_bins = []
+    else:                   # VoxCPM2 (2.0)
+        def_n_res_lm = 8
+        def_n_enc = 12
+        def_n_dit = 12
+        def_patch = 4
+        def_fsq_dim = 512
+        def_no_rope = True
+        def_dec_dim = 2048
+        def_out_sr = 48000
+        def_cond_type = "scale_bias"
+        def_sr_bins = [20000, 30000, 40000]
+
+    n_residual_layers = config.get("residual_lm_num_layers", def_n_res_lm)
+    n_encoder_layers = encoder_cfg.get("num_layers", def_n_enc)
+    n_dit_layers = dit_cfg.get("num_layers", def_n_dit)
+    patch_size = config.get("patch_size", def_patch)
     feat_dim = config.get("feat_dim", 64)
-    fsq_latent_dim = config.get("scalar_quantization_latent_dim", 512)
+    fsq_latent_dim = config.get("scalar_quantization_latent_dim", def_fsq_dim)
     fsq_scale = config.get("scalar_quantization_scale", 9)
+    residual_lm_no_rope = config.get("residual_lm_no_rope", def_no_rope)
 
     print(
         f"  Acoustic: ResLM={n_residual_layers}l, LocEnc={n_encoder_layers}l, "
         f"LocDiT={n_dit_layers}l, FSQ dim={fsq_latent_dim}"
     )
-    print(f"            patch_size={patch_size}, feat_dim={feat_dim}")
+    print(f"            patch_size={patch_size}, feat_dim={feat_dim}, no_rope={residual_lm_no_rope}")
 
-    gguf_writer = GGUFWriter(output_path, "voxcpm2-acoustic")
+    gguf_writer = GGUFWriter(output_path, "voxcpm-acoustic")
+
+    # Version
+    gguf_writer.add_float32("voxcpm.model_version", version)
 
     # Metadata
-    gguf_writer.add_uint32("voxcpm2.patch_size", patch_size)
-    gguf_writer.add_uint32("voxcpm2.feat_dim", feat_dim)
-    gguf_writer.add_uint32("voxcpm2.residual_lm.n_layer", n_residual_layers)
-    gguf_writer.add_uint32("voxcpm2.residual_lm.n_embd", n_embd)
-    gguf_writer.add_bool(
-        "voxcpm2.residual_lm.no_rope", config.get("residual_lm_no_rope", True)
-    )
-    gguf_writer.add_uint32("voxcpm2.locenc.n_layer", n_encoder_layers)
-    gguf_writer.add_uint32("voxcpm2.locenc.n_embd", encoder_cfg.get("hidden_dim", 1024))
-    gguf_writer.add_uint32("voxcpm2.locdit.n_layer", n_dit_layers)
-    gguf_writer.add_uint32("voxcpm2.locdit.n_embd", dit_cfg.get("hidden_dim", 1024))
-    gguf_writer.add_uint32("voxcpm2.fsq.latent_dim", fsq_latent_dim)
-    gguf_writer.add_float32("voxcpm2.fsq.scale", float(fsq_scale))
+    gguf_writer.add_uint32("voxcpm.patch_size", patch_size)
+    gguf_writer.add_uint32("voxcpm.feat_dim", feat_dim)
+    gguf_writer.add_uint32("voxcpm.residual_lm.n_layer", n_residual_layers)
+    gguf_writer.add_uint32("voxcpm.residual_lm.n_embd", n_embd)
+    gguf_writer.add_bool("voxcpm.residual_lm.no_rope", residual_lm_no_rope)
+    gguf_writer.add_uint32("voxcpm.locenc.n_layer", n_encoder_layers)
+    gguf_writer.add_uint32("voxcpm.locenc.n_embd", encoder_cfg.get("hidden_dim", 1024))
+    gguf_writer.add_uint32("voxcpm.locdit.n_layer", n_dit_layers)
+    gguf_writer.add_uint32("voxcpm.locdit.n_embd", dit_cfg.get("hidden_dim", 1024))
+    gguf_writer.add_uint32("voxcpm.fsq.latent_dim", fsq_latent_dim)
+    gguf_writer.add_float32("voxcpm.fsq.scale", float(fsq_scale))
     gguf_writer.add_float32(
-        "voxcpm2.cfm.sigma_min", dit_cfg.get("cfm_config", {}).get("sigma_min", 1e-6)
+        "voxcpm.cfm.sigma_min", dit_cfg.get("cfm_config", {}).get("sigma_min", 1e-6)
     )
     gguf_writer.add_float32(
-        "voxcpm2.cfm.cfg_rate",
+        "voxcpm.cfm.cfg_rate",
         dit_cfg.get("cfm_config", {}).get("inference_cfg_rate", 2.0),
     )
 
     # AudioVAE config
     gguf_writer.add_uint32(
-        "voxcpm2.audiovae.encoder_dim", vae_cfg.get("encoder_dim", 128)
+        "voxcpm.audiovae.encoder_dim", vae_cfg.get("encoder_dim", 128)
     )
-    gguf_writer.add_uint32("voxcpm2.audiovae.latent_dim", vae_cfg.get("latent_dim", 64))
+    gguf_writer.add_uint32("voxcpm.audiovae.latent_dim", vae_cfg.get("latent_dim", 64))
     gguf_writer.add_uint32(
-        "voxcpm2.audiovae.decoder_dim", vae_cfg.get("decoder_dim", 2048)
+        "voxcpm.audiovae.decoder_dim", vae_cfg.get("decoder_dim", def_dec_dim)
     )
-    gguf_writer.add_uint32(
-        "voxcpm2.audiovae.sample_rate", vae_cfg.get("sample_rate", 16000)
-    )
-    gguf_writer.add_uint32(
-        "voxcpm2.audiovae.out_sample_rate", vae_cfg.get("out_sample_rate", 48000)
-    )
+    vae_sample_rate = vae_cfg.get("sample_rate", 16000)
+    vae_out_sample_rate = vae_cfg.get("out_sample_rate", def_out_sr)
+    gguf_writer.add_uint32("voxcpm.audiovae.sample_rate", vae_sample_rate)
+    gguf_writer.add_uint32("voxcpm.audiovae.out_sample_rate", vae_out_sample_rate)
     encoder_rates = vae_cfg.get("encoder_rates", [2, 5, 8, 8])
     decoder_rates = vae_cfg.get("decoder_rates", [8, 6, 5, 2, 2, 2])
-    gguf_writer.add_array("voxcpm2.audiovae.encoder_rates", list(encoder_rates))
-    gguf_writer.add_array("voxcpm2.audiovae.decoder_rates", list(decoder_rates))
-    sr_bins = vae_cfg.get("sr_bin_boundaries", [20000, 30000, 40000])
+    gguf_writer.add_array("voxcpm.audiovae.encoder_rates", list(encoder_rates))
+    gguf_writer.add_array("voxcpm.audiovae.decoder_rates", list(decoder_rates))
+    sr_bins = vae_cfg.get("sr_bin_boundaries", def_sr_bins)
     if sr_bins:
-        gguf_writer.add_array("voxcpm2.audiovae.sr_bin_boundaries", list(sr_bins))
+        gguf_writer.add_array("voxcpm.audiovae.sr_bin_boundaries", list(sr_bins))
     gguf_writer.add_string(
-        "voxcpm2.audiovae.cond_type", vae_cfg.get("cond_type", "scale_bias")
+        "voxcpm.audiovae.cond_type", vae_cfg.get("cond_type", def_cond_type)
     )
 
     # LongRoPE frequency factors for LocEnc/LocDiT (read from lm_config)
@@ -688,7 +953,7 @@ def export_acoustic(
         long_factors = rope_scaling.get("long_factor", None)
         if long_factors:
             gguf_writer.add_array(
-                "voxcpm2.rope.long_factor", [float(v) for v in long_factors]
+                "voxcpm.rope.long_factor", [float(v) for v in long_factors]
             )
 
     print("  Writing acoustic tensors...")
@@ -841,13 +1106,20 @@ def export_acoustic(
         gguf_writer.add_tensor(
             f"projections.{name}.bias", sf.get_tensor(f"{name}.bias")
         )
-    # residual fusion projection
-    gguf_writer.add_tensor(
-        "projections.res_fusion_proj.weight", sf.get_tensor("fusion_concat_proj.weight")
-    )
-    gguf_writer.add_tensor(
-        "projections.res_fusion_proj.bias", sf.get_tensor("fusion_concat_proj.bias")
-    )
+    # residual fusion projection (V2 only; absent in V1/0.5B)
+    try:
+        gguf_writer.add_tensor(
+            "projections.res_fusion_proj.weight", sf.get_tensor("fusion_concat_proj.weight")
+        )
+        gguf_writer.add_tensor(
+            "projections.res_fusion_proj.bias", sf.get_tensor("fusion_concat_proj.bias")
+        )
+        print("    fusion_concat_proj: present")
+    except KeyError:
+        if version == 2.0:
+            print("    WARNING: fusion_concat_proj missing for VoxCPM2 model")
+        else:
+            print("    fusion_concat_proj: absent (expected for 0.5B/1.5)")
 
     # ---- StopPredictor ----
     gguf_writer.add_tensor(
@@ -875,11 +1147,6 @@ def _write_audiovae_weights(gguf_writer: GGUFWriter, state_dict: dict, vae_cfg: 
     """Write AudioVAE weights, merging weight_norm (weight_g + weight_v) to single tensors."""
     print("  Writing AudioVAE weights (merging weight_norm)...")
     target_np = np.float16 if dtype == "f16" else np.float32
-
-    encoder_dim = vae_cfg.get("encoder_dim", 128)
-    decoder_dim = vae_cfg.get("decoder_dim", 2048)
-    encoder_rates = vae_cfg.get("encoder_rates", [2, 5, 8, 8])
-    decoder_rates = vae_cfg.get("decoder_rates", [8, 6, 5, 2, 2, 2])
 
     # Build weight map: {base_name: {weight_g: tensor, weight_v: tensor, ...}}
     # First collect all weight_norm pairs
@@ -931,7 +1198,6 @@ def _write_audiovae_weights(gguf_writer: GGUFWriter, state_dict: dict, vae_cfg: 
 
         # Bias
         if "bias" in parts:
-            bias_key = base_name + ".bias" if base_name in written else base_name
             gguf_name_bias = map_audiovae_key(base_name) + ".bias"
             gguf_writer.add_tensor(gguf_name_bias, parts["bias"].astype(target_np))
 
@@ -954,9 +1220,13 @@ def _write_audiovae_weights(gguf_writer: GGUFWriter, state_dict: dict, vae_cfg: 
 # ==============================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert VoxCPM2 weights to GGUF format for llama.cpp-omni"
+        description="Convert VoxCPM/VoxCPM2 weights to GGUF format for llama.cpp-omni"
     )
-    parser.add_argument("--model", required=True, help="Path to model.safetensors")
+    parser.add_argument(
+        "--model",
+        required=True,
+        help="Path to model file: model.safetensors or pytorch_model.bin, or a directory containing one of these",
+    )
     parser.add_argument("--vae", required=True, help="Path to audiovae.pth")
     parser.add_argument("--config", required=True, help="Path to config.json")
     parser.add_argument(
@@ -983,31 +1253,79 @@ def main():
     # Load config
     with open(args.config, "r") as f:
         config = json.load(f)
-    print(f"Architecture: {config.get('architecture', 'unknown')}")
+
+    # Detect model version (architecture) and infer display name (for output files)
+    version = detect_model_version(config)
+    model_name = infer_model_name(config, str(args.model), version)
+    print(f"Architecture: {config.get('architecture', 'unknown')} → {model_name} (v{version})")
     print(f"Output dtype: {dtype}")
 
-    # Load model tensors
-    print(f"Loading safetensors: {args.model}")
-    sf = SafeTensorFile(args.model, target_dtype=dtype)
-    print(f"  {len(sf.keys())} tensors")
+    # Resolve model path: accept a directory or a direct file path
+    model_path = Path(args.model)
+    if model_path.is_dir():
+        safetensors_path = model_path / "model.safetensors"
+        pytorch_bin_path = model_path / "pytorch_model.bin"
+    else:
+        safetensors_path = model_path
+        pytorch_bin_path = model_path
 
-    # Load AudioVAE
+    # Load model weights (safetensors or pytorch pickle)
     import torch
 
+    if safetensors_path.exists() and safetensors_path.suffix == ".safetensors":
+        print(f"Loading safetensors: {safetensors_path}")
+        sf = SafeTensorFile(str(safetensors_path), target_dtype=dtype)
+        print(f"  {len(sf.keys())} tensors")
+    elif pytorch_bin_path.exists() and pytorch_bin_path.suffix in (".bin", ".pt", ".pth"):
+        print(f"Loading pytorch checkpoint: {pytorch_bin_path}")
+        checkpoint = torch.load(str(pytorch_bin_path), map_location="cpu", weights_only=True)
+        if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+            state_dict = checkpoint["state_dict"]
+        elif isinstance(checkpoint, dict):
+            state_dict = checkpoint
+        else:
+            raise ValueError(f"Unexpected checkpoint format: {type(checkpoint)}")
+
+        # Convert torch tensors to numpy
+        print(f"  Converting {len(state_dict)} tensors to numpy...")
+        np_weights = {}
+        for key, value in state_dict.items():
+            if hasattr(value, 'numpy'):
+                t = value
+                if t.dtype == torch.bfloat16:
+                    t = t.float()
+                np_weights[key] = t.numpy()
+            elif isinstance(value, np.ndarray):
+                np_weights[key] = value
+            else:
+                print(f"  WARNING: skipping {key} (type={type(value)})")
+        sf = DictWeightSource(np_weights, target_dtype=dtype)
+        print(f"  {len(sf.keys())} tensors")
+    else:
+        raise FileNotFoundError(
+            f"No model file found at {args.model}. "
+            f"Expected model.safetensors or pytorch_model.bin"
+        )
+
+    # Load AudioVAE
     print(f"Loading AudioVAE: {args.vae}")
     vae_data = torch.load(args.vae, map_location="cpu", weights_only=True)
     vae_state_dict = vae_data.get("state_dict", vae_data)
 
+    # Infer AudioVAE config if missing (V1/0.5B)
+    if "audio_vae_config" not in config:
+        config["audio_vae_config"] = infer_audio_vae_config(config, vae_state_dict)
+
     # Export BaseLM
-    print("\n=== Exporting BaseLM ===")
-    base_lm_path = os.path.join(args.output, f"VoxCPM2-BaseLM-{dtype_upper}.gguf")
+    print(f"\n=== Exporting {model_name} BaseLM ===")
+    base_lm_path = os.path.join(args.output, f"{model_name}-BaseLM-{dtype_upper}.gguf")
     tokenizer_dir = args.tokenizer_dir or os.path.dirname(os.path.abspath(args.config))
-    export_baselm(sf, config, base_lm_path, tokenizer_dir, dtype)
+    export_baselm(sf, config, base_lm_path, tokenizer_dir, dtype, version)
 
     # Export Acoustic
-    print("\n=== Exporting Acoustic ===")
-    acoustic_path = os.path.join(args.output, f"VoxCPM2-Acoustic-{dtype_upper}.gguf")
-    export_acoustic(sf, vae_state_dict, config, acoustic_path, dtype)
+    print(f"\n=== Exporting {model_name} Acoustic ===")
+    acoustic_path = os.path.join(args.output, f"{model_name}-Acoustic-{dtype_upper}.gguf")
+    export_acoustic(sf, vae_state_dict, config, acoustic_path, dtype, version)
 
     sf.close()
 

@@ -317,6 +317,18 @@ bool VoxCPM2GGUFWeightStore::get_f32(const char * key, float & dst) const {
     return true;
 }
 
+bool VoxCPM2GGUFWeightStore::get_bool(const char * key, bool & dst) const {
+    if (!ctx_gguf) {
+        return false;
+    }
+    const int64_t id = gguf_find_key(ctx_gguf, key);
+    if (id < 0) {
+        return false;
+    }
+    dst = gguf_get_val_bool(ctx_gguf, id);
+    return true;
+}
+
 bool VoxCPM2GGUFWeightStore::get_string(const char * key, std::string & dst) const {
     if (!ctx_gguf) {
         return false;
@@ -570,7 +582,7 @@ ggml_tensor * voxcpm2_build_cfg_pair_attention_mask(ggml_context * ctx, int bran
 
 std::vector<float> voxcpm2_load_rope_factors(const VoxCPM2GGUFWeightStore & store) {
     std::vector<float> factors;
-    if (store.get_f32_array("voxcpm2.rope.long_factor", factors) && !factors.empty()) {
+    if (store.get_f32_array("voxcpm.rope.long_factor", factors) && !factors.empty()) {
         return factors;
     }
     LOG_WRN("VoxCPM2Transformer: using hardcoded rope factors (not found in GGUF)\n");

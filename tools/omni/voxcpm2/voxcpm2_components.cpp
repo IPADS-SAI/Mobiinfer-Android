@@ -61,9 +61,12 @@ bool VoxCPM2Projections::validate_weights() const {
                          config.dit_hidden_size)) {
         return false;
     }
-    if (!validate_linear("VoxCPM2Projections.res_fusion_proj", weights.res_fusion_proj, config.lm_hidden_size * 2,
-                         config.lm_hidden_size)) {
-        return false;
+    // res_fusion_proj is optional (absent in v0.5 / v1.5)
+    if (weights.res_fusion_proj.weight) {
+        if (!validate_linear("VoxCPM2Projections.res_fusion_proj", weights.res_fusion_proj, config.lm_hidden_size * 2,
+                             config.lm_hidden_size)) {
+            return false;
+        }
     }
     return true;
 }
@@ -157,7 +160,10 @@ ggml_tensor * VoxCPM2Projections::build_dit_condition(ggml_context * ctx,
 
     ggml_tensor * dit_hidden_1 = lm_to_dit(ctx, lm_hidden);
     ggml_tensor * dit_hidden_2 = res_to_dit(ctx, residual_hidden);
-    return ggml_concat(ctx, dit_hidden_1, dit_hidden_2, 0);
+    if (has_fusion()) {
+        return ggml_concat(ctx, dit_hidden_1, dit_hidden_2, 0);   // → 2*dit_hidden
+    }
+    return ggml_add(ctx, dit_hidden_1, dit_hidden_2);              // → dit_hidden
 }
 
 ggml_tensor * VoxCPM2Projections::build_residual_fusion(ggml_context * ctx,
@@ -169,8 +175,11 @@ ggml_tensor * VoxCPM2Projections::build_residual_fusion(ggml_context * ctx,
     GGML_ASSERT(blended->ne[0] == config.lm_hidden_size);
     GGML_ASSERT(feat_embed->ne[0] == config.lm_hidden_size);
 
-    ggml_tensor * fused_input = ggml_concat(ctx, blended, feat_embed, 0);
-    return voxcpm2_linear(ctx, weights.res_fusion_proj.weight, weights.res_fusion_proj.bias, fused_input);
+    if (has_fusion()) {
+        ggml_tensor * fused_input = ggml_concat(ctx, blended, feat_embed, 0);
+        return voxcpm2_linear(ctx, weights.res_fusion_proj.weight, weights.res_fusion_proj.bias, fused_input);
+    }
+    return ggml_add(ctx, blended, feat_embed);  // no projection — element-wise sum
 }
 
 StopTokenPredictor::~StopTokenPredictor() {

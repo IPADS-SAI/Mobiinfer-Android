@@ -73,11 +73,14 @@ bool LocDiTModel::bind_from_store() {
         return false;
     }
 
-    store->get_u32("voxcpm2.patch_size", config.patch_size);
-    store->get_u32("voxcpm2.feat_dim", config.feat_dim);
-    store->get_u32("voxcpm2.locdit.n_layer", config.transformer.n_layer);
-    store->get_u32("voxcpm2.locdit.n_embd", config.transformer.hidden_size);
-    store->get_f32("voxcpm2.cfm.cfg_rate", config.cfg_rate);
+    store->get_u32("voxcpm.patch_size", config.patch_size);
+    store->get_u32("voxcpm.feat_dim", config.feat_dim);
+    store->get_u32("voxcpm.locdit.n_layer", config.transformer.n_layer);
+    store->get_u32("voxcpm.locdit.n_embd", config.transformer.hidden_size);
+    store->get_f32("voxcpm.cfm.cfg_rate", config.cfg_rate);
+    float model_version = 2.0f;
+    store->get_f32("voxcpm.model_version", model_version);
+    config.combine_mu_time = model_version < 2.0f;
     config.transformer.max_length = 4096;
     config.transformer.no_rope    = false;
 
@@ -132,8 +135,9 @@ bool LocDiTModel::init_from_gguf(const std::string & path, ggml_backend_t backen
         return false;
     }
 
-    LOG_INF("LocDiTModel: loaded layers=%d hidden=%d feat_dim=%d patch_size=%d cfg=%.3f\n", config.transformer.n_layer,
-            config.transformer.hidden_size, config.feat_dim, config.patch_size, config.cfg_rate);
+    LOG_INF("LocDiTModel: loaded layers=%d hidden=%d feat_dim=%d patch_size=%d cfg=%.3f mode=%s\n",
+            config.transformer.n_layer, config.transformer.hidden_size, config.feat_dim, config.patch_size,
+            config.cfg_rate, config.combine_mu_time ? "v1-mu-plus-time" : "v2-mu-time-tokens");
     return true;
 }
 
@@ -271,10 +275,11 @@ ggml_tensor * LocDiTModel::forward_single(ggml_context * ctx,
     ggml_tensor * cond_proj  = (cond && prefix_len > 0) ? project_condition(ctx, cond) : nullptr;
     ggml_tensor * time_token = build_time_token(ctx, t_scalar, dt_scalar);
 
-    if (mu_tokens == 1) {
+    if (config.combine_mu_time) {
+        GGML_ASSERT(mu_tokens == 1);
         ggml_tensor * mu_2d    = ggml_reshape_2d(ctx, mu, config.transformer.hidden_size, 1);
-        ggml_tensor * combined = ggml_concat(ctx, mu_2d, time_token, 1);
-        return forward_projected(ctx, x_proj, combined, cond_proj, 2, static_cast<int>(prefix_len),
+        ggml_tensor * combined = ggml_add(ctx, mu_2d, time_token);
+        return forward_projected(ctx, x_proj, combined, cond_proj, 1, static_cast<int>(prefix_len),
                                  static_cast<int>(seq_len));
     }
 
@@ -305,11 +310,12 @@ void LocDiTModel::forward_cfg_pair_projected(ggml_context * ctx,
 
     ggml_tensor * conditioned_prefix   = nullptr;
     ggml_tensor * unconditioned_prefix = nullptr;
-    if (mu_tokens == 1) {
+    if (config.combine_mu_time) {
+        GGML_ASSERT(mu_tokens == 1);
         ggml_tensor * mu_2d   = ggml_reshape_2d(ctx, mu, config.transformer.hidden_size, 1);
-        conditioned_prefix    = ggml_concat(ctx, mu_2d, time_token, 1);
+        conditioned_prefix    = ggml_add(ctx, mu_2d, time_token);
         ggml_tensor * zero_mu = ggml_scale(ctx, mu_2d, 0.0f);
-        unconditioned_prefix  = ggml_concat(ctx, zero_mu, time_token, 1);
+        unconditioned_prefix  = ggml_add(ctx, zero_mu, time_token);
     } else {
         ggml_tensor * mu_prefix      = reshape_mu_tokens(ctx, mu);
         ggml_tensor * zero_mu_prefix = ggml_scale(ctx, mu_prefix, 0.0f);
@@ -317,7 +323,7 @@ void LocDiTModel::forward_cfg_pair_projected(ggml_context * ctx,
         unconditioned_prefix         = ggml_concat(ctx, zero_mu_prefix, time_token, 1);
     }
 
-    const int generated_prefix_tokens = mu_tokens + 1;
+    const int generated_prefix_tokens = config.combine_mu_time ? 1 : mu_tokens + 1;
     const int branch_len              = prefix_len + seq_len + generated_prefix_tokens;
     const int total_len               = branch_len * 2;
 

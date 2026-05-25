@@ -301,15 +301,15 @@ bool AudioVAEModel::bind_from_store() {
         return false;
     }
 
-    store->get_u32("voxcpm2.audiovae.encoder_dim", config.encoder_dim);
-    store->get_u32("voxcpm2.audiovae.latent_dim", config.latent_dim);
-    store->get_u32("voxcpm2.audiovae.decoder_dim", config.decoder_dim);
-    store->get_u32("voxcpm2.audiovae.sample_rate", config.sample_rate);
-    store->get_u32("voxcpm2.audiovae.out_sample_rate", config.out_sample_rate);
-    store->get_i32_array("voxcpm2.audiovae.encoder_rates", config.encoder_rates);
-    store->get_i32_array("voxcpm2.audiovae.decoder_rates", config.decoder_rates);
-    store->get_i32_array("voxcpm2.audiovae.sr_bin_boundaries", config.sr_bin_boundaries);
-    store->get_string("voxcpm2.audiovae.cond_type", config.cond_type);
+    store->get_u32("voxcpm.audiovae.encoder_dim", config.encoder_dim);
+    store->get_u32("voxcpm.audiovae.latent_dim", config.latent_dim);
+    store->get_u32("voxcpm.audiovae.decoder_dim", config.decoder_dim);
+    store->get_u32("voxcpm.audiovae.sample_rate", config.sample_rate);
+    store->get_u32("voxcpm.audiovae.out_sample_rate", config.out_sample_rate);
+    store->get_i32_array("voxcpm.audiovae.encoder_rates", config.encoder_rates);
+    store->get_i32_array("voxcpm.audiovae.decoder_rates", config.decoder_rates);
+    store->get_i32_array("voxcpm.audiovae.sr_bin_boundaries", config.sr_bin_boundaries);
+    store->get_string("voxcpm.audiovae.cond_type", config.cond_type);
 
     if (!load_encoder_weights() || !load_decoder_weights()) {
         return false;

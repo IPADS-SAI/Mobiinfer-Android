@@ -12,6 +12,11 @@ struct VoxCPM2LocDiTConfig {
     int                      feat_dim   = 64;
     int                      patch_size = 4;
     float                    cfg_rate   = 2.0f;
+    // VoxCPM v1/v1.5 LocDiT uses one generated prefix token:
+    //   (mu + time)
+    // VoxCPM2 uses separate prefix token(s):
+    //   mu_token(s), time
+    bool                     combine_mu_time = false;
     VoxCPM2TransformerConfig transformer;
 };
 

@@ -45,10 +45,18 @@ struct VoxCPM2Projections {
     ggml_tensor * res_to_dit(ggml_context * ctx, ggml_tensor * residual_hidden) const;
     ggml_tensor * res_fusion(ggml_context * ctx, ggml_tensor * blended, ggml_tensor * feat_embed) const;
 
-    // VoxCPM2 uses concat([lm_to_dit(lm_hidden), res_to_dit(residual_hidden)]).
+    // Whether the fusion_concat_proj linear layer is present.
+    // Present in VoxCPM2 (v2.0); absent in VoxCPM-0.5B / VoxCPM-1.5.
+    bool has_fusion() const { return weights.res_fusion_proj.weight != nullptr; }
+
+    // Build LocDiT condition vector.
+    //   v2.0: concat([lm_to_dit(lm_hidden), res_to_dit(residual_hidden)])  → 2*dit_hidden
+    //   v0.5/1.5: add(lm_to_dit(lm_hidden), res_to_dit(residual_hidden))   → dit_hidden
     ggml_tensor * build_dit_condition(ggml_context * ctx, ggml_tensor * lm_hidden, ggml_tensor * residual_hidden) const;
 
-    // ResidualLM input bridge: fusion_concat_proj(concat([blended, feat_embed])).
+    // Build ResidualLM input.
+    //   v2.0: fusion_concat_proj(concat([blended, feat_embed]))  → lm_hidden
+    //   v0.5/1.5: add(blended, feat_embed)                       → lm_hidden
     ggml_tensor * build_residual_fusion(ggml_context * ctx, ggml_tensor * blended, ggml_tensor * feat_embed) const;
 
     void free();
