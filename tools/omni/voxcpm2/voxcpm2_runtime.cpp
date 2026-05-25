@@ -1328,8 +1328,18 @@ std::vector<float> VoxCPM2Runtime::decode_to_waveform(int target_sr) {
     ggml_set_output(waveform);
     ggml_build_forward_expand(graph, waveform);
 
-    BackendBufferGuard buffer(ggml_backend_alloc_ctx_tensors(ctx, backend));
-    if (!buffer.buffer) {
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!galloc) {
+        fail("failed to create AudioVAE decode graph allocator");
+        return {};
+    }
+    if (!ggml_gallocr_reserve(galloc, graph)) {
+        ggml_gallocr_free(galloc);
+        fail("failed to reserve AudioVAE decode graph memory");
+        return {};
+    }
+    if (!ggml_gallocr_alloc_graph(galloc, graph)) {
+        ggml_gallocr_free(galloc);
         fail("failed to allocate AudioVAE decode graph tensors");
         return {};
     }
@@ -1337,11 +1347,14 @@ std::vector<float> VoxCPM2Runtime::decode_to_waveform(int target_sr) {
     ggml_backend_tensor_set(latents_t, latents.data(), 0, latents.size() * sizeof(float));
     audio_vae.prepare_decode_inputs();
     if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+        ggml_gallocr_free(galloc);
         fail("AudioVAE decode graph compute failed");
         return {};
     }
 
-    return tensor_to_vector(waveform);
+    auto result = tensor_to_vector(waveform);
+    ggml_gallocr_free(galloc);
+    return result;
 }
 
 std::vector<float> VoxCPM2Runtime::encode_reference_audio(const std::vector<float> & reference_wav, int sample_rate) {
@@ -1382,14 +1395,25 @@ std::vector<float> VoxCPM2Runtime::encode_reference_audio(const std::vector<floa
     ggml_set_output(patch_major);
     ggml_build_forward_expand(graph, patch_major);
 
-    BackendBufferGuard buffer(ggml_backend_alloc_ctx_tensors(ctx, backend));
-    if (!buffer.buffer) {
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!galloc) {
+        fail("failed to create AudioVAE encode graph allocator");
+        return {};
+    }
+    if (!ggml_gallocr_reserve(galloc, graph)) {
+        ggml_gallocr_free(galloc);
+        fail("failed to reserve AudioVAE encode graph memory");
+        return {};
+    }
+    if (!ggml_gallocr_alloc_graph(galloc, graph)) {
+        ggml_gallocr_free(galloc);
         fail("failed to allocate AudioVAE encode graph tensors");
         return {};
     }
 
     ggml_backend_tensor_set(waveform_t, audio.data(), 0, audio.size() * sizeof(float));
     if (ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+        ggml_gallocr_free(galloc);
         fail("AudioVAE encode graph compute failed");
         return {};
     }
@@ -1397,15 +1421,19 @@ std::vector<float> VoxCPM2Runtime::encode_reference_audio(const std::vector<floa
     const int total_latent_frames = static_cast<int>(latent->ne[0]);
     const int latent_dim          = static_cast<int>(latent->ne[1]);
     if (latent_dim != feat_dim()) {
+        ggml_gallocr_free(galloc);
         fail("AudioVAE reference latent dimension does not match VoxCPM2 feat_dim");
         return {};
     }
     if (total_latent_frames <= 0 || total_latent_frames % patch_size() != 0) {
+        ggml_gallocr_free(galloc);
         fail("AudioVAE reference latent frames are not divisible by patch_size");
         return {};
     }
 
-    return tensor_to_vector(patch_major);
+    auto result = tensor_to_vector(patch_major);
+    ggml_gallocr_free(galloc);
+    return result;
 }
 
 std::vector<int32_t> VoxCPM2Runtime::expand_multichar_cjk_tokens(const std::vector<int32_t> & ids) const {
