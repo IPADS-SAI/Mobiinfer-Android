@@ -686,6 +686,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 }
             } break;
         case LLM_ARCH_MINICPM:
+        case LLM_ARCH_MINICPM4:
             {
                 // Backward-compatible defaults for older MiniCPM GGUFs
                 hparams.f_embedding_scale = 12.0f;
@@ -2391,6 +2392,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             case LLM_ARCH_LLAMA:
             case LLM_ARCH_REFACT:
             case LLM_ARCH_MINICPM:
+            case LLM_ARCH_MINICPM4:
             case LLM_ARCH_GRANITE:
             case LLM_ARCH_GRANITE_MOE:
                 {
@@ -19866,6 +19868,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
         case LLM_ARCH_GRANITE:
         case LLM_ARCH_GRANITE_MOE:
         case LLM_ARCH_MINICPM:
+        case LLM_ARCH_MINICPM4:
             {
                 llm = std::make_unique<llm_build_granite>(*this, params);
             } break;
@@ -20092,6 +20095,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_BAICHUAN:
         case LLM_ARCH_STARCODER:
         case LLM_ARCH_INTERNLM2:
+        case LLM_ARCH_MINICPM:
         case LLM_ARCH_XVERSE:
         case LLM_ARCH_COMMAND_R:
         case LLM_ARCH_COHERE2:
@@ -20152,8 +20156,8 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_NEMOTRON:
         case LLM_ARCH_EXAONE:
         case LLM_ARCH_EXAONE4:
-        case LLM_ARCH_MINICPM:
         case LLM_ARCH_MINICPM3:
+        case LLM_ARCH_MINICPM4:
         case LLM_ARCH_DOTS1:
         case LLM_ARCH_HUNYUAN_MOE:
         case LLM_ARCH_OPENAI_MOE:

@@ -115,6 +115,7 @@ static bool read_embedding_scale(const std::string & path, float & scale) {
     }
 
     const char * keys[] = {
+        "minicpm4.embedding_scale",
         "minicpm.embedding_scale",
         "llama.embedding_scale",
     };

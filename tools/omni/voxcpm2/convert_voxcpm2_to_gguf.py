@@ -696,7 +696,7 @@ def export_baselm(
         f"          scale_emb={f_embedding_scale}, residual_scale={f_residual_scale:.4f}, logit_scale={f_logit_scale:.4f}"
     )
 
-    arch = "minicpm"
+    arch = "minicpm4"
     gguf_writer = GGUFWriter(output_path, arch)
 
     # Metadata — Keys use {arch} placeholder, must format before passing
