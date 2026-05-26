@@ -2,12 +2,18 @@
 
 find_package(Threads REQUIRED)
 
-# CoreML / ANE support option
-option(ENABLE_COREML "Enable CoreML/ANE support for vision encoder" OFF)
+# CoreML / ANE support option：在 macOS 上默认开，其它平台默认关
+if(APPLE)
+    option(ENABLE_COREML "Enable CoreML/ANE support for vision encoder" ON)
+else()
+    option(ENABLE_COREML "Enable CoreML/ANE support for vision encoder" OFF)
+endif()
 
 add_library(omni
             omni.cpp
             omni.h
+            tts-condition-graph.cpp
+            tts-condition-graph.h
             audition.cpp
             audition.h
             vision.cpp
@@ -17,6 +23,7 @@ add_library(omni
             token2wav/token2wav-impl.h
             token2wav/token2wav.cpp
             token2wav/token2wav.h
+            token2wav/token2wav-profile.h
             )
 
 # Add CoreML related files when enabled
@@ -94,6 +101,20 @@ endif()
 target_link_libraries  (${TARGET} PRIVATE common omni Threads::Threads)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
+# 单工模式 - 纯音频测试（批量 prefill + 单次 decode）
+set(TARGET_SINGLE_TEST_AUDIO llama-omni-single-test-audio)
+add_executable         (${TARGET_SINGLE_TEST_AUDIO} test/single_test_audio.cpp)
+set_target_properties  (${TARGET_SINGLE_TEST_AUDIO} PROPERTIES OUTPUT_NAME llama-omni-single-test-audio)
+target_link_libraries  (${TARGET_SINGLE_TEST_AUDIO} PRIVATE common omni Threads::Threads)
+target_compile_features(${TARGET_SINGLE_TEST_AUDIO} PRIVATE cxx_std_17)
+
+# 单工模式 - Omni (audio+vision) 测试
+set(TARGET_SINGLE_TEST_OMNI llama-omni-single-test-omni)
+add_executable         (${TARGET_SINGLE_TEST_OMNI} test/single_test_omni.cpp)
+set_target_properties  (${TARGET_SINGLE_TEST_OMNI} PROPERTIES OUTPUT_NAME llama-omni-single-test-omni)
+target_link_libraries  (${TARGET_SINGLE_TEST_OMNI} PRIVATE common omni Threads::Threads)
+target_compile_features(${TARGET_SINGLE_TEST_OMNI} PRIVATE cxx_std_17)
+
 # VoxCPM2 MiniCPMLM wrapper (shared with omni and test)
 add_library(voxcpm2_llm STATIC
     voxcpm2/voxcpm2_llm.cpp
@@ -151,10 +172,10 @@ set_target_properties  (${TARGET_DUPLEX_TEST} PROPERTIES OUTPUT_NAME llama-omni-
 target_link_libraries  (${TARGET_DUPLEX_TEST} PRIVATE common omni Threads::Threads)
 target_compile_features(${TARGET_DUPLEX_TEST} PRIVATE cxx_std_17)
 
-# # Token2Wav 测试程序 - 完整 C++ 语音合成
-# add_executable(token2wav-example token2wav/token2wav-example.cpp)
-# target_link_libraries(token2wav-example PRIVATE common omni Threads::Threads)
-# target_compile_features(token2wav-example PRIVATE cxx_std_17)
+# Token2Wav 测试程序 - 纯 C++ 单线程 baseline（用于 profile 对照，不占 LLM/TTS GPU）
+add_executable(token2wav-example token2wav/token2wav-example.cpp)
+target_link_libraries(token2wav-example PRIVATE common omni Threads::Threads)
+target_compile_features(token2wav-example PRIVATE cxx_std_17)
 
 # VoxCPM2 CLI demo
 set(TARGET_VOXCPM2_CLI voxcpm2-cli)
