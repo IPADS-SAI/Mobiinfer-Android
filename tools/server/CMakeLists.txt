@@ -57,3 +57,24 @@ install(TARGETS ${TARGET} RUNTIME)
 
 target_link_libraries(${TARGET} PRIVATE llama-server-impl)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+# llama-omni-server executable (standalone omni HTTP API)
+
+if (LLAMA_OPENSSL)
+    find_package(OpenSSL)
+endif()
+
+set(TARGET_OMNI llama-omni-server)
+
+add_executable(${TARGET_OMNI} server-omni.cpp)
+install(TARGETS ${TARGET_OMNI} RUNTIME)
+
+target_link_libraries(${TARGET_OMNI} PRIVATE omni llama-common cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
+if (LLAMA_OPENSSL AND OpenSSL_FOUND)
+    target_link_libraries(${TARGET_OMNI} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_definitions(${TARGET_OMNI} PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
+endif()
+target_compile_features(${TARGET_OMNI} PRIVATE cxx_std_17)
+target_include_directories(${TARGET_OMNI} PRIVATE ${CMAKE_SOURCE_DIR})
+target_include_directories(${TARGET_OMNI} PRIVATE ${CMAKE_SOURCE_DIR}/vendor/cpp-httplib)
+target_include_directories(${TARGET_OMNI} PRIVATE ${CMAKE_SOURCE_DIR}/vendor)
