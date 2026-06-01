@@ -87,6 +87,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
+// Get RNG from sampler chain for multinomial sampling (for TTS audio_bos sampling)
+void* common_sampler_get_rng(struct common_sampler * gsmpl);
+
 // helpers
 
 // access the internal list of current candidate tokens

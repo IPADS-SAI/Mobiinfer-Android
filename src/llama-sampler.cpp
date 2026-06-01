@@ -3850,6 +3850,27 @@ uint32_t llama_sampler_get_seed(const struct llama_sampler * smpl) {
     return LLAMA_DEFAULT_SEED;
 }
 
+void * llama_sampler_get_rng(const struct llama_sampler * smpl) {
+    if (smpl->iface == &llama_sampler_dist_i) {
+        return &((llama_sampler_dist *) smpl->ctx)->rng;
+    }
+
+    // check if this is a chain of samplers
+    if (smpl->iface == &llama_sampler_chain_i) {
+        // iterate in reverse order to find dist sampler
+        const int n_samplers = llama_sampler_chain_n((struct llama_sampler *) smpl);
+        for (int i = n_samplers - 1; i >= 0; i--) {
+            const struct llama_sampler * it = llama_sampler_chain_get((struct llama_sampler *) smpl, i);
+            void * rng = llama_sampler_get_rng(it);
+            if (rng != nullptr) {
+                return rng;
+            }
+        }
+    }
+
+    return nullptr;
+}
+
 // perf
 
 struct llama_perf_sampler_data llama_perf_sampler(const struct llama_sampler * chain) {

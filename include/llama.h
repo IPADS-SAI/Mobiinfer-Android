@@ -1468,6 +1468,10 @@ extern "C" {
     // Returns the seed used by the sampler if applicable, LLAMA_DEFAULT_SEED otherwise
     LLAMA_API uint32_t llama_sampler_get_seed(const struct llama_sampler * smpl);
 
+    // Returns pointer to the rng (std::mt19937) used by the dist sampler if applicable, NULL otherwise
+    // (used for TTS audio_bos sampling that needs to share the RNG for reproducibility)
+    LLAMA_API void *   llama_sampler_get_rng (const struct llama_sampler * smpl);
+
     /// @details Sample and accept a token from the idx-th output of the last evaluation
     //
     // Shorthand for:

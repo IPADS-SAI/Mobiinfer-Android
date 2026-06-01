@@ -661,6 +661,13 @@ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
     return llama_sampler_get_seed(gsmpl->chain);
 }
 
+void * common_sampler_get_rng(struct common_sampler * gsmpl) {
+    if (!gsmpl || !gsmpl->chain) {
+        return nullptr;
+    }
+    return llama_sampler_get_rng(gsmpl->chain);
+}
+
 // helpers
 
 llama_token_data_array * common_sampler_get_candidates(struct common_sampler * gsmpl, bool do_sort) {

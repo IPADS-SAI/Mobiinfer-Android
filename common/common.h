@@ -572,6 +572,13 @@ struct common_params {
     int image_min_tokens = -1;
     int image_max_tokens = -1;
 
+    // omni models (see tools/omni)
+    std::string tts_model               = ""; // TTS weights GGUF
+    std::string apm_model               = ""; // audio encoder GGUF
+    std::string vpm_model               = ""; // vision encoder GGUF
+    std::string projector_model         = ""; // projector GGUF
+    std::string vision_coreml_model_path = ""; // path to CoreML .mlmodelc for vision ANE
+
     // finetune
     struct lr_opt lr;
     enum ggml_opt_optimizer_type optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
