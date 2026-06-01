@@ -178,13 +178,14 @@ int main(int argc, char ** argv) {
 
         std::string audio_path = data.at("audio_path_prefix");
         std::string img_path   = data.value("img_path_prefix", "");
+        std::string text       = data.value("text", "");
         int cnt                = data.at("cnt");
         int max_slice_nums     = data.value("max_slice_nums", -1);
 
         bool ok = false;
         {
             std::lock_guard<std::mutex> lock(state.octx_mutex);
-            ok = stream_prefill(state.octx, audio_path, img_path, cnt, max_slice_nums);
+            ok = stream_prefill(state.octx, audio_path, img_path, cnt, max_slice_nums, text);
         }
 
         if (!ok) {
