@@ -20,9 +20,15 @@ typedef std::unique_ptr<ggml_metal_device, ggml_metal_device_deleter> ggml_metal
 ggml_metal_device_t ggml_metal_device_get(int device) {
     static std::vector<ggml_metal_device_ptr> devs;
 
-    devs.emplace_back(ggml_metal_device_init(device));
+    if ((int) devs.size() <= device) {
+        devs.resize(device + 1);
+    }
 
-    return devs.back().get();
+    if (!devs[device]) {
+        devs[device].reset(ggml_metal_device_init(device));
+    }
+
+    return devs[device].get();
 }
 
 struct ggml_metal_pipelines {

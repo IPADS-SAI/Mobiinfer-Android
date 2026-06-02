@@ -1715,6 +1715,7 @@ struct hg2_gguf_model_loader {
     ggml_backend_buffer_t buf_weights = nullptr;
     std::unordered_map<std::string, ggml_tensor *> tensors;
     std::string                                    path;
+    ~hg2_gguf_model_loader() { hg_gguf_model_loader_reset(); }
     void          hg_gguf_model_loader_reset();
     bool          hg_gguf_model_loader_load_from_file(const std::string & gguf_path, ggml_backend_t backend_in);
     ggml_tensor * hg_gguf_model_loader_get_tensor(const std::string & name) const;
@@ -1945,6 +1946,7 @@ struct voc_hg2_model {
     std::shared_ptr<void> weights_owner;
     std::shared_ptr<hifigan2::hg2_model> hg2;
     int32_t num_threads = 1;
+    ~voc_hg2_model() { voc_hg2_model_free(); }
     bool voc_hg2_model_init_from_gguf(const std::string & gguf_path_in,
                                       const std::string & device,
                                       int32_t             num_threads_in);

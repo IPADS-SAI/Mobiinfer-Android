@@ -4442,7 +4442,7 @@ void omni_free(struct omni_context * ctx_omni) {
         }
     }
     
-    delete ctx_omni->ctx_vision;
+    vision_free(ctx_omni->ctx_vision);
     audition_free(ctx_omni->ctx_audio);
     
     if (ctx_omni->use_tts) {
