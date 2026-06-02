@@ -3776,7 +3776,8 @@ static struct llama_model * llama_init_tts(common_params * params, std::string m
     llama_numa_init(params->numa);
     
     llama_model_params model_params = common_model_params_to_llama(*params);
-    
+    model_params.partial_load = true;  // TTS GGUF contains extra tensors (emb_code, head_code, projector_*) beyond standard llama
+
     // 如果指定了override值(>=0)，使用它；否则保持与LLM相同的设置
     if (n_gpu_layers_override >= 0) {
         model_params.n_gpu_layers = n_gpu_layers_override;

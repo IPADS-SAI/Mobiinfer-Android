@@ -504,319 +504,388 @@ namespace GGUFMeta {
     // TODO: this is not very clever - figure out something better
     template bool llama_model_loader::get_key_or_arr<std::array<int, 4>>(enum llm_kv kid, std::array<int, 4> & result, uint32_t n, bool required);
     template bool llama_model_loader::get_key_or_arr<std::array<uint32_t, 512>>(enum llm_kv kid, std::array<uint32_t, 512> & result, uint32_t n, bool required);
-    template bool llama_model_loader::get_key_or_arr<std::array<float, 512>>(enum llm_kv kid, std::array<float, 512> & result, uint32_t n, bool required);
+    template bool llama_model_loader::get_key_or_arr<std::array<float, 512>>(enum llm_kv              kid,
+                                                                             std::array<float, 512> & result,
+                                                                             uint32_t                 n,
+                                                                             bool                     required);
 
-
-llama_model_loader::llama_model_loader(
-        struct gguf_context * meta,
-        llama_model_set_tensor_data_t set_tensor_data,
-        void * set_tensor_data_ud,
-        const std::string & fname,
-        std::vector<std::string> & splits,
-        FILE * file,
-        bool use_mmap,
-        bool use_direct_io,
-        bool check_tensors,
-        bool no_alloc,
-        const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
-        : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
-    int trace = 0;
-    if (getenv("LLAMA_TRACE")) {
-        trace = atoi(getenv("LLAMA_TRACE"));
-    }
-
-    if (param_overrides_p != nullptr) {
-        for (const struct llama_model_kv_override * p = param_overrides_p; p->key[0] != 0; p++) {
-            kv_overrides.insert({std::string(p->key), *p});
-        }
-    }
-
-    tensor_buft_overrides = param_tensor_buft_overrides_p;
-
-    if (!fname.empty()) {
-        // Load the main GGUF
-        struct ggml_context * ctx = NULL;
-        struct gguf_init_params params = {
-            /*.no_alloc = */ true,
-            /*.ctx      = */ &ctx,
-        };
-
-        metadata_ptr.reset(gguf_init_from_file(fname.c_str(), params));
-        metadata = metadata_ptr.get();
-        if (metadata == nullptr) {
-            throw std::runtime_error(format("%s: failed to load model from %s", __func__, fname.c_str()));
+    llama_model_loader::llama_model_loader(struct gguf_context *                    meta,
+                                           llama_model_set_tensor_data_t            set_tensor_data,
+                                           void *                                   set_tensor_data_ud,
+                                           const std::string &                      fname,
+                                           std::vector<std::string> &               splits,
+                                           FILE *                                   file,
+                                           bool                                     use_mmap,
+                                           bool                                     use_direct_io,
+                                           bool                                     check_tensors,
+                                           bool                                     no_alloc,
+                                           const llama_model_kv_override *          param_overrides_p,
+                                           const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+                                           bool                                     partial_load) :
+        partial_load(partial_load),
+        metadata(meta),
+        set_tensor_data(set_tensor_data),
+        set_tensor_data_ud(set_tensor_data_ud) {
+        int trace = 0;
+        if (getenv("LLAMA_TRACE")) {
+            trace = atoi(getenv("LLAMA_TRACE"));
         }
 
-        get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
-        llm_kv = LLM_KV(llm_arch_from_string(arch_name));
-
-        files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
-        contexts.emplace_back(ctx);
-
-        if (use_mmap && use_direct_io) {
-            if (files.back()->has_direct_io()) {
-                LLAMA_LOG_WARN("%s: direct I/O is enabled, disabling mmap\n", __func__);
-                use_mmap = false;
-            } else {
-                LLAMA_LOG_WARN("%s: direct I/O is not available, using mmap\n", __func__);
-                use_direct_io = false;
-
-                // reopen file using std::fopen for mmap
-                files.pop_back();
-                files.emplace_back(new llama_file(fname.c_str(), "rb", false));
+        if (param_overrides_p != nullptr) {
+            for (const struct llama_model_kv_override * p = param_overrides_p; p->key[0] != 0; p++) {
+                kv_overrides.insert({ std::string(p->key), *p });
             }
         }
 
-        // Save tensors data offset of the main file.
-        // For subsidiary files, `meta` tensor data offset must not be used,
-        // so we build a unified tensors index for weights.
-        for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
-            std::string tensor_name = std::string(cur->name);
-            // make sure there is no duplicated tensor names
-            if (weights_map.find(tensor_name) != weights_map.end()) {
-                throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
-            }
-            n_elements += ggml_nelements(cur);
-            n_bytes    += ggml_nbytes(cur);
-            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
-        }
-        uint16_t n_split = 0;
-        get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
+        tensor_buft_overrides = param_tensor_buft_overrides_p;
 
-        // Load additional GGML contexts
-        if (n_split > 1) {
-            // make sure the main file is loaded first
-            uint16_t idx = 0;
-            const std::string kv_split_no = llm_kv(LLM_KV_SPLIT_NO);
-            get_key(kv_split_no, idx);
-            if (idx != 0) {
-                throw std::runtime_error(format("illegal split file idx: %d (file: %s), model must be loaded with the first split", idx, fname.c_str()));
+        if (!fname.empty()) {
+            // Load the main GGUF
+            struct ggml_context *   ctx    = NULL;
+            struct gguf_init_params params = {
+                /*.no_alloc = */ true,
+                /*.ctx      = */ &ctx,
+            };
+
+            metadata_ptr.reset(gguf_init_from_file(fname.c_str(), params));
+            metadata = metadata_ptr.get();
+            if (metadata == nullptr) {
+                throw std::runtime_error(format("%s: failed to load model from %s", __func__, fname.c_str()));
             }
 
-            // generate list of splits if needed
-            if (splits.empty()) {
-                splits = llama_get_list_splits(fname, idx, n_split);
+            get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
+            llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+
+            files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+            contexts.emplace_back(ctx);
+
+            if (use_mmap && use_direct_io) {
+                if (files.back()->has_direct_io()) {
+                    LLAMA_LOG_WARN("%s: direct I/O is enabled, disabling mmap\n", __func__);
+                    use_mmap = false;
+                } else {
+                    LLAMA_LOG_WARN("%s: direct I/O is not available, using mmap\n", __func__);
+                    use_direct_io = false;
+
+                    // reopen file using std::fopen for mmap
+                    files.pop_back();
+                    files.emplace_back(new llama_file(fname.c_str(), "rb", false));
+                }
             }
 
-            // in case user give a custom list of splits, check if it matches the expected number
-            if (n_split != (uint16_t)splits.size()) {
-                throw std::runtime_error(format("invalid split count, given: %zu splits, but expected %d", splits.size(), n_split));
+            // Save tensors data offset of the main file.
+            // For subsidiary files, `meta` tensor data offset must not be used,
+            // so we build a unified tensors index for weights.
+            for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+                std::string tensor_name = std::string(cur->name);
+                // make sure there is no duplicated tensor names
+                if (weights_map.find(tensor_name) != weights_map.end()) {
+                    throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
+                }
+                n_elements += ggml_nelements(cur);
+                n_bytes += ggml_nbytes(cur);
+                weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
             }
+            uint16_t n_split = 0;
+            get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
 
-            if (trace > 0) {
-                LLAMA_LOG_INFO("%s: loading additional %d GGUFs\n", __func__, n_split);
-            }
-
-            // load other splits
-            for (idx = 1; idx < n_split; idx++) {
-                const char * fname_split = splits[idx].c_str();
-
-                struct gguf_init_params split_params = {
-                    /*.no_alloc = */ true,
-                    /*.ctx      = */ &ctx,
-                };
-                gguf_context_ptr ctx_gguf { gguf_init_from_file(fname_split, split_params) };
-                if (!ctx_gguf) {
-                    throw std::runtime_error(format("%s: failed to load GGUF split from %s", __func__, fname_split));
+            // Load additional GGML contexts
+            if (n_split > 1) {
+                // make sure the main file is loaded first
+                uint16_t          idx         = 0;
+                const std::string kv_split_no = llm_kv(LLM_KV_SPLIT_NO);
+                get_key(kv_split_no, idx);
+                if (idx != 0) {
+                    throw std::runtime_error(
+                        format("illegal split file idx: %d (file: %s), model must be loaded with the first split", idx,
+                               fname.c_str()));
                 }
 
-                // check idx
+                // generate list of splits if needed
+                if (splits.empty()) {
+                    splits = llama_get_list_splits(fname, idx, n_split);
+                }
+
+                // in case user give a custom list of splits, check if it matches the expected number
+                if (n_split != (uint16_t) splits.size()) {
+                    throw std::runtime_error(
+                        format("invalid split count, given: %zu splits, but expected %d", splits.size(), n_split));
+                }
+
+                if (trace > 0) {
+                    LLAMA_LOG_INFO("%s: loading additional %d GGUFs\n", __func__, n_split);
+                }
+
+                // load other splits
+                for (idx = 1; idx < n_split; idx++) {
+                    const char * fname_split = splits[idx].c_str();
+
+                    struct gguf_init_params split_params = {
+                        /*.no_alloc = */ true,
+                        /*.ctx      = */ &ctx,
+                    };
+                    gguf_context_ptr ctx_gguf{ gguf_init_from_file(fname_split, split_params) };
+                    if (!ctx_gguf) {
+                        throw std::runtime_error(
+                            format("%s: failed to load GGUF split from %s", __func__, fname_split));
+                    }
+
+                    // check idx
+                    {
+                        const int kid = gguf_find_key(ctx_gguf.get(), kv_split_no.c_str());
+                        if (kid < 0) {
+                            throw std::runtime_error(
+                                format("missing key %s in GGUF split %s", kv_split_no.c_str(), fname_split));
+                        }
+                        int idx_gguf = gguf_get_val_u16(ctx_gguf.get(), kid);
+                        if (idx_gguf != idx) {
+                            throw std::runtime_error(format("invalid split file idx: %d (file: %s), expected %d",
+                                                            idx_gguf, fname_split, idx));
+                        }
+                    }
+
+                    files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                    contexts.emplace_back(ctx);
+
+                    // Save tensors data offset info of the shard.
+                    for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+                        std::string tensor_name = std::string(cur->name);
+                        // make sure there is no duplicated tensor names
+                        if (weights_map.find(tensor_name) != weights_map.end()) {
+                            throw std::runtime_error(
+                                format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
+                        }
+                        n_elements += ggml_nelements(cur);
+                        n_bytes += ggml_nbytes(cur);
+                        weights_map.emplace(tensor_name,
+                                            llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
+                    }
+                }
+
+                get_key(llm_kv(LLM_KV_SPLIT_TENSORS_COUNT), n_tensors);
+
+                // sanity check
                 {
-                    const int kid = gguf_find_key(ctx_gguf.get(), kv_split_no.c_str());
-                    if (kid < 0) {
-                        throw std::runtime_error(format("missing key %s in GGUF split %s", kv_split_no.c_str(), fname_split));
-                    }
-                    int idx_gguf = gguf_get_val_u16(ctx_gguf.get(), kid);
-                    if (idx_gguf != idx) {
-                        throw std::runtime_error(format("invalid split file idx: %d (file: %s), expected %d", idx_gguf, fname_split, idx));
+                    const int n_tensors_loaded = (int) weights_map.size();
+                    if (n_tensors != n_tensors_loaded) {
+                        throw std::runtime_error(
+                            format("corrupted model: %d tensors expected but %d found", n_tensors, n_tensors_loaded));
                     }
                 }
 
-                files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
-                contexts.emplace_back(ctx);
+                LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n", __func__, n_split - 1);
+            }
+        } else if (file != nullptr) {
+            struct ggml_context *   ctx    = NULL;
+            struct gguf_init_params params = {
+                /*.no_alloc = */ true,
+                /*.ctx      = */ &ctx,
+            };
 
-                // Save tensors data offset info of the shard.
-                for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
-                    std::string tensor_name = std::string(cur->name);
-                    // make sure there is no duplicated tensor names
-                    if (weights_map.find(tensor_name) != weights_map.end()) {
-                        throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
-                    }
-                    n_elements += ggml_nelements(cur);
-                    n_bytes    += ggml_nbytes(cur);
-                    weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
+            metadata_ptr.reset(gguf_init_from_file_ptr(file, params));
+            metadata = metadata_ptr.get();
+            if (metadata == nullptr) {
+                throw std::runtime_error(format("%s: failed to load model from file pointer", __func__));
+            }
+
+            get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
+            llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+
+            files.emplace_back(new llama_file(file));
+            contexts.emplace_back(ctx);
+
+            // Save tensors data offset info of the main file.
+            for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+                std::string tensor_name = std::string(cur->name);
+                // make sure there is no duplicated tensor names
+                if (weights_map.find(tensor_name) != weights_map.end()) {
+                    throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
                 }
+                n_elements += ggml_nelements(cur);
+                n_bytes += ggml_nbytes(cur);
+                weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
             }
-
-            get_key(llm_kv(LLM_KV_SPLIT_TENSORS_COUNT), n_tensors);
-
-            // sanity check
-            {
-                const int n_tensors_loaded = (int) weights_map.size();
-                if (n_tensors != n_tensors_loaded) {
-                    throw std::runtime_error(format("corrupted model: %d tensors expected but %d found", n_tensors, n_tensors_loaded));
-                }
-            }
-
-            LLAMA_LOG_INFO("%s: additional %d GGUFs metadata loaded.\n",  __func__, n_split - 1);
-        }
-    } else if (file != nullptr) {
-        struct ggml_context * ctx = NULL;
-        struct gguf_init_params params = {
-            /*.no_alloc = */ true,
-            /*.ctx      = */ &ctx,
-        };
-
-        metadata_ptr.reset(gguf_init_from_file_ptr(file, params));
-        metadata = metadata_ptr.get();
-        if (metadata == nullptr) {
-            throw std::runtime_error(format("%s: failed to load model from file pointer", __func__));
+        } else {
+            get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
+            llm_kv = LLM_KV(llm_arch_from_string(arch_name));
         }
 
-        get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
-        llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+        n_kv      = gguf_get_n_kv(metadata);
+        n_tensors = weights_map.size();
 
-        files.emplace_back(new llama_file(file));
-        contexts.emplace_back(ctx);
+        fver = (enum llama_fver) gguf_get_version(metadata);
 
-        // Save tensors data offset info of the main file.
-        for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
-            std::string tensor_name = std::string(cur->name);
-            // make sure there is no duplicated tensor names
-            if (weights_map.find(tensor_name) != weights_map.end()) {
-                throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
-            }
-            n_elements += ggml_nelements(cur);
-            n_bytes    += ggml_nbytes(cur);
-            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
-        }
-    } else {
-        get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
-        llm_kv = LLM_KV(llm_arch_from_string(arch_name));
-    }
+        LLAMA_LOG_INFO("%s: loaded meta data with %d key-value pairs and %d tensors from %s (version %s)\n", __func__,
+                       n_kv, n_tensors, fname.empty() ? "(file*)" : fname.c_str(), llama_file_version_name(fver));
 
-    n_kv      = gguf_get_n_kv(metadata);
-    n_tensors = weights_map.size();
-
-    fver = (enum llama_fver) gguf_get_version(metadata);
-
-    LLAMA_LOG_INFO("%s: loaded meta data with %d key-value pairs and %d tensors from %s (version %s)\n",
-            __func__, n_kv, n_tensors, fname.empty() ? "(file*)" : fname.c_str(), llama_file_version_name(fver));
-
-    // determine file type based on the number of tensors for each quantization and print meta data
-    // TODO: make optional
-    {
-        std::map<enum ggml_type, uint32_t> n_type;
-
-        uint32_t n_type_max = 0;
-        enum ggml_type type_max = GGML_TYPE_F32;
-
-        for (const auto & it : weights_map) {
-            const llama_tensor_weight & w = it.second;
-            const ggml_tensor * tensor = w.tensor;
-
-            enum ggml_type type = tensor->type;
-
-            n_type[type]++;
-
-            if (n_type_max < n_type[type]) {
-                n_type_max = n_type[type];
-                type_max   = type;
-            }
-
-            if (trace > 0) {
-                const uint16_t sid = w.idx;
-                LLAMA_LOG_INFO("%s: - tensor split %2d: %32s %-8s [ %s ] %8.2f MiB\n", __func__,
-                        sid, ggml_get_name(tensor), ggml_type_name(type), llama_format_tensor_shape(tensor).c_str(),
-                        ggml_nbytes(tensor)/1024.0f/1024.0f);
-            }
-        }
-
-        switch (type_max) {
-            case GGML_TYPE_F32:     ftype = LLAMA_FTYPE_ALL_F32;        break;
-            case GGML_TYPE_F16:     ftype = LLAMA_FTYPE_MOSTLY_F16;     break;
-            case GGML_TYPE_BF16:    ftype = LLAMA_FTYPE_MOSTLY_BF16;    break;
-            case GGML_TYPE_Q4_0:    ftype = LLAMA_FTYPE_MOSTLY_Q4_0;    break;
-            case GGML_TYPE_Q4_1:    ftype = LLAMA_FTYPE_MOSTLY_Q4_1;    break;
-            case GGML_TYPE_Q5_0:    ftype = LLAMA_FTYPE_MOSTLY_Q5_0;    break;
-            case GGML_TYPE_Q5_1:    ftype = LLAMA_FTYPE_MOSTLY_Q5_1;    break;
-            case GGML_TYPE_Q8_0:    ftype = LLAMA_FTYPE_MOSTLY_Q8_0;    break;
-            case GGML_TYPE_Q2_K:    ftype = LLAMA_FTYPE_MOSTLY_Q2_K;    break;
-            case GGML_TYPE_Q3_K:    ftype = LLAMA_FTYPE_MOSTLY_Q3_K_M;  break;
-            case GGML_TYPE_Q4_K:    ftype = LLAMA_FTYPE_MOSTLY_Q4_K_M;  break;
-            case GGML_TYPE_Q5_K:    ftype = LLAMA_FTYPE_MOSTLY_Q5_K_M;  break;
-            case GGML_TYPE_Q6_K:    ftype = LLAMA_FTYPE_MOSTLY_Q6_K;    break;
-            case GGML_TYPE_TQ1_0:   ftype = LLAMA_FTYPE_MOSTLY_TQ1_0;   break;
-            case GGML_TYPE_TQ2_0:   ftype = LLAMA_FTYPE_MOSTLY_TQ2_0;   break;
-            case GGML_TYPE_IQ2_XXS: ftype = LLAMA_FTYPE_MOSTLY_IQ2_XXS; break;
-            case GGML_TYPE_IQ2_XS:  ftype = LLAMA_FTYPE_MOSTLY_IQ2_XS;  break;
-            case GGML_TYPE_IQ2_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ2_S;   break;
-            case GGML_TYPE_IQ3_XXS: ftype = LLAMA_FTYPE_MOSTLY_IQ3_XXS; break;
-            case GGML_TYPE_IQ1_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ1_S;   break;
-            case GGML_TYPE_IQ1_M:   ftype = LLAMA_FTYPE_MOSTLY_IQ1_M;   break;
-            case GGML_TYPE_IQ4_NL:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_NL;  break;
-            case GGML_TYPE_IQ4_XS:  ftype = LLAMA_FTYPE_MOSTLY_IQ4_XS;  break;
-            case GGML_TYPE_IQ3_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ3_S;   break;
-            case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
-            case GGML_TYPE_Q1_0:    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;    break;
-            default:
-                {
-                    LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));
-                    ftype = LLAMA_FTYPE_ALL_F32;
-                } break;
-        }
-
-        // this is a way to mark that we have "guessed" the file type
-        ftype = (llama_ftype) (ftype | LLAMA_FTYPE_GUESSED);
-
+        // determine file type based on the number of tensors for each quantization and print meta data
+        // TODO: make optional
         {
-            uint32_t ftype_val = 0;
-            if (get_key(LLM_KV_GENERAL_FILE_TYPE, ftype_val, false)) {
-                ftype = (llama_ftype) ftype_val;
+            std::map<enum ggml_type, uint32_t> n_type;
+
+            uint32_t       n_type_max = 0;
+            enum ggml_type type_max   = GGML_TYPE_F32;
+
+            for (const auto & it : weights_map) {
+                const llama_tensor_weight & w      = it.second;
+                const ggml_tensor *         tensor = w.tensor;
+
+                enum ggml_type type = tensor->type;
+
+                n_type[type]++;
+
+                if (n_type_max < n_type[type]) {
+                    n_type_max = n_type[type];
+                    type_max   = type;
+                }
+
+                if (trace > 0) {
+                    const uint16_t sid = w.idx;
+                    LLAMA_LOG_INFO("%s: - tensor split %2d: %32s %-8s [ %s ] %8.2f MiB\n", __func__, sid,
+                                   ggml_get_name(tensor), ggml_type_name(type),
+                                   llama_format_tensor_shape(tensor).c_str(), ggml_nbytes(tensor) / 1024.0f / 1024.0f);
+                }
+            }
+
+            switch (type_max) {
+                case GGML_TYPE_F32:
+                    ftype = LLAMA_FTYPE_ALL_F32;
+                    break;
+                case GGML_TYPE_F16:
+                    ftype = LLAMA_FTYPE_MOSTLY_F16;
+                    break;
+                case GGML_TYPE_BF16:
+                    ftype = LLAMA_FTYPE_MOSTLY_BF16;
+                    break;
+                case GGML_TYPE_Q4_0:
+                    ftype = LLAMA_FTYPE_MOSTLY_Q4_0;
+                    break;
+                case GGML_TYPE_Q4_1:
+                    ftype = LLAMA_FTYPE_MOSTLY_Q4_1;
+                    break;
+                case GGML_TYPE_Q5_0:
+                    ftype = LLAMA_FTYPE_MOSTLY_Q5_0;
+                    break;
+                case GGML_TYPE_Q5_1:
+                    ftype = LLAMA_FTYPE_MOSTLY_Q5_1;
+                    break;
+                case GGML_TYPE_Q8_0:
+                    ftype = LLAMA_FTYPE_MOSTLY_Q8_0;
+                    break;
+                case GGML_TYPE_Q2_K:
+                    ftype = LLAMA_FTYPE_MOSTLY_Q2_K;
+                    break;
+                case GGML_TYPE_Q3_K:
+                    ftype = LLAMA_FTYPE_MOSTLY_Q3_K_M;
+                    break;
+                case GGML_TYPE_Q4_K:
+                    ftype = LLAMA_FTYPE_MOSTLY_Q4_K_M;
+                    break;
+                case GGML_TYPE_Q5_K:
+                    ftype = LLAMA_FTYPE_MOSTLY_Q5_K_M;
+                    break;
+                case GGML_TYPE_Q6_K:
+                    ftype = LLAMA_FTYPE_MOSTLY_Q6_K;
+                    break;
+                case GGML_TYPE_TQ1_0:
+                    ftype = LLAMA_FTYPE_MOSTLY_TQ1_0;
+                    break;
+                case GGML_TYPE_TQ2_0:
+                    ftype = LLAMA_FTYPE_MOSTLY_TQ2_0;
+                    break;
+                case GGML_TYPE_IQ2_XXS:
+                    ftype = LLAMA_FTYPE_MOSTLY_IQ2_XXS;
+                    break;
+                case GGML_TYPE_IQ2_XS:
+                    ftype = LLAMA_FTYPE_MOSTLY_IQ2_XS;
+                    break;
+                case GGML_TYPE_IQ2_S:
+                    ftype = LLAMA_FTYPE_MOSTLY_IQ2_S;
+                    break;
+                case GGML_TYPE_IQ3_XXS:
+                    ftype = LLAMA_FTYPE_MOSTLY_IQ3_XXS;
+                    break;
+                case GGML_TYPE_IQ1_S:
+                    ftype = LLAMA_FTYPE_MOSTLY_IQ1_S;
+                    break;
+                case GGML_TYPE_IQ1_M:
+                    ftype = LLAMA_FTYPE_MOSTLY_IQ1_M;
+                    break;
+                case GGML_TYPE_IQ4_NL:
+                    ftype = LLAMA_FTYPE_MOSTLY_IQ4_NL;
+                    break;
+                case GGML_TYPE_IQ4_XS:
+                    ftype = LLAMA_FTYPE_MOSTLY_IQ4_XS;
+                    break;
+                case GGML_TYPE_IQ3_S:
+                    ftype = LLAMA_FTYPE_MOSTLY_IQ3_S;
+                    break;
+                case GGML_TYPE_NVFP4:
+                    ftype = LLAMA_FTYPE_MOSTLY_NVFP4;
+                    break;
+                case GGML_TYPE_Q1_0:
+                    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;
+                    break;
+                default:
+                    {
+                        LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));
+                        ftype = LLAMA_FTYPE_ALL_F32;
+                    }
+                    break;
+            }
+
+            // this is a way to mark that we have "guessed" the file type
+            ftype = (llama_ftype) (ftype | LLAMA_FTYPE_GUESSED);
+
+            {
+                uint32_t ftype_val = 0;
+                if (get_key(LLM_KV_GENERAL_FILE_TYPE, ftype_val, false)) {
+                    ftype = (llama_ftype) ftype_val;
+                }
+            }
+
+            LLAMA_LOG_INFO("%s: Dumping metadata keys/values. Note: KV overrides do not apply in this output.\n",
+                           __func__);
+
+            for (int i = 0; i < n_kv; i++) {
+                const char *         name = gguf_get_key(metadata, i);
+                const enum gguf_type type = gguf_get_kv_type(metadata, i);
+                const std::string    type_name =
+                    type == GGUF_TYPE_ARRAY ?
+                        format("%s[%s,%zu]", gguf_type_name(type), gguf_type_name(gguf_get_arr_type(metadata, i)),
+                               gguf_get_arr_n(metadata, i)) :
+                        gguf_type_name(type);
+
+                std::string  value         = gguf_kv_to_str(metadata, i);
+                const size_t MAX_VALUE_LEN = 40;
+                if (value.size() > MAX_VALUE_LEN) {
+                    value = format("%s...", value.substr(0, MAX_VALUE_LEN - 3).c_str());
+                }
+                replace_all(value, "\n", "\\n");
+
+                LLAMA_LOG_INFO("%s: - kv %3d: %42s %-16s = %s\n", __func__, i, name, type_name.c_str(), value.c_str());
+            }
+
+            // print type counts
+            for (auto & kv : n_type) {
+                if (kv.second == 0) {
+                    continue;
+                }
+
+                LLAMA_LOG_INFO("%s: - type %4s: %4d tensors\n", __func__, ggml_type_name(kv.first), kv.second);
             }
         }
 
-        LLAMA_LOG_INFO("%s: Dumping metadata keys/values. Note: KV overrides do not apply in this output.\n", __func__);
-
-        for (int i = 0; i < n_kv; i++) {
-            const char * name           = gguf_get_key(metadata, i);
-            const enum gguf_type type   = gguf_get_kv_type(metadata, i);
-            const std::string type_name =
-                type == GGUF_TYPE_ARRAY
-                ? format("%s[%s,%zu]", gguf_type_name(type), gguf_type_name(gguf_get_arr_type(metadata, i)), gguf_get_arr_n(metadata, i))
-                : gguf_type_name(type);
-
-            std::string value          = gguf_kv_to_str(metadata, i);
-            const size_t MAX_VALUE_LEN = 40;
-            if (value.size() > MAX_VALUE_LEN) {
-                value = format("%s...", value.substr(0, MAX_VALUE_LEN - 3).c_str());
-            }
-            replace_all(value, "\n", "\\n");
-
-            LLAMA_LOG_INFO("%s: - kv %3d: %42s %-16s = %s\n", __func__, i, name, type_name.c_str(), value.c_str());
+        if (!llama_mmap::SUPPORTED) {
+            LLAMA_LOG_WARN("%s: mmap is not supported on this platform\n", __func__);
+            use_mmap = false;
         }
 
-        // print type counts
-        for (auto & kv : n_type) {
-            if (kv.second == 0) {
-                continue;
-            }
-
-            LLAMA_LOG_INFO("%s: - type %4s: %4d tensors\n", __func__, ggml_type_name(kv.first), kv.second);
-        }
+        this->use_mmap      = use_mmap;
+        this->use_direct_io = use_direct_io;
+        this->check_tensors = check_tensors;
+        this->no_alloc      = no_alloc;
     }
-
-    if (!llama_mmap::SUPPORTED) {
-        LLAMA_LOG_WARN("%s: mmap is not supported on this platform\n", __func__);
-        use_mmap = false;
-    }
-
-    this->use_mmap = use_mmap;
-    this->use_direct_io = use_direct_io;
-    this->check_tensors = check_tensors;
-    this->no_alloc = no_alloc;
-}
 
 std::string llama_model_loader::get_arch_name() const {
     return arch_name;
