@@ -8,6 +8,11 @@
 #include <string>
 #include <cmath>
 #include "ggml-backend.h"
+
+// Function pointer types for CUDA backend extensions (queried via proc address)
+// These types are not exposed by the public ggml API; declare them locally
+typedef void (*ggml_backend_cuda_set_allow_batched_add_t)(ggml_backend_t backend, bool allow);
+typedef void (*ggml_backend_cuda_set_disable_graph_t)(ggml_backend_t backend, bool disable);
 #include "ggml.h"
 #include "gguf.h"
 #include <chrono>
@@ -997,8 +1002,10 @@ ggml_tensor * fmCausalConditionalCFM::build_forward_chunk_graph(ggml_context *  
 }
 }  // namespace flow_matching
 }  // namespace omni
+
 namespace omni {
 namespace flow_matching {
+
 fmCausalConv1d::fmCausalConv1d(int in_channels, int out_channels, int kernel_size) :
     in_channels_(in_channels),
     out_channels_(out_channels),
