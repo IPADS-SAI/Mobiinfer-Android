@@ -8,6 +8,11 @@
 #include <string>
 #include <cmath>
 #include "ggml-backend.h"
+
+// Function pointer types for CUDA backend extensions (queried via proc address)
+// These types are not exposed by the public ggml API; declare them locally
+typedef void (*ggml_backend_cuda_set_allow_batched_add_t)(ggml_backend_t backend, bool allow);
+typedef void (*ggml_backend_cuda_set_disable_graph_t)(ggml_backend_t backend, bool disable);
 #include "ggml.h"
 #include "gguf.h"
 #include <chrono>
@@ -997,27 +1002,10 @@ ggml_tensor * fmCausalConditionalCFM::build_forward_chunk_graph(ggml_context *  
 }
 }  // namespace flow_matching
 }  // namespace omni
+
 namespace omni {
 namespace flow_matching {
-namespace {
-// 用 im2col 计算一维卷积
-static ggml_tensor * fm_causal_conv1d_im2col_f32_n1(ggml_context * ctx,
-                                          ggml_tensor *  w_kic_oc,
-                                          ggml_tensor *  x_tcb,
-                                          int            stride,
-                                          int            padding,
-                                          int            dilation) {
-    const int64_t K    = w_kic_oc->ne[0];
-    const int64_t Cin  = w_kic_oc->ne[1];
-    const int64_t Cout = w_kic_oc->ne[2];
-    ggml_tensor * im2col = ggml_im2col(ctx, w_kic_oc, x_tcb, stride, 0, padding, 0, dilation, 0, false, GGML_TYPE_F32);
-    ggml_tensor * im2col_2d = ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]);
-    ggml_tensor * w_2d = ggml_reshape_2d(ctx, w_kic_oc, K * Cin, Cout);
-    ggml_tensor * mm = ggml_mul_mat(ctx, im2col_2d, w_2d);
-    ggml_tensor * y_tcb = ggml_reshape_3d(ctx, mm, im2col->ne[1], Cout, im2col->ne[2]);
-    return y_tcb;
-}
-}  // namespace
+
 fmCausalConv1d::fmCausalConv1d(int in_channels, int out_channels, int kernel_size) :
     in_channels_(in_channels),
     out_channels_(out_channels),
