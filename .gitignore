@@ -160,3 +160,17 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# PyTorch
+*.pt
+*.safetensors
+# Output directories
+tools/omni/output/
+tools/omni/output_*/
+
+# Demo apps (not part of llama.cpp build)
+apps/
+
+# PyTorch checkpoint directories
+pt/
+tools/omni/**/pt/
