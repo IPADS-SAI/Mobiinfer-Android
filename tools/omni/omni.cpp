@@ -4142,9 +4142,41 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
             bool init_ok = false;
             // 优先级: prompt_cache.gguf > prompt_bundle (实时计算 fallback)
             print_with_timestamp("Token2Wav: using prompt_cache from %s\n", prompt_cache_gguf.c_str());
+
+            // CoreML 后端选择：通过 params->token2wav_coreml_model_path 控制。
+            // - 空字符串（默认）：纯 GPU/GGUF 路径，不启用 CoreML。
+            // - "auto"：自动在 token2wav-gguf 目录查找 CoreML 模型。
+            // - 具体路径：使用指定 CoreML 模型。
+            std::string coreml_model_path;
+            if (!ctx_omni->params->token2wav_coreml_model_path.empty()) {
+                if (ctx_omni->params->token2wav_coreml_model_path == "auto") {
+                    // 与 GGUF 文件同级目录下查找
+                    std::string auto_pkg = ctx_omni->token2wav_model_dir + "/coreml_minicpmo45_t2w_dit.mlpackage";
+                    std::ifstream probe(auto_pkg + "/Manifest.json");
+                    if (probe.good()) {
+                        coreml_model_path = auto_pkg;
+                    } else {
+                        // fallback: 尝试带完整文件名
+                        auto_pkg = ctx_omni->token2wav_model_dir + "/coreml_minicpmo45_t2w_dit_f16_chunk56_cache600.mlpackage";
+                        std::ifstream probe2(auto_pkg + "/Manifest.json");
+                        if (probe2.good()) {
+                            coreml_model_path = auto_pkg;
+                        } else {
+                            print_with_timestamp("Token2Wav: CoreML auto mode, but no CoreML model found in %s\n",
+                                                 ctx_omni->token2wav_model_dir.c_str());
+                        }
+                    }
+                } else {
+                    coreml_model_path = ctx_omni->params->token2wav_coreml_model_path;
+                }
+            }
+            if (!coreml_model_path.empty()) {
+                print_with_timestamp("Token2Wav: CoreML model = %s\n", coreml_model_path.c_str());
+            }
+
             init_ok = ctx_omni->token2wav_session->init_from_prompt_cache_gguf(
                     encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
-                    vocoder_gguf, device_token2mel, device_vocoder, 5, 1.0f);
+                    vocoder_gguf, device_token2mel, device_vocoder, 5, 1.0f, coreml_model_path);
             if (!init_ok && use_prompt_bundle) {
                 print_with_timestamp("Token2Wav: prompt_cache failed, fallback to prompt_bundle from %s\n", prompt_bundle_dir.c_str());
                 init_ok = ctx_omni->token2wav_session->init_from_prompt_bundle(

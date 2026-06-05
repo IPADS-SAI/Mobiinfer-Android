@@ -165,8 +165,11 @@ int main() {
     omni::flow::Token2WavSession sess;
     // 初始化：加载 encoder/flow/vocoder 模型，导入 prompt_cache用于初始化
     const auto t_init0 = clock::now();
+    // CoreML backend: pass the path to init_from_prompt_cache_gguf. Leave empty for GPU-only.
+    std::string coreml_model;
     if (!sess.init_from_prompt_cache_gguf(encoder_gguf, flow_matching_gguf, flow_extra_gguf, prompt_cache_gguf,
-                                          vocoder_gguf, device_token2mel, device_vocoder, n_timesteps, temperature)) {
+                                          vocoder_gguf, device_token2mel, device_vocoder, n_timesteps, temperature,
+                                          coreml_model)) {
         std::fprintf(stderr, "init_from_prompt_cache_gguf failed\n");
         return 3;
     }
