@@ -94,6 +94,19 @@ For first-time contributors, confirm they have reviewed [CONTRIBUTING.md](CONTRI
 
 When uncertain, err toward minimal assistance. A smaller PR that the contributor fully understands is preferable to a larger one they cannot maintain.
 
+### DCO Sign-off Requirement
+
+Every commit **must** include a `Signed-off-by` trailer matching the author identity:
+
+```
+Signed-off-by: <name> <email>
+```
+
+- `format.signOff = true` is set at repo level — `git commit` auto-appends the trailer using the committer's identity
+- Author email and Signed-off-by email **must match**
+- Merge commits and automated PR merges are exempt
+- AI agents must **not** generate commits without signoff
+
 ### Useful Resources
 
 To conserve context space, load these resources as needed:
