@@ -2320,14 +2320,21 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
 
         size_t src1_stride_size = sizeof(cuda_t);
 
-        const int threads_x = 16;
-        const int threads_y = 16;
-        dim3 block_dims(threads_x, threads_y);
-
-        dim3 grid_dims(
-            (ne13 + threads_x - 1) / threads_x,
-            (ne12 + threads_y - 1) / threads_y
-        );
+        {
+        const int64_t max_block = 1024;
+        int64_t bx = ne13;
+        int64_t by = ne12;
+        int64_t gx = 1;
+        int64_t gy = 1;
+        if (bx * by > max_block) {
+            bx = (ne13 <= 32) ? ne13 : 32;
+            by = max_block / bx;
+            if (by > ne12) by = ne12;
+            gx = (ne13 + bx - 1) / bx;
+            gy = (ne12 + by - 1) / by;
+        }
+        dim3 block_dims(bx, by);
+        dim3 grid_dims(gx, gy);
         k_compute_batched_ptrs<<<grid_dims, block_dims, 0, main_stream>>>(
                 src0_ptr, src1_ptr, dst_t,
                 ptrs_src.get(), ptrs_dst.get(),
@@ -2338,6 +2345,7 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
                 (src1->type == src0_type) ? nb13 : s13*src1_stride_size,
                 nbd2, nbd3,
                 r2, r3);
+        }
 
         CUDA_CHECK(cudaGetLastError());
 
