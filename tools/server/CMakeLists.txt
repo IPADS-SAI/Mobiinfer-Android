@@ -68,7 +68,15 @@ endif()
 
 set(TARGET_OMNI llama-omni-server)
 
-add_executable(${TARGET_OMNI} server-omni.cpp)
+add_executable(${TARGET_OMNI}
+    server-omni.cpp
+    session.h
+    session.cpp
+    protocol.h
+    protocol.cpp
+    ws_handler.h
+    ws_handler.cpp
+)
 install(TARGETS ${TARGET_OMNI} RUNTIME)
 
 target_link_libraries(${TARGET_OMNI} PRIVATE omni llama-common cpp-httplib ${CMAKE_THREAD_LIBS_INIT})

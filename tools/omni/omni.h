@@ -148,6 +148,16 @@ struct projector_model {
     bool initialized = false;
 };
 
+// ============================================================================
+// Audio output callback type
+// Called by T2W threads when a chunk of audio is generated.
+// samples: float32 PCM, caller retains ownership (copy if you need to keep it)
+// n_samples: number of float32 values
+// sample_rate: sample rate of the audio (e.g. 24000 for Python T2W)
+// is_final: true if this is the last chunk of the current generation
+// ============================================================================
+using audio_output_cb_t = std::function<void(const float * samples, int n_samples, int sample_rate, bool is_final)>;
+
 struct omni_context {
     struct vision_ctx * ctx_vision = NULL;
     struct audition_ctx * ctx_audio = NULL;
@@ -342,7 +352,8 @@ struct omni_context {
     // 语言设置 (用于 prompt 生成)
     std::string language = "zh";
 
-    // text streaming queue for server
+    // text_mtx protects only the text streaming state consumed by HTTP/WS
+    // readers; broader omni_context lifecycle/prefill changes use server octx_mutex.
     std::mutex text_mtx;
     std::condition_variable text_cv;
     std::deque<std::string> text_queue;
@@ -417,6 +428,7 @@ struct omni_context {
     // 设置为 true 时使用 Python 实现（精度更高），false 时使用 C++ 实现
     // macOS 上默认使用 C++ 实现（无 CUDA）
     bool use_python_token2wav = false;
+    audio_output_cb_t audio_output_cb = nullptr; // called by T2W threads when a chunk of audio is ready
     std::string python_t2w_script_dir;  // Python Token2Wav 脚本目录
     std::string python_t2w_model_dir;   // Python Token2Wav 模型目录
     
@@ -479,6 +491,9 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
                                 const std::string & base_output_dir = "./tools/omni/output");
 
 void omni_free(struct omni_context * ctx_omni);
+// Stop/join inference threads and clear queues so the same context can serve a
+// new session, without tearing down the loaded model (unlike omni_free).
+void omni_prepare_for_reuse(struct omni_context * ctx_omni);
 
 // ANE/CoreML warmup — call once after omni_init to pre-load models into NPU
 void omni_warmup_ane(struct omni_context * ctx_omni);

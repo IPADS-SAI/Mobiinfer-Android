@@ -577,6 +577,7 @@ struct common_params {
     std::string apm_model                = ""; // audio encoder GGUF
     std::string vpm_model                = ""; // vision encoder GGUF
     std::string projector_model          = ""; // projector GGUF
+    std::string tts_bin_dir              = ""; // directory containing TTS projector/token2wav assets
     bool vpm_batch_encode                = false; // batch-encode same-size vision slices (off by default; helps large/high-res images)
 
     // VoxCPM2 TTS
