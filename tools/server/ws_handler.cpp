@@ -581,7 +581,7 @@ void handle_ws_backend(httplib::ws::WebSocket & ws,
                         llama_context * ctx,
                         omni_context *& shared_octx,
                         std::mutex & octx_mutex) {
-    const std::string temp_dir = fs::temp_directory_path() / "omni_ws";
+    const std::string temp_dir = (fs::temp_directory_path() / "omni_ws").string();
     fs::create_directories(temp_dir);
     int msg_counter = 0;
     std::vector<std::string> retained_media_files;
