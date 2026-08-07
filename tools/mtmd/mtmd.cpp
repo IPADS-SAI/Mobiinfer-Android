@@ -131,6 +131,7 @@ mtmd_context_params mtmd_context_params_default() {
         /* warmup            */ true,
         /* image_min_tokens  */ -1,
         /* image_max_tokens  */ -1,
+        /* image_max_slice_nums */ -1,
         /* cb_eval           */ nullptr,
         /* cb_eval_user_data */ nullptr,
     };
@@ -219,6 +220,7 @@ struct mtmd_context {
             /* flash_attn_type   */ mtmd_get_clip_flash_attn_type(ctx_params.flash_attn_type),
             /* image_min_tokens  */ ctx_params.image_min_tokens,
             /* image_max_tokens  */ ctx_params.image_max_tokens,
+            /* image_max_slice_nums */ ctx_params.image_max_slice_nums,
             /* warmup            */ ctx_params.warmup,
             /* cb_eval           */ ctx_params.cb_eval,
             /* cb_eval_user_data */ ctx_params.cb_eval_user_data,
@@ -643,6 +645,12 @@ mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
 
 void mtmd_free(mtmd_context * ctx) {
     delete ctx;
+}
+
+void mtmd_set_image_max_slice_nums(mtmd_context * ctx, int n) {
+    if (ctx && ctx->ctx_v) {
+        clip_set_image_max_slice_nums(ctx->ctx_v, n);
+    }
 }
 
 struct mtmd_tokenizer {

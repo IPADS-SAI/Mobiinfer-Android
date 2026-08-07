@@ -9,6 +9,8 @@ int main(void) {
 
     struct mtmd_context_params params = mtmd_context_params_default();
     printf("Default image marker: %s\n", params.image_marker);
+    assert(params.image_max_slice_nums == -1);
+    mtmd_set_image_max_slice_nums(NULL, 1);
 
     mtmd_input_chunks * chunks = mtmd_test_create_input_chunks();
 

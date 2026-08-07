@@ -39,6 +39,7 @@ struct clip_context_params {
     enum clip_flash_attn_type flash_attn_type;
     int image_min_tokens;
     int image_max_tokens;
+    int image_max_slice_nums;
     bool warmup;
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
@@ -124,3 +125,5 @@ struct clip_cap {
     bool has_audio;
 };
 struct clip_cap clip_get_cap(const char * fname);
+
+void clip_set_image_max_slice_nums(struct clip_ctx * ctx, int n);

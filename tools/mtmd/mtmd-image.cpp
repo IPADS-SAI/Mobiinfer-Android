@@ -667,7 +667,7 @@ mtmd_image_preprocessor_llava_uhd::slice_instructions mtmd_image_preprocessor_ll
     res.overview_size = best_size;
 
     {
-        const int max_slice_nums = 9; // TODO: this is only used by minicpmv, maybe remove it
+        const int max_slice_nums = hparams.custom_image_max_slice_nums > 0 ? hparams.custom_image_max_slice_nums : 9; // TODO: this is only used by minicpmv, maybe remove it
         const float log_ratio = log((float)original_width / original_height);
         const float ratio = (float)original_width * original_height / (slice_size * slice_size);
         const int multiple = fmin(ceil(ratio), max_slice_nums);
