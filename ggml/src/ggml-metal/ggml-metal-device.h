@@ -305,6 +305,13 @@ void   ggml_metal_buffer_free     (ggml_metal_buffer_t buf);
 void * ggml_metal_buffer_get_base (ggml_metal_buffer_t buf);
 bool   ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf);
 
+// Drop the MTLBuffer objects (Metal working-set accounting), keeping the host
+// mapping and virtual address so tensors stay valid. GPU must be idle.
+// Pair with ggml_metal_buffer_unpark. Do not madvise: discarded pages come
+// back as zeros and the first decode after unpark is wrong.
+bool   ggml_metal_buffer_park     (ggml_metal_buffer_t buf);
+bool   ggml_metal_buffer_unpark   (ggml_metal_buffer_t buf);
+
 void   ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, uint8_t value, size_t offset, size_t size);
 void   ggml_metal_buffer_set_tensor   (ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
 void   ggml_metal_buffer_get_tensor   (ggml_metal_buffer_t buf, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size);
