@@ -315,6 +315,11 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // Expert-major sidecar manifest and slots per routed layer.
+        // Both fields must be set together.
+        const char * moe_sidecar_path;
+        int32_t moe_slot_bank;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool use_mmap;        // use mmap if possible
@@ -388,6 +393,10 @@ extern "C" {
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
         struct llama_sampler_seq_config * samplers;
         size_t                            n_samplers;
+
+        // a source/target/parent context
+        // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
+        struct llama_context * ctx_other;
     };
 
     struct llama_model_tensor_override {
@@ -558,6 +567,16 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_embd     (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_inp (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_out (const struct llama_model * model);
+
+    // 取 token 的输入 embedding（token_embd 的第 token 行），不做前向。
+    // `out` 的大小必须是 n_tokens * llama_model_n_embd(model) 个 float。
+    // 用于把「文本 token + 多模态 embedding」拼成同一个 embedding 批次送进 llama_decode()。
+    // 返回 0 表示成功，非 0 失败。
+    LLAMA_API int32_t llama_model_token_embd(
+            const struct llama_model * model,
+            const llama_token *        tokens,
+            int32_t                    n_tokens,
+            float *                    out);
     LLAMA_API int32_t llama_model_n_layer    (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head     (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv  (const struct llama_model * model);
@@ -966,6 +985,24 @@ extern "C" {
     // Get the number of threads used for prompt and batch processing (multiple token).
     LLAMA_API int32_t llama_n_threads_batch(struct llama_context * ctx);
 
+    // MoE look-ahead expert prefetch depth. 0 = off (no next-layer predict / prefetch).
+    // 1..16 = number of next-layer experts predicted and preadv'd into the shared-bank tail.
+    // No-op if the context has no MoE sidecar. Rebuilds the decode graph.
+    LLAMA_API void llama_set_moe_lookahead_prefetch_depth(struct llama_context * ctx, int32_t depth);
+    LLAMA_API int32_t llama_get_moe_lookahead_prefetch_depth(const struct llama_context * ctx);
+
+    // After a finished generation: drop the MoE expert window's Metal buffers and
+    // host pages. Next llama_decode rewraps automatically. No-op without sidecar.
+    // Disable with LLAMA_MOE_PARK_WINDOW=0.
+    LLAMA_API void llama_moe_park_expert_memory(struct llama_context * ctx);
+
+    // Pre-read the static expert-window prewarm table (LLAMA_MOE_PREWARM) into the per-layer
+    // decode windows during an idle window *before* prefill. The decode windows are physically
+    // separate from the prefill bank, so the data survives prefill and the prefill→decode
+    // transition only re-publishes the slot mappings (no I/O). No-op without a sidecar / table.
+    // Must be called while no decode is in flight (e.g. after the vision encoder is unloaded).
+    LLAMA_API void llama_moe_prewarm_experts(struct llama_context * ctx);
+
     // Set whether the context outputs embeddings or not
     // TODO: rename to avoid confusion with llama_get_embeddings()
     LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);
@@ -973,6 +1010,10 @@ extern "C" {
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
+
+    // Runtime MoE top-k. 0 = model metadata. Must be <= GGUF / sidecar expert_used_count.
+    LLAMA_API void llama_set_n_expert_used(struct llama_context * ctx, int32_t n_expert_used);
+    LLAMA_API int32_t llama_n_expert_used(const struct llama_context * ctx);
 
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.

@@ -393,6 +393,8 @@ namespace GGUFMeta {
     }
 
     template bool llama_model_loader::get_arr<std::vector<std::string>>(enum llm_kv kid, std::vector<std::string> & result, bool required);
+    template bool llama_model_loader::get_arr<std::array<int32_t, 512>>(enum llm_kv kid, std::array<int32_t, 512> & result, bool required);
+    template bool llama_model_loader::get_arr<std::vector<int32_t>>(enum llm_kv kid, std::vector<int32_t> & result, bool required);
 
     template<typename T>
     bool llama_model_loader::get_key(const std::string & key, T & result, bool required) {
@@ -1043,39 +1045,44 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     return nullptr;
 }
 
+ggml_context * llama_model_loader::ctx_for_buft(
+        const llama_hparams & hparams, ggml_backend_buffer_type_t buft) {
+    auto it = ctx_map.find(buft);
+    if (it == ctx_map.end()) {
+        // one ggml context per buffer type
+        int max_n_tensors = n_tensors;
+        max_n_tensors += 1;                 // duplicated output tensor
+        max_n_tensors += hparams.n_layer*2; // duplicated rope freq tensors
+        // MoE-SSD decode 窗口：每种 family 每层 2 个 view（prefill + decode），共 ~8/层。
+        // 这些张量在 load_arch_tensors 里新建，不经过 create_tensor，所以不在这里
+        // 预留的话 ctx 的 metadata 空间会溢出、ggml_new_tensor 直接 abort。
+        max_n_tensors += hparams.n_layer * 10;
+        if (files.empty()) {
+            max_n_tensors += hparams.n_layer*256; // this should be well above what any model actually uses
+        }
+        const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
+
+        ggml_init_params params = {
+            /*.mem_size   =*/ ctx_size,
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+
+        ggml_context * ctx = ggml_init(params);
+        if (!ctx) {
+            throw std::runtime_error(format("failed to create ggml context"));
+        }
+
+        ctx_map.emplace(buft, ctx);
+
+        return ctx;
+    }
+    return it->second.get();
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        auto it = ctx_map.find(buft);
-        if (it == ctx_map.end()) {
-            // one ggml context per buffer type
-            int max_n_tensors = n_tensors;
-            max_n_tensors += 1;                 // duplicated output tensor
-            max_n_tensors += hparams.n_layer*2; // duplicated rope freq tensors
-            if (files.empty()) {
-                max_n_tensors += hparams.n_layer*256; // this should be well above what any model actually uses
-            }
-            const size_t ctx_size = ggml_tensor_overhead()*max_n_tensors;
-
-            ggml_init_params params = {
-                /*.mem_size   =*/ ctx_size,
-                /*.mem_buffer =*/ NULL,
-                /*.no_alloc   =*/ true,
-            };
-
-            ggml_context * ctx = ggml_init(params);
-            if (!ctx) {
-                throw std::runtime_error(format("failed to create ggml context"));
-            }
-
-            ctx_map.emplace(buft, ctx);
-
-            return ctx;
-        }
-        return it->second.get();
-    };
-
     auto buft_for_tensor = [&](ggml_tensor * t_meta) -> ggml_backend_buffer_type_t {
         if (!t_meta) {
             if (flags & TENSOR_NOT_REQUIRED) {
@@ -1243,7 +1250,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
         GGML_ASSERT(buft != nullptr);
-        ggml_context * ctx = ctx_for_buft(buft);
+        ggml_context * ctx = ctx_for_buft(hparams, buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
         return ret;
@@ -1254,7 +1261,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     if (buft == nullptr) {
         return nullptr; // return type is ggml_tensor *
     }
-    ggml_context * ctx = ctx_for_buft(buft);
+    ggml_context * ctx = ctx_for_buft(hparams, buft);
+
+    // 记下这次创建用的 ctx。`virtualize_expert_tensor` 紧跟着 `create_tensor` 调用，
+    // 所以那里读到的就是该 expert 张量所在的 ctx —— decode 窗口的 view 要在这个
+    // ctx 里新建 metadata（ggml 允许 view 与 base 不同 ctx）。
+    last_create_ctx = ctx;
 
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
     if (flags & TENSOR_DUPLICATED) {
@@ -1283,6 +1295,140 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     return tensor;
+}
+
+ggml_tensor * llama_model_loader::create_tensor_alloc(
+        const llama_hparams & hparams,
+        ggml_backend_buffer_type_t buft,
+        const std::string & name,
+        const std::initializer_list<int64_t> & ne,
+        ggml_type type) {
+    ggml_context * ctx = ctx_for_buft(hparams, buft);
+
+    // 与 create_tensor 一样记下 ctx：expert_ctx / last_create_ctx 供后续
+    // 建「decode 窗口」的 view 用（见 virtualize_expert_tensor）。
+    last_create_ctx = ctx;
+
+    // 注意这里**不写 weights_map**：这个张量的内容不来自 gguf，
+    // 写进去会让 load_all_data 去文件里找它。
+    ggml_tensor * tensor = ggml_new_tensor(ctx, type, (int) ne.size(), ne.begin());
+    ggml_set_name(tensor, name.c_str());
+    n_created++;
+    n_created_synthesized++;
+    return tensor;
+}
+
+void llama_model_loader::virtualize_expert_tensor(        ggml_tensor * tensor,
+        int64_t n_expert,
+        int64_t n_slots,
+        ggml_type sidecar_type,
+        size_t bytes_per_expert) {
+    if (!tensor) {
+        return;
+    }
+    // 捕获本张量所在的 context，供 decode 窗口新建 view 用。
+    expert_ctx = last_create_ctx;
+    if (tensor->data || tensor->buffer) {
+        throw std::runtime_error("cannot virtualize an allocated expert tensor");
+    }
+    if (tensor->type != sidecar_type) {
+        throw std::runtime_error(format(
+            "expert tensor '%s' type %s does not match sidecar type %s",
+            ggml_get_name(tensor), ggml_type_name(tensor->type), ggml_type_name(sidecar_type)));
+    }
+    // ne[2] 此时仍是 GGUF 里的原始值（= n_expert），下面会改成 n_slots。
+    // n_slots 允许大于 n_expert：按层分区时 slot 数就大于专家数（同一专家在不同层
+    // 的窗口里占不同 slot）。上界由 model 侧的 RAM 预算控制，这里不重复限制。
+    if (tensor->ne[2] != n_expert || n_slots <= 0) {
+        throw std::runtime_error(format("invalid slot geometry for expert tensor '%s'", ggml_get_name(tensor)));
+    }
+    if (ggml_nbytes(tensor) != bytes_per_expert * (size_t) n_expert) {
+        throw std::runtime_error(format("expert byte stride mismatch for tensor '%s'", ggml_get_name(tensor)));
+    }
+
+    const std::string name = ggml_get_name(tensor);
+    tensor->ne[2] = n_slots;
+    tensor->nb[3] = tensor->nb[2] * tensor->ne[2];
+
+    if (ggml_nbytes(tensor) != bytes_per_expert * (size_t) n_slots) {
+        throw std::runtime_error(format("virtual expert tensor '%s' has unexpected size", name.c_str()));
+    }
+    // 把张量从 weights_map 摘掉，这样 load_all_data 不会去 gguf 里找它 —— 专家的
+    // 内容来自 sidecar，由 preadv 运行时写入。
+    //
+    // 不检查返回值：gguf 里已经没有专家时（用 strip_experts.py 剥离过），张量是
+    // 按 sidecar manifest 合成的，本来就不在 weights_map 里。
+    weights_map.erase(name);
+
+    LLAMA_LOG_INFO("%s: virtualized %s from %lld experts to %lld slots (%.2f MiB)\n",
+        __func__, name.c_str(), (long long) n_expert, (long long) n_slots,
+        ggml_nbytes(tensor) / 1024.0 / 1024.0);
+}
+
+void llama_model_loader::alias_expert_slot_tensor(ggml_tensor * dst, ggml_tensor * src) {
+    if (!dst || !src) {
+        throw std::runtime_error("cannot alias a null expert slot tensor");
+    }
+    if (dst == src) {
+        return;
+    }
+    if (dst->data || dst->buffer || src->data || src->buffer) {
+        throw std::runtime_error(format(
+            "cannot alias already-allocated expert tensor '%s'", ggml_get_name(dst)));
+    }
+    if (dst->view_src) {
+        throw std::runtime_error(format(
+            "expert tensor '%s' is already a view", ggml_get_name(dst)));
+    }
+    // 允许 dst 是 src 的**子窗口**（ne[2] 更小，view_offs = 0）：
+    // 每层按 prefill 容量建张量、base 是更大的「prefill + 各层 decode」大块。
+    if (dst->ne[0] != src->ne[0] || dst->ne[1] != src->ne[1] ||
+        dst->ne[2] > src->ne[2]) {
+        throw std::runtime_error(format(
+            "cannot alias expert tensor '%s' onto '%s': shape %lldx%lldx%lld vs %lldx%lldx%lld",
+            ggml_get_name(dst), ggml_get_name(src),
+            (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2],
+            (long long) src->ne[0], (long long) src->ne[1], (long long) src->ne[2]));
+    }
+    if (ggml_nbytes(dst) > ggml_nbytes(src)) {
+        throw std::runtime_error(format(
+            "cannot alias expert tensor '%s' (%.2f MiB) onto smaller base '%s' (%.2f MiB)",
+            ggml_get_name(dst), ggml_nbytes(dst) / 1024.0 / 1024.0,
+            ggml_get_name(src), ggml_nbytes(src) / 1024.0 / 1024.0));
+    }
+    dst->view_src  = src;
+    dst->view_offs = 0;
+    dst->data      = nullptr;
+}
+
+ggml_tensor * llama_model_loader::window_expert_slot_tensor(
+        const char * name, ggml_tensor * base, int64_t slot_offset, int64_t n_slots,
+        size_t bytes_per_expert) {
+    if (!base || !expert_ctx) {
+        throw std::runtime_error("cannot create an expert window without a base / context");
+    }
+    if (slot_offset < 0 || n_slots <= 0 || bytes_per_expert == 0) {
+        throw std::runtime_error("invalid expert window range");
+    }
+    if ((size_t) (slot_offset + n_slots) * bytes_per_expert > ggml_nbytes(base)) {
+        throw std::runtime_error(format(
+            "expert window '%s' [%lld, %lld) exceeds base '%s' (%zu bytes)",
+            name, (long long) slot_offset, (long long) (slot_offset + n_slots),
+            ggml_get_name(base), ggml_nbytes(base)));
+    }
+
+    // 新建 metadata，然后做成 base 上的一段 view。
+    // 复用 base 的 nb[1]/nb[2]（expert 之间的步长），只改 ne[2] 和字节偏移。
+    ggml_tensor * result = ggml_new_tensor_3d(expert_ctx, base->type,
+                                              base->ne[0], base->ne[1], n_slots);
+    ggml_set_name(result, name);
+    result->nb[1]   = base->nb[1];
+    result->nb[2]   = base->nb[2];
+    result->nb[3]   = base->nb[2] * n_slots;
+    result->view_src  = base;
+    result->view_offs = (size_t) slot_offset * bytes_per_expert;
+    result->data      = nullptr;
+    return result;
 }
 
 struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_context * ctx, struct ggml_tensor * base, const std::string & name, const std::initializer_list<int64_t> & ne, size_t offset, bool required) {
@@ -1314,12 +1460,15 @@ struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_conte
 }
 
 void llama_model_loader::done_getting_tensors(bool partial) const {
-    if (n_created > n_tensors) {
-        throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
+    // 合成出来的张量（gguf 里已剥离的专家）在文件里没有对应项，不参与「架构是否
+    // 和文件匹配」的校验，否则会误判成「创建的张量比文件多」。
+    const int n_from_file = n_created - n_created_synthesized;
+    if (n_from_file > n_tensors) {
+        throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_from_file));
     }
-    if (n_created < n_tensors) {
+    if (n_from_file < n_tensors) {
         if (!partial) {
-            throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
+            throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_from_file));
         }
         LLAMA_LOG_INFO("%s: partial load — used %d of %d tensors in the file (rest belong to a sibling model on the same .gguf)\n",
                 __func__, n_created, n_tensors);
