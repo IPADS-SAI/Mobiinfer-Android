@@ -5,6 +5,7 @@
 #include "llama-hparams.h"
 #include "llama-impl.h"
 #include "llama-mmap.h"
+#include "llama-moe-sidecar.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
 
@@ -284,6 +285,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_qwen35moe(params);
         case LLM_ARCH_MISTRAL3:
             return new llama_model_mistral3(params);
+        case LLM_ARCH_DFLASH:
+            return new llama_model_dflash(params);
         case LLM_ARCH_MIMO2:
             return new llama_model_mimo2(params);
         case LLM_ARCH_KIMI_LINEAR:
@@ -883,6 +886,33 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
 }
 
 // GPU: split if LLAMA_SPLIT_MODE_ROW -> GPU
+// 向设备要一个「张量必须自己分配」的 buffer type：它的张量不会被换成本地映射
+// （mmap）包装的 buffer。
+//
+// 为什么需要：启用 mmap 时，llama_model::load_tensors 会把**默认 buft** 的张量
+// 整体包进模型文件的映射区（见那里的 is_default_buft 判断）。而 MoE 专家张量
+// 的内容来自 sidecar、由 preadv 在运行时写入，跟文件映射无关 —— 落进映射区就
+// 写不进去（映射是 MAP_PRIVATE 只读）。把它们放到这个 buft 上，走正常分配。
+//
+// 后端若不提供，返回 nullptr，调用方回退到默认行为。
+static ggml_backend_buffer_type_t make_alloc_only_buft(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg) {
+        return nullptr;
+    }
+    auto fn = (ggml_backend_buffer_type_t (*)(size_t))
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_buffer_type_alloc_only");
+    if (!fn) {
+        return nullptr;
+    }
+    for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); ++i) {
+        if (ggml_backend_reg_dev_get(reg, i) == dev) {
+            return fn(i);
+        }
+    }
+    return nullptr;
+}
+
 static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode split_mode, const float * tensor_split) {
     buft_list_t buft_list;
 
@@ -952,6 +982,10 @@ struct llama_model::impl {
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
+    /// 每个设备上「张量必须自己分配」的 buft（见 make_alloc_only_buft）。
+    /// MoE 专家张量走它，避免被 mmap 的文件映射包住。nullptr = 后端不支持。
+    std::map<ggml_backend_dev_t, ggml_backend_buffer_type_t> alloc_only_buft;
+
     struct layer_dev {
         ggml_backend_dev_t dev;
         buft_list_t * buft_list;
@@ -962,10 +996,20 @@ struct llama_model::impl {
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
+    std::unique_ptr<llama_moe_sidecar> moe_sidecar;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
+
+    const bool has_sidecar = params.moe_sidecar_path && params.moe_sidecar_path[0] != '\0';
+    const bool has_slots = params.moe_slot_bank > 0;
+    if (has_sidecar != has_slots) {
+        throw std::invalid_argument("MoE sidecar path and slot bank size must be set together");
+    }
+    if (has_sidecar) {
+        pimpl->moe_sidecar = std::make_unique<llama_moe_sidecar>(params.moe_sidecar_path);
+    }
 }
 
 llama_model::~llama_model() {
@@ -1147,6 +1191,40 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     // per-arch hparams
     load_arch_hparams(ml);
 
+    if (pimpl->moe_sidecar) {
+        if (arch != LLM_ARCH_QWEN35MOE) {
+            throw std::runtime_error("MoE sidecar currently supports only qwen35moe");
+        }
+        if (pimpl->moe_sidecar->expert_count() != (int32_t) hparams.n_expert ||
+            pimpl->moe_sidecar->expert_used_count() != (int32_t) hparams.n_expert_used) {
+            throw std::runtime_error("MoE sidecar expert counts do not match model metadata");
+        }
+        // bank 的下界是 top-k（一层的 unique 至少要能装下）。
+        //
+        // 上界**不再**限制到 n_expert：原先认为「slot 数超过专家数没意义」，
+        // 但那只在「所有层共享同一个 slot 编号空间」的假设下成立。
+        // 一旦要按层分区（每层留自己的跨 token 窗口），slot 数就可以大于专家数 ——
+        // 同一个专家在不同层的窗口里占不同的 slot。真正的上界是下面的 RAM 预算。
+        if (params.moe_slot_bank < (int32_t) hparams.n_expert_used) {
+            throw std::runtime_error("MoE slot bank must be at least expert_used_count");
+        }
+        // Shared-bank RAM is bank x one layer. Cap it at the old bank=32-per-layer budget.
+        const int32_t n_moe_layers = pimpl->moe_sidecar->layer_count();
+        constexpr int32_t kMoeSlotBankRamBaseline = 32;
+        if (n_moe_layers > 0 && params.moe_slot_bank > kMoeSlotBankRamBaseline * n_moe_layers) {
+            throw std::runtime_error("MoE shared slot bank exceeds the bank=32-per-layer RAM budget");
+        }
+        const size_t bytes_all = pimpl->moe_sidecar->bytes_per_slot_all_layers();
+        const size_t bytes_one = n_moe_layers > 0 ? bytes_all / (size_t) n_moe_layers : 0;
+        LLAMA_LOG_INFO(
+            "%s: MoE sidecar shared slot bank: %d slots, %d layers, %.2f MiB resident (bank=32 x layers was %.2f MiB)\n",
+            __func__,
+            params.moe_slot_bank,
+            n_moe_layers,
+            (bytes_one * (size_t) params.moe_slot_bank) / 1024.0 / 1024.0,
+            (bytes_all * (size_t) kMoeSlotBankRamBaseline) / 1024.0 / 1024.0);
+    }
+
     pimpl->n_bytes = ml.n_bytes;
 
     pimpl->desc_str = arch_name() + " " + type_name() + " " + ml.ftype_name();
@@ -1186,6 +1264,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // add CPU buffer types as a fallback
         buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
         pimpl->gpu_buft_list.emplace(dev.dev, std::move(buft_list));
+
+        if (ggml_backend_buffer_type_t buft = make_alloc_only_buft(dev.dev)) {
+            pimpl->alloc_only_buft.emplace(dev.dev, buft);
+        }
     }
 
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -1582,6 +1664,59 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
         tn, ne, flags);
 }
 
+ggml_tensor * llama_model_base::create_tensor_own_alloc(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+    // 内容不由模型文件提供、而是在运行时写入的张量走这里（目前只有 MoE 专家）。
+    //
+    // 关键是把 buft_list 换成**只含一个 buft** 的列表：那个 buft 不是设备默认值，
+    // 于是 llama_model::load_tensors 里「默认 buft 的张量包进 mmap 映射区」那段
+    // 不会命中它，张量会走正常分配（见 make_alloc_only_buft）。
+    //
+    // 未开 mmap 时行为与原来一致（那个 buft 的 alloc_buffer 就是普通的 shared 分配），
+    // 所以这个改动对现有路径是透明的。
+    ggml_backend_dev_t dev = tn.bid == -1
+        ? nullptr
+        : ggml_backend_buft_get_device(pimpl->dev_layer.at(tn.bid).buft_list->front().second);
+
+    // 诊断开关：退回「和非专家权重共用一个 buffer」的旧行为，用于 A/B。
+    static const bool disabled = [] {
+        const char * s = std::getenv("LLAMA_MOE_NO_OWN_ALLOC");
+        return s && *s && *s != '0';
+    }();
+
+    const auto it = dev ? pimpl->alloc_only_buft.find(dev) : pimpl->alloc_only_buft.end();
+    if (it == pimpl->alloc_only_buft.end() || disabled) {
+        return create_tensor(ml, tn, ne, flags);
+    }
+
+    static std::map<ggml_backend_dev_t, buft_list_t> lists;
+    buft_list_t & list = lists[dev];
+    if (list.empty()) {
+        list.emplace_back(dev, it->second);
+    }
+
+    return ml.create_tensor(
+        hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, &list,
+        tn, ne, flags);
+}
+
+ggml_tensor * llama_model_base::create_expert_tensor_from_sidecar(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, ggml_type type) {
+    // gguf 里没有这个专家张量（已剥离），只能用 sidecar manifest 的形状/类型合成。
+    // 必须放在 alloc_only_buft 上：专家内容是 preadv 运行时写入的，不能被 mmap
+    // 的文件映射包住（见 create_tensor_own_alloc 的说明）。
+    ggml_backend_dev_t dev = tn.bid == -1
+        ? nullptr
+        : ggml_backend_buft_get_device(pimpl->dev_layer.at(tn.bid).buft_list->front().second);
+
+    const auto it = dev ? pimpl->alloc_only_buft.find(dev) : pimpl->alloc_only_buft.end();
+    if (it == pimpl->alloc_only_buft.end()) {
+        throw std::runtime_error(format(
+            "%s: backend has no alloc-only buft, cannot synthesize stripped expert tensor '%s'",
+            __func__, tn.str().c_str()));
+    }
+
+    return ml.create_tensor_alloc(hparams, it->second, tn.str(), ne, type);
+}
+
 std::string llama_model::arch_name() const {
     return llm_arch_name(arch);
 }
@@ -1917,6 +2052,132 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
     return it->second;
 }
 
+bool llama_model::moe_slot_bank_enabled() const {
+    return pimpl->moe_sidecar != nullptr;
+}
+
+int32_t llama_model::moe_slot_bank_size() const {
+    return pimpl->moe_sidecar ? params.moe_slot_bank : 0;
+}
+
+int32_t llama_model::moe_sidecar_layer_count() const {
+    return pimpl->moe_sidecar ? pimpl->moe_sidecar->layer_count() : 0;
+}
+
+int32_t llama_model::moe_decode_window() const {
+    if (!pimpl->moe_sidecar) {
+        return 0;
+    }
+    const char * s = std::getenv("LLAMA_MOE_DECODE_WINDOW");
+    if (!s || !*s) {
+        return 0;                       // 未设置 = 关闭
+    }
+    const int32_t n_moe = pimpl->moe_sidecar->layer_count();
+    if (n_moe <= 0) {
+        return 0;
+    }
+
+    int32_t want;
+    if (strcmp(s, "auto") == 0) {
+        want = params.moe_slot_bank / n_moe;
+    } else {
+        want = atoi(s);
+        // "0" 表示**关闭**，不是「自动」。以前 0 会落到 auto 分支算出
+        // bank/层数（本模型是 6），而 6 < n_expert_used(8) —— 一个 token 装不下，
+        // 会在运行时抛错。这个语义陷阱让 `-moeDecodeWindow 0` 直接崩，已修。
+        if (want <= 0) {
+            return 0;
+        }
+    }
+
+    // 下界：一步至少要能装下本层用到的专家数，否则该层必然分配失败。
+    // 上界：每层张量的 ne[2] = 窗口宽度，Metal 的 mul_mat_id 要求 ne[2] <= 1024
+    // （这是每层张量的限制而不是总量，所以总量可以更大，受 RAM 约束）。
+    const int32_t lo = (int32_t) std::max<int64_t>(1, hparams.n_expert_used);
+    if (want < lo) {
+        LLAMA_LOG_WARN("%s: MoE decode window %d < n_expert_used %d, clamped up\n",
+                __func__, (int) want, (int) lo);
+        want = lo;
+    }
+    return std::min(want, 1024);
+}
+
+std::vector<int32_t> llama_model::moe_layer_windows() const {
+    std::vector<int32_t> out;
+    if (!pimpl->moe_sidecar) {
+        return out;
+    }
+    const int32_t n_moe = pimpl->moe_sidecar->layer_count();
+    if (n_moe <= 0) {
+        return out;
+    }
+    const int32_t base = moe_decode_window();
+    out.assign((size_t) n_moe, base);
+    if (base <= 0) {
+        return out;                     // 未启用窗口
+    }
+
+    const char * s = std::getenv("LLAMA_MOE_LAYER_WINDOWS");
+    if (!s || !*s) {
+        return out;                     // 没有按层覆盖 = 全部均匀
+    }
+
+    // 解析 "0:128,1:80" 这类覆盖。非法项直接忽略（宁可退回均匀，也不要崩）。
+    const char * p = s;
+    while (*p) {
+        while (*p == ' ' || *p == ',') ++p;
+        if (!*p) break;
+        char * end = nullptr;
+        const long il = strtol(p, &end, 10);
+        if (end == p || *end != ':') break;
+        p = end + 1;
+        const long w = strtol(p, &end, 10);
+        if (end == p) break;
+        p = end;
+        if (il >= 0 && il < n_moe && w > 0) {
+            const int32_t lo = (int32_t) std::max<int64_t>(1, hparams.n_expert_used);
+            out[(size_t) il] = (int32_t) std::min<long>(std::max<long>(w, lo), 1024);
+        }
+    }
+    return out;
+}
+
+int32_t llama_model::moe_layer_windows_total() const {
+    const auto w = moe_layer_windows();
+    int32_t sum = 0;
+    for (int32_t x : w) {
+        sum += x;
+    }
+    return sum;
+}
+
+int32_t llama_model::moe_prefetch_slots() const {
+    if (!pimpl->moe_sidecar) {
+        return 0;
+    }
+    const char * s = std::getenv("LLAMA_MOE_LOOKAHEAD_PREFETCH");
+    const bool on = s && *s && *s != '0';
+    if (!on) {
+        return 0;
+    }
+    const char * d = std::getenv("LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH");
+    int32_t k = d ? atoi(d) : 8;
+    return std::max(0, std::min(k, 64));
+}
+
+const llama_moe_sidecar_entry * llama_model::moe_sidecar_entry(const char * tensor_name) const {
+    if (!pimpl->moe_sidecar || !tensor_name) {
+        return nullptr;
+    }
+    // decode 窗口张量的名字是 `<原名>.dec`（见 qwen35moe 的窗口布局），
+    // 它们是同一份权重、同一个 sidecar entry，所以查表前剥掉后缀。
+    std::string name = tensor_name;
+    if (name.size() > 4 && name.compare(name.size() - 4, 4, ".dec") == 0) {
+        name.resize(name.size() - 4);
+    }
+    return pimpl->moe_sidecar->find(name.c_str());
+}
+
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {
     return hparams.is_swa(il) ? hparams.rope_freq_base_train_swa : cparams.rope_freq_base;
 }
@@ -2142,7 +2403,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     // TODO: move reranking logic here and generalize
     llm->build_dense_out(dense_2_out_layers, dense_2_out_layers_b, dense_3_out_layers);
 
-    llm->res->set_outputs();
+    llm->res->set_outputs(params);
 
     return llm->res->get_gf();
 }
@@ -2163,6 +2424,8 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.moe_sidecar_path            =*/ nullptr,
+        /*.moe_slot_bank               =*/ 0,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_direct_io               =*/ false,
@@ -2203,6 +2466,82 @@ int32_t llama_model_n_embd_inp(const llama_model * model) {
 
 int32_t llama_model_n_embd_out(const llama_model * model) {
     return model->hparams.n_embd_out();
+}
+
+// 取 token 的**输入** embedding（即 token_embd 的第 token 行），不做任何前向。
+//
+// 用途：把一段「文本 token + 多模态 embedding」的序列整条当作 embedding 批次送进
+// llama_decode()。llama 的 ubatch 只能是「全 token」或「全 embedding」（见
+// llama-batch.cpp 的 ubatch_add：embd 缓冲区全有或全无），所以想让图文进同一个前向，
+// 唯一的办法是把文本 token 也转成输入向量。
+//
+// 注意：token 路径在 n_embd_inp != n_embd 时还会补零，这里不处理该情况（直接报错），
+// 也不处理 LoRA 对 embedding 的修正 —— 本仓库的多模态路径不用 LoRA。
+int32_t llama_model_token_embd(
+        const llama_model * model,
+        const llama_token * tokens,
+        int32_t             n_tokens,
+        float *             out) {
+    if (model == nullptr || tokens == nullptr || out == nullptr || n_tokens <= 0) {
+        return -1;
+    }
+    const ggml_tensor * t = model->tok_embd;
+    if (t == nullptr) {
+        LLAMA_LOG_ERROR("%s: 模型没有 token_embd 张量\n", __func__);
+        return -1;
+    }
+    const int32_t n_embd     = model->hparams.n_embd;
+    const int32_t n_embd_inp = model->hparams.n_embd_inp();
+    if (n_embd_inp != n_embd) {
+        LLAMA_LOG_ERROR("%s: n_embd_inp (%d) != n_embd (%d)，暂不支持（需按 token 路径补零）\n",
+                        __func__, n_embd_inp, n_embd);
+        return -1;
+    }
+    if (getenv("MB_TOKEN_EMBD_DEBUG")) {
+        LLAMA_LOG_INFO("%s: type=%s ne=[%lld,%lld] nb=[%zu,%zu]\n", __func__,
+                       ggml_type_name(t->type), (long long) t->ne[0], (long long) t->ne[1],
+                       t->nb[0], t->nb[1]);
+    }
+
+    // 逐行取回 + 按类型反量化。
+    //
+    // 为什么这样（CPU 反量化）与 token 路径（GPU 上跑 ggml_get_rows）**逐位相同**：
+    // Q4_K 的反量化是逐元素的仿射变换 `d*s*q - dmin*m`，两边用的是同一份查表与同样的
+    // float 运算顺序，不涉及任何归约。实测在 1/2/3 个 ubatch 下，两条路径 prompt 末尾的
+    // logits 最大绝对差都是 0.000000e+00（见 bench_prefill/test_logits_cmp.cpp）。
+    const ggml_type_traits * traits = ggml_get_type_traits(t->type);
+    if (traits == nullptr || traits->to_float == nullptr) {
+        LLAMA_LOG_ERROR("%s: 类型 %s 没有 to_float，无法反量化\n",
+                        __func__, ggml_type_name(t->type));
+        return -1;
+    }
+
+    const size_t row_bytes = t->nb[1];
+    const int64_t n_vocab  = t->ne[1];
+
+    if (getenv("MB_TOKEN_EMBD_DEBUG")) {
+        LLAMA_LOG_INFO("%s: type=%s ne=[%lld,%lld] nb=[%zu,%zu] view_offs=%zu data=%p n_vocab=%lld\n",
+                       __func__, ggml_type_name(t->type),
+                       (long long) t->ne[0], (long long) t->ne[1],
+                       t->nb[0], t->nb[1], (size_t) t->view_offs, t->data, (long long) n_vocab);
+    }
+
+    // 逐行取回：tok_embd 可能驻留在 GPU 上，统一走 backend 的 device→host 拷贝。
+    // 行与行在词表里可能离得很远，所以不做整段合并。
+    std::vector<uint8_t> row(row_bytes);
+
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        const llama_token tok = tokens[i];
+        if (tok < 0 || (int64_t) tok >= n_vocab) {
+            LLAMA_LOG_ERROR("%s: token %d 越界（n_vocab = %lld）\n",
+                            __func__, (int) tok, (long long) n_vocab);
+            return -1;
+        }
+        ggml_backend_tensor_get(t, row.data(), (size_t) tok * row_bytes, row_bytes);
+        traits->to_float(row.data(), out + (size_t) i * n_embd, n_embd);
+    }
+
+    return 0;
 }
 
 int32_t llama_model_n_layer(const llama_model * model) {
@@ -2385,6 +2724,13 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_TALKIE:
             return LLAMA_ROPE_TYPE_NEOX;
 
+        case LLM_ARCH_DFLASH:
+            // drafts for M-RoPE targets carry rope sections and follow the target's temporal dim
+            if (const auto & s = model->hparams.rope_sections; s[0] || s[1] || s[2] || s[3]) {
+                return LLAMA_ROPE_TYPE_MROPE;
+            }
+            return LLAMA_ROPE_TYPE_NEOX;
+
         case LLM_ARCH_QWEN2VL:
         case LLM_ARCH_PADDLEOCR:
             return LLAMA_ROPE_TYPE_MROPE;
@@ -2504,8 +2850,9 @@ uint64_t llama_model_n_params(const llama_model * model) {
 
 bool llama_model_has_encoder(const llama_model * model) {
     switch (model->arch) {
-        case LLM_ARCH_T5:        return true;
-        case LLM_ARCH_T5ENCODER: return true;
+        case LLM_ARCH_T5:
+        case LLM_ARCH_T5ENCODER:
+        case LLM_ARCH_DFLASH:    return true;
         default:                 return false;
     }
 }
@@ -2590,4 +2937,13 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
         layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K, "bias", bid), {n_embd_k_}, TENSOR_NOT_REQUIRED);
         layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V, "bias", bid), {n_embd_v_}, TENSOR_NOT_REQUIRED);
     }
+}
+
+const int32_t * llama_model_target_layer_ids(const struct llama_model * model) {
+    const auto & v = model->target_layer_ids;
+    return v.empty() ? nullptr : v.data();
+}
+
+uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
+    return (uint32_t) model->target_layer_ids.size();
 }

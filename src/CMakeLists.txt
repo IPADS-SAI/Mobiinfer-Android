@@ -30,6 +30,10 @@ add_library(llama
             llama-memory-hybrid-iswa.cpp
             llama-memory-recurrent.cpp
             llama-mmap.cpp
+            llama-moe-sidecar.cpp
+            llama-moe-sidecar.h
+            llama-moe-slot.cpp
+            llama-moe-slot.h
             llama-model-loader.cpp
             llama-model-saver.cpp
             llama-model.cpp
@@ -49,6 +53,7 @@ set_target_properties(llama PROPERTIES
 )
 
 target_include_directories(llama PRIVATE .)
+target_include_directories(llama PRIVATE ../vendor)
 target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 

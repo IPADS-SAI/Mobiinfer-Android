@@ -26,6 +26,11 @@ extern "C" {
         size_t                (*get_alloc_size)(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
         // (optional) check if tensor data is in host memory and uses standard ggml tensor layout (defaults to false)
         bool                  (*is_host)       (ggml_backend_buffer_type_t buft);
+        // (optional) check if tensor data is directly addressable from the CPU, even though the buffer
+        // may still be a device buffer (e.g. Metal buffers with MTLResourceStorageModeShared on unified
+        // memory). when true, tensor->data is a valid host pointer and can be written directly with
+        // memcpy/pread instead of going through set_tensor (defaults to is_host)
+        bool                  (*is_host_addressable)(ggml_backend_buffer_type_t buft);
     };
 
     struct ggml_backend_buffer_type {

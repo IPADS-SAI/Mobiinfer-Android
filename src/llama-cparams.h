@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <cstdint>
+#include <vector>
 
 #define LLAMA_MAX_SEQ 256
 
@@ -15,6 +16,9 @@ struct llama_cparams {
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing
+
+    // 0 = use hparams.n_expert_used. Runtime top-k for MoE (prefill vs decode).
+    int32_t  n_expert_used = 0;
 
     float rope_freq_base;
     float rope_freq_scale;
@@ -43,9 +47,15 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+
     enum llama_context_type ctx_type;
     enum llama_pooling_type pooling_type;
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
+
+    // other context this context cooperates with (draft -> target model for the
+    // speculator architectures that share the target's token embedding / lm head)
+    llama_context * ctx_other;
 };
