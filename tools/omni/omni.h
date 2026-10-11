@@ -12,6 +12,7 @@
 #include <chrono>
 #include <functional>
 #include <atomic>
+#include <map>
 
 // Windows compatibility: pid_t is not defined on MSVC
 #ifdef _WIN32
@@ -39,6 +40,14 @@ struct DuplexPipeline;
 // 让外部只需要 push_frame / wait_next_frame，无需知道 stream_prefill/stream_decode
 // 的"index 语义"和并发约束。
 struct DuplexSession;
+
+// Per-frame pipeline timing breakdown (populated by encoder/llm threads, consumed by decode worker)
+struct DuplexFrameTiming {
+    double ms_encode_vpm = 0;   // VPM (vision) encoding time
+    double ms_encode_apm = 0;   // APM (audio) encoding time
+    double ms_encode_wall = 0;  // wall clock encoding time (max of VPM+APM in parallel)
+    double ms_prefill_llm = 0;  // LLM prefill time (embedding injection into KV cache)
+};
 
 //
 // omni ctx
@@ -257,6 +266,12 @@ struct omni_context {
     // 持有内部 prefill_worker/decode_worker 线程及 frame 队列。
     // omni_free 时若仍存在，会被强制 session_end 释放。
     DuplexSession * duplex_session = NULL;
+
+    // Per-frame pipeline timing. Keyed by frame index (matches DuplexEncodeReq::index).
+    // Encoder thread writes ms_encode_*; llm thread writes ms_prefill_llm.
+    // Decode worker reads and populates OmniDuplexFrameResult.
+    std::mutex frame_timing_mtx;
+    std::map<int, DuplexFrameTiming> frame_timing;
     
     volatile bool need_speek = false;
     volatile bool speek_done = true;
@@ -551,6 +566,8 @@ struct OmniDuplexFrameResult {
     std::string text;               // 该帧 SPEAK 时生成的文本片段（已剔除控制 token）
     int      n_past_after = 0;      // 帧处理完成时的 ctx_llama n_past（调试用）
     double   ms_prefill_submit = 0; // push_frame → prefill_worker 完成提交（不等编码）
+    double   ms_encode = 0;         // VPM+APM encoding wall time (encoder thread)
+    double   ms_prefill = 0;        // LLM prefill time (llm thread, prefill → KV cache)
     double   ms_decode = 0;         // decode_worker 内部 stream_decode 阻塞时长
     double   ms_total = 0;          // push_frame → 本帧 result 出队的端到端 wall time
 };

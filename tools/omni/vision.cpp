@@ -1903,7 +1903,19 @@ struct llava_uhd {
             const float ratio = (float)original_width * original_height / (slice_size * slice_size);
             const int multiple = fmin(ceil(ratio), max_slice_nums);
 
+            // 1-tile split is the same image as overview; only slice when we get >= 2 tiles
+            if (!has_slices || max_slice_nums <= 1 || multiple <= 1) {
+                res.refined_size = vision_image_size{0, 0};
+                res.grid_size    = vision_image_size{0, 0};
+                return res;
+            }
+
             auto best_grid   = get_best_grid(max_slice_nums, multiple, log_ratio);
+            if (best_grid.width * best_grid.height <= 1) {
+                res.refined_size = vision_image_size{0, 0};
+                res.grid_size    = vision_image_size{0, 0};
+                return res;
+            }
             auto refine_size = get_refine_size(original_size, best_grid, slice_size, patch_size, true);
             res.grid_size    = best_grid;
             res.refined_size = refine_size;
@@ -1913,10 +1925,6 @@ struct llava_uhd {
                     res.overview_size.width, res.overview_size.height,
                     res.refined_size.width, res.refined_size.height,
                     res.grid_size.width, res.grid_size.height);
-
-            if (!has_slices || max_slice_nums == 0) {
-                return res;
-            }
 
             int width  = refine_size.width;
             int height = refine_size.height;
