@@ -7,6 +7,13 @@
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
 
+// ref: https://github.com/ggml-org/llama.cpp/pull/28068
+static inline ggml_tensor * build_gdn_l2_norm(ggml_context * ctx, ggml_tensor * x, float eps) {
+    const float n = x->ne[0];
+
+    return ggml_scale(ctx, ggml_rms_norm(ctx, x, eps/n), 1.0f/sqrtf(n));
+}
+
 //
 // base classes
 //
@@ -1060,6 +1067,37 @@ struct llama_model_glm_dsa : public llama_model_base {
     void load_arch_tensors(llama_model_loader & ml) override;
 
     using graph = llama_model_deepseek2::graph;
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+struct llama_model_eagle3 : public llama_model_base {
+    llama_model_eagle3(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    template <bool is_enc>
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
+
+        ggml_tensor * build_inp_embd_enc() const;
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
+struct llama_model_dflash : public llama_model_base {
+    llama_model_dflash(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    template <bool is_enc>
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
+
+        ggml_tensor * build_inp_embd_enc() const;
+    };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
