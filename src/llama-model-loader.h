@@ -72,6 +72,17 @@ struct llama_model_loader {
     int n_tensors = 0;
     int n_created = 0;
 
+    /// 其中「不来自 gguf、由 create_tensor_alloc 合成」的张量数。
+    /// gguf 剥离专家后，这些张量在文件里没有对应项，校验张量总数时要排除。
+    int n_created_synthesized = 0;
+
+    /// 最近一次 `create_tensor` 用的 ggml context。见 create_tensor 里的注释。
+    struct ggml_context * last_create_ctx = nullptr;
+    /// expert 张量所在的 ggml context。在 `virtualize_expert_tensor` 里从
+    /// `last_create_ctx` 捕获（两者紧邻调用，所以是精确的）。decode 窗口的
+    /// view 张量在这里新建。
+    struct ggml_context * expert_ctx = nullptr;
+
     uint64_t n_elements = 0;
     size_t   n_bytes    = 0;
 
@@ -183,6 +194,47 @@ struct llama_model_loader {
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    /// 在**指定的 buft** 上新建一个空张量（不读 gguf、不进 weights_map）。
+    ///
+    /// 给「内容不由模型文件提供」的张量用：MoE 专家剥离出 gguf 之后，gguf 里根本没有
+    /// 这些张量，只能用 experts manifest 里的形状/类型合成一个占位张量，内容后续由
+    /// preadv 填。不进 weights_map 是关键 —— 否则 load_all_data 会去文件里找它们。
+    struct ggml_tensor * create_tensor_alloc(
+        const llama_hparams & hparams,
+        ggml_backend_buffer_type_t buft,
+        const std::string & name,
+        const std::initializer_list<int64_t> & ne,
+        enum ggml_type type);
+
+    /// 取（必要时新建）某个 buffer type 对应的 ggml context。
+    /// 顺手把 metadata 容量按模型规模预留好，见实现里的说明。
+    struct ggml_context * ctx_for_buft(const llama_hparams & hparams, ggml_backend_buffer_type_t buft);
+
+    void virtualize_expert_tensor(
+        struct ggml_tensor * tensor,
+        int64_t n_expert,
+        int64_t n_slots,
+        enum ggml_type experts_type,
+        size_t bytes_per_expert);
+
+    // Make dst a view of src so later backend alloc only pays for src.
+    // dst may be a smaller / different quant of the same expert geometry.
+    void alias_expert_slot_tensor(struct ggml_tensor * dst, struct ggml_tensor * src);
+
+    /// 把 `dst` 变成 `base` 上一个**窗口**的 view：起始 slot 为 `slot_offset`、
+    /// 长度 `n_slots` 个 expert。
+    ///
+    /// 与 `alias_expert_slot_tensor` 的区别：那个要求 dst/src 的 ne[2] 相同（整块别名），
+    /// 这个允许 dst 只是 base 的一段子窗口 —— 用于「40 层各自在自己的偏移上开窗口」。
+    /// dst 由本函数**新建**（在 expert 张量所在的那个 ggml context 里），所以调用方
+    /// 拿到的是一块新 metadata，不需要预先有张量对象。
+    struct ggml_tensor * window_expert_slot_tensor(
+        const char * name,
+        struct ggml_tensor * base,
+        int64_t slot_offset,
+        int64_t n_slots,
+        size_t bytes_per_expert);
 
     struct ggml_tensor * create_tensor_as_view(struct ggml_context * ctx, struct ggml_tensor * base, const std::string & name, const std::initializer_list<int64_t> & ne, size_t offset, bool required = true);
 

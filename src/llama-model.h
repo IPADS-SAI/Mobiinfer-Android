@@ -17,6 +17,7 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+struct llama_moe_experts_entry;
 
 // available models
 enum llm_type {
@@ -297,6 +298,21 @@ struct llama_layer {
     struct ggml_tensor * ffn_down_exps     = nullptr;
     struct ggml_tensor * ffn_up_exps       = nullptr;
     struct ggml_tensor * ffn_gate_up_exps  = nullptr;
+
+    // MoE-SSD decode 专用 slot 张量。指向**同一块 buffer 上本层自己的偏移**
+    // （`view_offs = il * c * bytes_per_expert`），ne[2] = 每层窗口宽度 c，
+    // 所以层间不共用 slot，decode 缓存能跨 token 保留。
+    //
+    // 为什么不复用上面那几个：上面那份是 40 层 alias 到偏移 0 的共享张量，
+    // 它的 ne[2] = bank（最大 1000）——而 Metal 的 `mul_mat_id` 要求 ne[2] <= 1024
+    // （threadgroup 维度），所以共享张量把每层窗口卡在 25。拆成每层张量后
+    // 每层 ne[2] = c（小），c 的上限就只剩 RAM。
+    //
+    // 为空表示没启用（未开 experts，或窗口宽度为 0）。
+    struct ggml_tensor * ffn_gate_exps_dec    = nullptr;
+    struct ggml_tensor * ffn_down_exps_dec    = nullptr;
+    struct ggml_tensor * ffn_up_exps_dec      = nullptr;
+    struct ggml_tensor * ffn_gate_up_exps_dec = nullptr;
     struct ggml_tensor * ffn_gate_inp_b    = nullptr;
     struct ggml_tensor * ffn_gate_exps_b   = nullptr;
     struct ggml_tensor * ffn_down_exps_b   = nullptr;
@@ -562,6 +578,19 @@ struct llama_model {
     struct ggml_tensor * per_layer_model_proj = nullptr;
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
 
+    // eagle3
+    struct ggml_tensor * fc  = nullptr;  // feature fusion layer
+    struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
+
+    // dspark
+    struct ggml_tensor * dspark_markov_w1   = nullptr;
+    struct ggml_tensor * dspark_markov_w2   = nullptr;
+    struct ggml_tensor * dspark_conf_proj   = nullptr;
+    struct ggml_tensor * dspark_conf_proj_b = nullptr;
+
+    // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
+    std::vector<int32_t> target_layer_ids;
+
     std::vector<llama_layer> layers;
 
     //Dense linear projections for SentenceTransformers models like embeddinggemma
@@ -621,6 +650,34 @@ struct llama_model {
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 
+    bool moe_slot_bank_enabled() const;
+    int32_t moe_slot_bank_size() const;
+    /// 每层 decode 窗口宽度（slot 数），0 = 未启用。
+    /// 由 `LLAMA_MOE_DECODE_WINDOW` 决定（`auto` = bank / MoE 层数）。
+    int32_t moe_decode_window() const;
+
+    /// 每层的 decode 窗口宽度（**按 MoE 层序号**，不含预读暂存区）。
+    ///
+    /// 为什么需要按层：实测各层的「窗口容量→miss」曲线差别很大 —— layer 0 要到
+    /// c≈200 才饱和，而多数层 c≈96 就饱和。均匀分配会让冷层浪费 slot、热层不够。
+    /// 离线规划器（`runs-m4max-private/plan_layer_windows.py`，与引擎实测吻合）
+    /// 显示：同样总内存下按层分配能少 11~15% 的 miss。
+    ///
+    /// 宽度由 `LLAMA_MOE_LAYER_WINDOWS` 指定，格式 `层:宽度` 逗号分隔，
+    /// 例：`0:128,1:80`（未列出的层用 `moe_decode_window()` 的值）。
+    /// 返回的 vector 下标是**MoE 层序号**（与 experts 的 layer 字段一致）。
+    std::vector<int32_t> moe_layer_windows() const;
+
+    /// 所有层窗口宽度之和（用来算 base 张量的总 slots）。
+    int32_t moe_layer_windows_total() const;
+    /// 每层**预读暂存区**的 slot 数（= 预读深度 K）。0 = 无。
+    /// 与 moe_decode_window() 一起决定每层张量的总宽度（c + K）。
+    int32_t moe_prefetch_slots() const;
+    /// experts 里的 MoE 层数（用于算 base 容量）。
+    int32_t moe_experts_layer_count() const;
+
+    const llama_moe_experts_entry * moe_experts_entry(const char * tensor_name) const;
+
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
 
@@ -671,6 +728,19 @@ struct llama_model_base : public llama_model {
 
     // convenience overload of create_tensor that doesn't require llama_model_loader
     ggml_tensor * create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    /// 与 `create_tensor` 相同，但保证张量**自己分配内存**、不会被 mmap 的文件映射包住。
+    ///
+    /// 用于「内容不由模型文件提供，而是运行时写入」的张量（MoE 专家 slot）。
+    /// 未启用 mmap 时与 `create_tensor` 行为一致。
+    ggml_tensor * create_tensor_own_alloc(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    /// 为**已从 gguf 剥离**的 MoE 专家张量合成一个占位张量（空内容，待 preadv 填）。
+    ///
+    /// gguf 里已经不含专家时（见 tools/omni/moe/strip_experts.py），张量只能按
+    /// experts manifest 里的形状/类型建出来。仍然放在「自己分配」的 buft 上，
+    /// 理由与 create_tensor_own_alloc 相同。
+    ggml_tensor * create_expert_tensor_from_manifest(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, enum ggml_type type);
 
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,

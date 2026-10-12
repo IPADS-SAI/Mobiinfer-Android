@@ -181,6 +181,20 @@ static bool ggml_backend_buffer_is_metal(ggml_backend_buffer_t buffer) {
            buffer->iface.free_buffer == ggml_backend_metal_buffer_private_free_buffer;
 }
 
+bool ggml_backend_metal_buffer_park(ggml_backend_buffer_t buffer) {
+    if (!buffer || !ggml_backend_buffer_is_metal(buffer)) {
+        return false;
+    }
+    return ggml_metal_buffer_park((ggml_metal_buffer_t) buffer->context);
+}
+
+bool ggml_backend_metal_buffer_unpark(ggml_backend_buffer_t buffer) {
+    if (!buffer || !ggml_backend_buffer_is_metal(buffer)) {
+        return false;
+    }
+    return ggml_metal_buffer_unpark((ggml_metal_buffer_t) buffer->context);
+}
+
 //
 // buffer types
 //
@@ -278,6 +292,13 @@ static bool ggml_backend_metal_buffer_type_shared_is_host(ggml_backend_buffer_ty
     GGML_UNUSED(buft);
 }
 
+static bool ggml_backend_metal_buffer_type_shared_is_host_addressable(ggml_backend_buffer_type_t buft) {
+    // shared buffers use MTLResourceStorageModeShared backed by host memory, so tensor->data is a real CPU pointer
+    return true;
+
+    GGML_UNUSED(buft);
+}
+
 static ggml_backend_buffer_type_t ggml_backend_metal_buffer_type_shared(int device) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
@@ -306,6 +327,7 @@ static ggml_backend_buffer_type_t ggml_backend_metal_buffer_type_shared(int devi
                     /* .get_max_size     = */ ggml_backend_metal_buffer_type_shared_get_max_size,
                     /* .get_alloc_size   = */ ggml_backend_metal_buffer_type_shared_get_alloc_size,
                     /* .is_host          = */ ggml_backend_metal_buffer_type_shared_is_host,
+                    /* .is_host_addressable = */ ggml_backend_metal_buffer_type_shared_is_host_addressable,
                 },
                 /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_metal_reg(), i),
                 /* .context = */ raw_ctx,
@@ -381,6 +403,7 @@ static ggml_backend_buffer_type_t ggml_backend_metal_buffer_type_private(int dev
                     /* .get_max_size     = */ ggml_backend_metal_buffer_type_private_get_max_size,
                     /* .get_alloc_size   = */ ggml_backend_metal_buffer_type_private_get_alloc_size,
                     /* .is_host          = */ ggml_backend_metal_buffer_type_private_is_host,
+                    /* .is_host_addressable = */ NULL, // private buffers expose a virtual address, not CPU-writable memory
                 },
                 /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_metal_reg(), i),
                 /* .context = */ raw_ctx,
@@ -430,6 +453,13 @@ static bool ggml_backend_metal_buffer_type_mapped_is_host(ggml_backend_buffer_ty
     GGML_UNUSED(buft);
 }
 
+static bool ggml_backend_metal_buffer_type_mapped_is_host_addressable(ggml_backend_buffer_type_t buft) {
+    // mapped buffers wrap a host pointer, so tensor->data points into host memory
+    return true;
+
+    GGML_UNUSED(buft);
+}
+
 static ggml_backend_buffer_type_t ggml_backend_metal_buffer_type_mapped(int device) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
@@ -459,6 +489,7 @@ static ggml_backend_buffer_type_t ggml_backend_metal_buffer_type_mapped(int devi
                     /* .get_max_size     = */ ggml_backend_metal_buffer_type_mapped_get_max_size,
                     /* .get_alloc_size   = */ ggml_backend_metal_buffer_type_mapped_get_alloc_size,
                     /* .is_host          = */ ggml_backend_metal_buffer_type_mapped_is_host,
+                    /* .is_host_addressable = */ ggml_backend_metal_buffer_type_mapped_is_host_addressable,
                 },
                 /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_metal_reg(), i),
                 /* .context = */ raw_ctx,
@@ -868,9 +899,37 @@ static ggml_backend_feature * ggml_backend_metal_get_features(ggml_backend_reg_t
     GGML_UNUSED(reg);
 }
 
+static ggml_backend_buffer_type_t ggml_backend_metal_reg_buffer_type_alloc_only(size_t device) {
+    // Wrap the "mapped" buffer type (newBufferWithBytesNoCopy over host memory).
+    //
+    // Its alloc_buffer is identical to the default shared one, so a tensor placed
+    // here gets normal MTLResourceStorageModeShared memory. What matters is that it
+    // is NOT the device default: in llama_model::load_tensors the mmap path wraps
+    // the *default* buft's tensors into the file mapping (the `is_default_buft`
+    // check). Tensors whose content does NOT come from the file - e.g. MoE expert
+    // slots filled by preadv - must avoid that, so they go here instead.
+    if (device >= (size_t) g_devices) {
+        return nullptr;
+    }
+
+    return ggml_backend_metal_buffer_type_mapped((int) device);
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
+    }
+
+    if (strcmp(name, "ggml_backend_dev_buffer_type_alloc_only") == 0) {
+        return (void *)ggml_backend_metal_reg_buffer_type_alloc_only;
+    }
+
+    if (strcmp(name, "ggml_backend_metal_buffer_park") == 0) {
+        return (void *)ggml_backend_metal_buffer_park;
+    }
+
+    if (strcmp(name, "ggml_backend_metal_buffer_unpark") == 0) {
+        return (void *)ggml_backend_metal_buffer_unpark;
     }
 
     return NULL;

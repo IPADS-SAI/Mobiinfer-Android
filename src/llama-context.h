@@ -14,6 +14,7 @@
 #include <vector>
 
 struct llama_model;
+class llama_moe_slot_runtime;
 class llama_batch_allocr;
 
 class llama_io_read_i;
@@ -87,6 +88,8 @@ struct llama_context {
     float * get_embeddings_pre_norm();
     float * get_embeddings_pre_norm_ith(int32_t i);
 
+    float * get_embeddings_layer_inp(uint32_t lid);
+
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
 
@@ -111,8 +114,16 @@ struct llama_context {
 
     void set_embeddings (bool value);
     void set_embeddings_pre_norm(bool value, bool masked);
+    void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
+    void set_moe_lookahead_prefetch_depth(int32_t depth);
+    int32_t get_moe_lookahead_prefetch_depth() const;
+    void park_moe_expert_memory();
+    void prewarm_moe_experts();
+    // 0 restores hparams top-k. Clamped to [1, hparams.n_expert_used].
+    void set_n_expert_used(int32_t n);
+    int32_t n_expert_used() const;
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -225,6 +236,10 @@ private:
     // map the output row index `i` to batch index
     int64_t output_resolve_row(int32_t i) const;
 
+    // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
+    // from backend into host-side embd_layer_inp buffers
+    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+
     //
     // graph
     //
@@ -265,6 +280,7 @@ private:
     //
 
     const llama_model & model;
+    std::unique_ptr<llama_moe_slot_runtime> moe_slots;
 
     llama_cparams cparams;
 
@@ -286,6 +302,10 @@ private:
     // populated only when cparams.embeddings_pre_norm is enabled and the model graph
     // sets llm_graph_result::t_h_pre_norm
     buffer_view<float> embd_pre_norm = {nullptr, 0};
+
+    // host buffers for output layer input embeddings, per layer
+    // populated when cparams.output_layer_inp[il] is true
+    std::vector<buffer_view<float>> embd_layer_inp;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

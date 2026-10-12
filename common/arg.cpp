@@ -2267,6 +2267,97 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_DIO"));
     add_opt(common_arg(
+        {"--moe-experts"}, "PATH",
+        "expert-major routed MoE experts directory or manifest",
+        [](common_params & params, const std::string & value) {
+            params.moe_experts = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERTS"));
+    add_opt(common_arg(
+        {"--moe-slot-bank"}, "N",
+        "number of resident routed expert slots per layer",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("moe-slot-bank must be positive");
+            }
+            params.moe_slot_bank = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_SLOT_BANK"));
+    add_opt(common_arg(
+        {"--moe-k-prefill"}, "N",
+        "MoE top-k during prompt eval (default: model metadata). experts must still match training K",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("moe-k-prefill must be positive");
+            }
+            params.moe_k_prefill = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-k-decode"}, "N",
+        "MoE top-k during generation (default: model metadata)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("moe-k-decode must be positive");
+            }
+            params.moe_k_decode = value;
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-k-decode-cycle"}, "K,K,...",
+        "alternate MoE top-k each decode step, e.g. 8,4 (overrides --moe-k-decode)",
+        [](common_params & params, const std::string & value) {
+            params.moe_k_decode_cycle.clear();
+            size_t start = 0;
+            while (start < value.size()) {
+                const size_t comma = value.find(',', start);
+                const std::string tok = value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+                if (tok.empty()) {
+                    throw std::invalid_argument("moe-k-decode-cycle: empty entry");
+                }
+                const int k = std::stoi(tok);
+                if (k <= 0) {
+                    throw std::invalid_argument("moe-k-decode-cycle values must be positive");
+                }
+                params.moe_k_decode_cycle.push_back(k);
+                if (comma == std::string::npos) {
+                    break;
+                }
+                start = comma + 1;
+            }
+            if (params.moe_k_decode_cycle.empty()) {
+                throw std::invalid_argument("moe-k-decode-cycle needs at least one K");
+            }
+        }
+    ));
+    add_opt(common_arg(
+        {"--moe-k-decode-schedule"}, "K,K,...",
+        "MoE top-k for the first N decode steps, then --moe-k-decode (or hold last). e.g. 8,4,8 with --moe-k-decode 4",
+        [](common_params & params, const std::string & value) {
+            params.moe_k_decode_schedule.clear();
+            size_t start = 0;
+            while (start < value.size()) {
+                const size_t comma = value.find(',', start);
+                const std::string tok = value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+                if (tok.empty()) {
+                    throw std::invalid_argument("moe-k-decode-schedule: empty entry");
+                }
+                const int k = std::stoi(tok);
+                if (k <= 0) {
+                    throw std::invalid_argument("moe-k-decode-schedule values must be positive");
+                }
+                params.moe_k_decode_schedule.push_back(k);
+                if (comma == std::string::npos) {
+                    break;
+                }
+                start = comma + 1;
+            }
+            if (params.moe_k_decode_schedule.empty()) {
+                throw std::invalid_argument("moe-k-decode-schedule needs at least one K");
+            }
+        }
+    ));
+    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"

@@ -5960,7 +5960,8 @@ static bool generate_audio_tokens_local(
     return !output_audio_tokens.empty();
 }
 
-// Helper function to play WAV file
+// Helper function to play WAV file (not available on iOS)
+#if !TARGET_OS_IPHONE
 static void play_wav_file(const std::string& wav_file_path) {
 #ifndef _WIN32
     // Play audio asynchronously using fork() to avoid blocking TTS thread
@@ -5987,9 +5988,11 @@ static void play_wav_file(const std::string& wav_file_path) {
 #endif
     // Windows: no-op (audio playback handled by frontend)
 }
+#endif // !TARGET_OS_IPHONE
 
 
-// Helper function to move old output directory to old_output/<id>/
+// Helper function to move old output directory to old_output/<id>/ (not available on iOS)
+#if !TARGET_OS_IPHONE
 static void move_old_output_to_archive() {
     const std::string base_output_dir = "./tools/omni/output";
     const std::string old_output_base_dir = "./old_output";
@@ -6131,8 +6134,10 @@ static void move_old_output_to_archive() {
     } else {
     }
 }
+#endif // !TARGET_OS_IPHONE
 
-// Helper function to merge all WAV files into a single file
+// Helper function to merge all WAV files into a single file (not available on iOS)
+#if !TARGET_OS_IPHONE
 static void merge_wav_files(const std::string& output_dir, int num_chunks) {
     if (num_chunks == 0) {
         LOG_WRN("TTS: no chunks to merge\n");
@@ -6197,6 +6202,7 @@ static void merge_wav_files(const std::string& output_dir, int num_chunks) {
         LOG_WRN("TTS: failed to merge WAV files (tried ffmpeg and sox). Please install ffmpeg or sox.\n");
     }
 }
+#endif // !TARGET_OS_IPHONE
 
 // ==============================================================================
 // TTS Thread Function - Duplex Mode
@@ -6709,7 +6715,11 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
                 ctx_omni->warmup_done = true;
                 speek_cv.notify_all();
                 
-                merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
+#if !TARGET_OS_IPHONE
+    #if !TARGET_OS_IPHONE
+            merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
+#endif
+#endif
                 
                 if (ctx_omni->duplex_mode && !accumulated_is_end_of_turn) {
                     // LISTEN/CHUNK_EOS: 保持 TTS 状态
@@ -6794,7 +6804,9 @@ void tts_thread_func_duplex(struct omni_context * ctx_omni, common_params *param
             }
             
             // 重置 TTS 状态
+#if !TARGET_OS_IPHONE
             merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
+#endif
             llama_memory_t mem = llama_get_memory(ctx_omni->ctx_tts_llama);
             if (mem) {
                 llama_memory_seq_rm(mem, 0, 0, -1);
@@ -7510,7 +7522,11 @@ void tts_thread_func(struct omni_context * ctx_omni, common_params *params) {
                 print_with_timestamp("TTS: finished processing all chunks\n");
                 
                 // Merge all WAV files into a single file
-                merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
+#if !TARGET_OS_IPHONE
+    #if !TARGET_OS_IPHONE
+            merge_wav_files(tts_wav_output_dir, chunk_idx + 1);
+#endif
+#endif
                 // Python: end_of_turn = last_id in turn_terminator_token_ids
                 
                 // 🔧 保存当前 round_idx 用于 T2W（递增前的值）

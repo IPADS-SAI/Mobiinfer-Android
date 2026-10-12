@@ -77,6 +77,14 @@ bool ggml_backend_buft_is_host(ggml_backend_buffer_type_t buft) {
     return false;
 }
 
+bool ggml_backend_buft_is_host_addressable(ggml_backend_buffer_type_t buft) {
+    GGML_ASSERT(buft);
+    if (buft->iface.is_host_addressable) {
+        return buft->iface.is_host_addressable(buft);
+    }
+    return ggml_backend_buft_is_host(buft);
+}
+
 ggml_backend_dev_t ggml_backend_buft_get_device(ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(buft);
     return buft->device;
@@ -173,6 +181,10 @@ size_t ggml_backend_buffer_get_alloc_size(ggml_backend_buffer_t buffer, const st
 
 bool ggml_backend_buffer_is_host(ggml_backend_buffer_t buffer) {
     return ggml_backend_buft_is_host(ggml_backend_buffer_get_type(buffer));
+}
+
+bool ggml_backend_buffer_is_host_addressable(ggml_backend_buffer_t buffer) {
+    return ggml_backend_buft_is_host_addressable(ggml_backend_buffer_get_type(buffer));
 }
 
 void ggml_backend_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
@@ -2334,6 +2346,7 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
             /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
             /* .get_alloc_size   = */ NULL, // defaults to ggml_nbytes
             /* .is_host          = */ ggml_backend_cpu_buffer_type_is_host,
+            /* .is_host_addressable = */ NULL, // fall back to is_host
         },
         /* .device  = */ NULL, // FIXME ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
         /* .context = */ NULL,
@@ -2357,6 +2370,7 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
             /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
             /* .get_alloc_size   = */ NULL, // defaults to ggml_nbytes
             /* .is_host          = */ ggml_backend_cpu_buffer_type_is_host,
+            /* .is_host_addressable = */ NULL, // fall back to is_host
         },
         /* .device  = */ NULL, // FIXME ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
         /* .context = */ NULL,

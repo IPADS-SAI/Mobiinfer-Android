@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from typing import Callable, Iterable, TYPE_CHECKING
 
 import torch
@@ -10,7 +12,7 @@ if TYPE_CHECKING:
 from .base import MmprojModel, ModelBase, TextModel, gguf, logger
 
 from .llama import LlamaModel
-from .qwen import Qwen3_5TextModel
+from .qwen import Qwen3_5MoeTextModel, Qwen3_5TextModel
 
 
 @ModelBase.register("MiniCPMForCausalLM")
@@ -144,13 +146,16 @@ class MiniCPMV4_6VisionModel(MmprojModel):
         if self.hparams_vision is not None:
             # In MiniCPM-V 4.6 `vision_config.image_size` (980) describes the SigLIP
             # positional embedding bucket grid (70 x 70), while the per-slice processing
-            # resolution is the preprocessor's `scale_resolution` (typically 448).
+            # resolution is the preprocessor's `scale_resolution` (448).
             # The CLIP loader in tools/mtmd/clip.cpp consumes `clip.vision.image_size`
             # as the slice size and warmup resolution, so report `scale_resolution` there
             # to match the upstream MiniCPMV4_6ImageProcessorPil slicing rules.
-            scale_resolution = self.preprocessor_config.get("scale_resolution")
-            if scale_resolution is not None:
-                self.hparams_vision["image_size"] = int(scale_resolution)
+            # MiniCPM-V 4.7's preprocessor_config.json omits `scale_resolution`, so fall
+            # back to the upstream MiniCPMV4_7ImageProcessor default (448) rather than
+            # leaking the 980 position-embedding grid into the CLIP hparams.
+            scale_resolution = self.preprocessor_config.get("scale_resolution", 448)
+            self.hparams_vision["image_size"] = int(scale_resolution)
+            logger.info(f"gguf: (minicpm) clip slice resolution = {scale_resolution}")
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()

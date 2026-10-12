@@ -2,6 +2,7 @@
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
+#include <cstdlib>
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -36,6 +37,21 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// ── 投机受理探针（诊断，默认关闭）────────────────────────────────────────────
+//
+// LLAMA_SPEC_PROBE=1 时，每轮投机采样打一行 `[spec] draft=<草稿数> acc=<受理数>`。
+// 用途：直接得到**逐名次受理概率** p_k = P(acc >= k)。p_k 与「多验证一行的边际
+// 成本」的比值决定 n_max 该取多少，而这是 DSpark 值不值得做的唯一判据。
+// 注意日志级别为 debug 的那条 "accepted %2zu/%2zu" 在部分受理路径上不会打印，
+// 所以这里单独埋点，不走日志系统。
+static bool spec_probe_on() {
+    static const bool on = [] {
+        const char * p = std::getenv("LLAMA_SPEC_PROBE");
+        return p && *p && *p != '0';
+    }();
+    return on;
+}
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
@@ -634,6 +650,11 @@ public:
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
 
+    // batch.embd 的容量（token 数）；batch_is_embd 标记本批次是否为「整段 embedding」。
+    // 两者都服务于路线 A（prefill_media_embd_batch），默认路径不受影响。
+    int32_t batch_cap     = 0;
+    bool    batch_is_embd = false;
+
     server_queue    queue_tasks;
     server_response queue_results;
 
@@ -813,6 +834,14 @@ private:
                     params_dft.cache_type_k          = params_spec.cache_type_k;
                     params_dft.cache_type_v          = params_spec.cache_type_v;
                     params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
+
+                    // draft models (DFlash/DSpark/EAGLE3) are dense, not the qwen35moe target
+                    params_dft.moe_experts.clear();
+                    params_dft.moe_slot_bank = 0;
+                    params_dft.moe_k_prefill = 0;
+                    params_dft.moe_k_decode  = 0;
+                    params_dft.moe_k_decode_cycle.clear();
+                    params_dft.moe_k_decode_schedule.clear();
                 } else {
                     // MTP draft context lives on the target model, only context+compute are new
                     measure_model_bytes = false;
@@ -909,6 +938,15 @@ private:
 
             params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
 
+            // draft models (DFlash/DSpark/EAGLE3) are dense, not the qwen35moe target;
+            // inheriting --moe-experts would try to open the target expert bank on the draft GGUF
+            params_dft.moe_experts.clear();
+            params_dft.moe_slot_bank = 0;
+            params_dft.moe_k_prefill = 0;
+            params_dft.moe_k_decode  = 0;
+            params_dft.moe_k_decode_cycle.clear();
+            params_dft.moe_k_decode_schedule.clear();
+
             auto mparams_dft = common_model_params_to_llama(params_dft);
 
             model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
@@ -929,6 +967,9 @@ private:
             // note: for small models maybe we can set this to the maximum possible draft from all speculative types
             //       the extra memory for small models is likely negligible?
             cparams.n_rs_seq = 0;
+            // a DFlash/DSpark draft ships no token embedding or lm head of its own and reads both
+            // from the target model through this link
+            cparams.ctx_other = ctx_tgt;
             ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
 
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
@@ -1090,7 +1131,27 @@ private:
         // note that n_batch can be > n_ctx (e.g. for non-causal attention models such as BERT where the KV cache is not used)
         {
             const int32_t n_batch = llama_n_batch(ctx_tgt);
-            batch = llama_batch_init(std::max(n_batch, params_base.n_parallel), 0, 1);
+            batch_cap = std::max(n_batch, params_base.n_parallel);
+            // 分配 embd 缓冲：路线 A 会把「文本 + 图像」整段当 embedding 送（见
+            // prefill_media_embd_batch）。纯文本批次仍走 token 路径，不碰这块缓冲。
+            // 代价 = batch_cap × n_embd × 4 字节。
+            batch = llama_batch_init(batch_cap, llama_model_n_embd(model_tgt), 1);
+
+            // llama_batch_init() 在 embd != 0 时**不分配 token 缓冲**（两者二选一），
+            // 但服务器的正常解码走的正是 token 路径，所以这里把 token 缓冲补上。
+            // 两段内存不会同时被使用：路线 A 的 embedding 批次不看 token，普通批次不看 embd。
+            batch.token = (llama_token *) malloc(sizeof(llama_token) * (size_t) batch_cap);
+
+            // llama_batch_init() 只按 n_tokens 分配 pos，但 M-RoPE 的 **embedding** 批次
+            // 每个 token 要 n_pos_per_embd 个位置（见 llama-batch.cpp 的 ubatch_add：
+            // 源偏移 = j*n_tokens）。路线 A 正好用得到，所以这里按 n_tokens*n_pos_per_embd
+            // 重新分配。（mtmd-helper 的 decode_embd_batch 也是自己另开 pos 数组，同理。）
+            const int32_t n_pos_per_embd =
+                (mctx != nullptr && mtmd_decode_use_mrope(mctx)) ? 4 : 1;
+            if (n_pos_per_embd > 1) {
+                free(batch.pos);
+                batch.pos = (llama_pos *) malloc(sizeof(llama_pos) * (size_t) batch_cap * n_pos_per_embd);
+            }
         }
 
         if (params_base.cache_ram_mib != 0) {
@@ -2303,6 +2364,161 @@ private:
         }
     }
 
+    // ── 路线 A：图像 + 文本整段拼成一个 embedding 批次，只做一次 llama_decode ────────
+    //
+    // 现状：每个图像切片是一个独立 chunk，逐个解码（见 server_tokens::process_chunk）。
+    // 一张 640-token 的图 = 10 次 64 行前向 + 若干条 2~3 行的文本批。而 64 行就已经要用掉
+    // 每层约 90/256 个专家 → 每 token 读盘是长文本的 ~8 倍；同时 64 行的 matmul 效率
+    // 也只有 1024 行的 ~1/3。两项叠加就是「图像 prefill 比长文本慢 6.8 倍」。
+    //
+    // llama 的 ubatch 只能是「全 token」或「全 embedding」（见 llama-batch.cpp 的
+    // ubatch_add：embd 指针全有或全无），所以要让图文进同一个前向，唯一办法是把这段
+    // 序列**整体**当 embedding 送：
+    //   * 文本 token → llama_model_token_embd()（token_embd 的第 token 行）
+    //   * 图像 token → 视觉塔输出
+    //   * 位置      → M-RoPE 的 [t;y;x;z] **分段存放**（ubatch_add 按 batch.token ? 0 : j*n_tokens
+    //                 取源偏移，所以 embedding 批的位置必须是 section-major，不能逐 token 交错）
+    //                 文本按 token 路径的规则广播成 [p,p,p,0]
+    // 这样整段一次前向：MoE 每层只读一轮专家，批宽也够大。
+    //
+    // 由 MB_MEDIA_EMBD_BATCH=1 开启，默认关闭。
+    // 返回写入 batch 的 token 数；0 表示没走这条路，调用方退回原逻辑。
+    int32_t prefill_media_embd_batch(server_slot & slot, const server_tokens & input_tokens, int32_t n_batch_max) {
+        static const bool enabled = [] {
+            const char * e = std::getenv("MB_MEDIA_EMBD_BATCH");
+            return e && *e && *e != '0';
+        }();
+        if (!enabled) {
+            return 0;
+        }
+        // 只在「本批次还是空的」时接管：混合多个 slot 的情况太复杂，退回原路径。
+        if (batch.n_tokens != 0) {
+            return 0;
+        }
+        if (!input_tokens.has_mtmd || mctx == nullptr) {
+            return 0;
+        }
+
+        const llama_model * model = llama_get_model(ctx_tgt);
+        const int32_t n_embd = llama_model_n_embd(model);
+        if (n_embd <= 0 || batch.embd == nullptr) {
+            return 0;
+        }
+        const bool use_mrope = mtmd_decode_use_mrope(mctx);
+        const int32_t n_pos = use_mrope ? 4 : 1;
+
+        // 上限取 n_batch：保证整段能落在**一次** llama_decode 里 —— embedding 路径的位置是
+        // section-major（步长 = 总 token 数），跨切片就没法按偏移切了。
+        const size_t cap = std::min<size_t>((size_t) batch_cap, (size_t) n_batch_max);
+        std::vector<llama_pos> pos_t(cap, 0), pos_y(cap, 0), pos_x(cap, 0), pos_z(cap, 0);
+        // 注意：seq_id 必须写进 **batch 自己分配** 的数组（llama_batch_init 里 malloc 的），
+        // 不能让 batch.seq_id[i] 指向本函数的局部缓冲 —— 解码发生在本函数返回之后，
+        // 那样就是悬空指针（踩过：seq_id 读到垃圾值 → "Invalid input batch"）。
+
+        size_t n_added = 0;
+        llama_pos pos = slot.prompt.tokens.pos_next();
+
+        while (slot.prompt.n_tokens() < slot.task->n_tokens() && n_added < cap) {
+            const size_t idx = slot.prompt.n_tokens();
+            const llama_token cur = input_tokens[idx];
+
+            if (cur == LLAMA_TOKEN_NULL) {
+                // ── 一个图像切片 ────────────────────────────────────────
+                const mtmd_input_chunk * chunk = input_tokens.find_chunk(idx).get();
+                if (chunk == nullptr) {
+                    break;
+                }
+                const int32_t n_tok = (int32_t) mtmd_input_chunk_get_n_tokens(chunk);
+                if (n_tok <= 0 || n_added + (size_t) n_tok > cap) {
+                    break; // 装不下就留给下一批
+                }
+                if (mtmd_encode_chunk(mctx, chunk) != 0) {
+                    SRV_ERR("%s", "media-embd-batch: vision encode failed\n");
+                    return 0;
+                }
+                const float * src = mtmd_get_output_embd(mctx);
+                if (src == nullptr) {
+                    return 0;
+                }
+                std::memcpy(batch.embd + n_added * (size_t) n_embd,
+                            src, (size_t) n_tok * (size_t) n_embd * sizeof(float));
+
+                // 位置：chunk 自带 (t,y,x,z)
+                const mtmd_image_tokens * it = mtmd_input_chunk_get_tokens_image(chunk);
+                std::vector<mtmd_decoder_pos> rel((size_t) n_tok);
+                mtmd_helper_image_get_decoder_pos(it, pos, rel.data());
+                for (int32_t i = 0; i < n_tok; ++i) {
+                    pos_t[n_added + i] = rel[(size_t) i].t;
+                    pos_y[n_added + i] = rel[(size_t) i].y;
+                    pos_x[n_added + i] = rel[(size_t) i].x;
+                    pos_z[n_added + i] = rel[(size_t) i].z;
+                }
+                n_added += (size_t) n_tok;
+                pos     += mtmd_input_chunk_get_n_pos(chunk);
+
+                slot.prompt.tokens.push_back(chunk);
+                slot.n_prompt_tokens_processed += (size_t) n_tok;
+            } else {
+                // ── 一段文本 token（连续的就一起取 embedding）───────────
+                size_t run = 0;
+                while (idx + run < (size_t) slot.task->n_tokens() && n_added + run < cap) {
+                    const llama_token t = input_tokens[idx + run];
+                    if (t == LLAMA_TOKEN_NULL) {
+                        break;
+                    }
+                    run++;
+                }
+                if (run == 0) {
+                    break;
+                }
+                std::vector<llama_token> ids(run);
+                for (size_t i = 0; i < run; ++i) {
+                    ids[i] = input_tokens[idx + i];
+                }
+                if (llama_model_token_embd(model, ids.data(), (int32_t) run,
+                                           batch.embd + n_added * (size_t) n_embd) != 0) {
+                    SRV_ERR("%s", "media-embd-batch: llama_model_token_embd failed\n");
+                    return 0;
+                }
+                for (size_t i = 0; i < run; ++i) {
+                    pos_t[n_added + i] = pos;
+                    pos_y[n_added + i] = pos;
+                    pos_x[n_added + i] = pos;
+                    pos_z[n_added + i] = n_pos > 1 ? 0 : pos; // 第 4 维与 token 路径一致，填 0
+                    slot.prompt.tokens.push_back(ids[i]);
+                    slot.n_prompt_tokens_processed++;
+                    pos++;
+                }
+                n_added += run;
+            }
+        }
+
+        if (n_added == 0) {
+            return 0;
+        }
+
+        // 位置必须 section-major 写回（见函数头注释）
+        for (size_t i = 0; i < n_added; ++i) {
+            batch.pos[i]                = pos_t[i];
+            batch.pos[i + n_added]      = n_pos > 1 ? pos_y[i] : pos_t[i];
+            batch.pos[i + 2 * n_added]  = n_pos > 1 ? pos_x[i] : pos_t[i];
+            batch.pos[i + 3 * n_added]  = n_pos > 1 ? pos_z[i] : pos_t[i];
+        }
+        for (size_t i = 0; i < n_added; ++i) {
+            batch.n_seq_id[i]  = 1;
+            batch.seq_id[i][0] = slot.id; // 写进 batch 自己分配的数组，不用局部缓冲
+            // 与 common_batch_add(…, slot.need_embd()) 保持一致：原路径每个 prompt token
+            // 都按 need_embd() 设 logits。不一致会改变 n_outputs，进而影响图的裁剪。
+            batch.logits[i]    = slot.need_embd();
+        }
+        batch.n_tokens  = (int32_t) n_added;
+        batch_is_embd   = true;
+
+        SLT_INF(slot, "media-embd-batch: %zu tokens as one embedding batch (%s)\n",
+                n_added, n_pos > 1 ? "M-RoPE" : "1D");
+        return (int32_t) n_added;
+    }
+
     void update_slots() {
         // check if all slots are idle
         {
@@ -2398,6 +2614,7 @@ private:
 
         // start populating the batch for this iteration
         common_batch_clear(batch);
+        batch_is_embd = false;
 
         // track if given slot can be batched with slots already in the batch
         server_slot * slot_batched = nullptr;
@@ -2885,7 +3102,16 @@ private:
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                             n_swa > 0);
 
+                    const int32_t n_before_user = slot.task->params.n_before_user;
+                    const bool n_before_user_known = n_before_user > 0;
+
                     bool has_mtmd = false;
+
+                    // [路线 A] 图文混合时把整段拼成一个 embedding 批次，一次 decode。
+                    // 返回 >0 表示已接管，跳过下面的「逐 chunk 解码」与「逐 token 入批」两个循环。
+                    if (prefill_media_embd_batch(slot, input_tokens, n_batch) > 0) {
+                        has_mtmd = true;
+                    } else {
 
                     // check if we should process the image
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
@@ -2919,9 +3145,6 @@ private:
 
                         has_mtmd = true;
                     }
-
-                    const int32_t n_before_user = slot.task->params.n_before_user;
-                    const bool n_before_user_known = n_before_user > 0;
 
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.n_tokens < n_batch) {
@@ -2979,6 +3202,7 @@ private:
                             }
                         }
                     }
+                    } // 路线 A 未接管时的原路径
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.n_tokens - n_tokens_prev;
@@ -3098,10 +3322,16 @@ private:
         for (int32_t i = 0; i < batch.n_tokens; i = i_next) {
             const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
 
+            // 路线 A：整段 embedding 批次按 embd 送（token 与 embd 二者互斥，见
+            // llama-batch.cpp 的 ubatch_add）。helper 已把批次规模限制在 n_batch 以内，
+            // 所以这里恒为单切片（i == 0），位置的 section-major 布局无需再切。
+            if (batch_is_embd) {
+                GGML_ASSERT(i == 0 && n_tokens == batch.n_tokens);
+            }
             llama_batch batch_view = {
                 n_tokens,
-                batch.token    + i,
-                nullptr,
+                batch_is_embd ? nullptr     : batch.token + i,
+                batch_is_embd ? batch.embd  : nullptr,
                 batch.pos      + i,
                 batch.n_seq_id + i,
                 batch.seq_id   + i,
@@ -3350,6 +3580,10 @@ private:
                     slot.spec_i_batch.clear();
 
                     GGML_ASSERT(accepted.size() >= 1);
+
+                    if (spec_probe_on()) {
+                        fprintf(stderr, "[spec] draft=%zu acc=%zu\n", n_draft, accepted.size() - 1);
+                    }
 
                     const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 

@@ -20,6 +20,7 @@ struct llama_cparams;
 struct llama_layer;
 
 struct llama_memory_context_i;
+class llama_moe_slot_runtime;
 
 class llama_kv_cache_context;
 class llama_kv_cache_dsa_context;
@@ -602,6 +603,12 @@ struct llm_graph_params {
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
+    llama_moe_slot_runtime       * moe_slots;
+    // MoE-SSD 阶段。决定 FFN 用哪套 slot 张量（prefill 共享 / decode 每层独立）。
+    // **必须进 operator==**：否则图缓存会把上一个阶段的图复用过来，而图里嵌的是
+    // 张量指针 —— 那就会拿 prefill 的共享张量去跑 decode（窗口失效但不报错）。
+    // n_tokens 不足以区分：单 token 的 prefill 与 decode 都是 1。
+    bool moe_decode_phase = false;
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
@@ -686,10 +693,13 @@ struct llm_graph_params {
         return
             cparams.embeddings  == other.cparams.embeddings  &&
             cparams.causal_attn == other.cparams.causal_attn &&
+            cparams.n_expert_used == other.cparams.n_expert_used &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
+            moe_slots == other.moe_slots &&
+            moe_decode_phase == other.moe_decode_phase &&
             cross == other.cross;
     }
 };
@@ -703,8 +713,13 @@ public:
     ggml_tensor * get_inp_tokens()  const { return t_inp_tokens; }
     ggml_tensor * get_logits()      const { return t_logits; }
     ggml_tensor * get_embd()        const { return t_embd; }
+    // [诊断] 输入 embedding（token 路径是 get_rows(tok_embd)，embedding 路径就是喂进来的张量）。
+    // 供 llama_model_token_embd() 的等值性测试取真值用，默认不参与任何正常路径。
+    ggml_tensor * get_inp_embd()    const { return t_inp_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
     ggml_tensor * get_h_pre_norm()  const { return t_h_pre_norm; }
+
+    ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -714,7 +729,7 @@ public:
     void reset();
 
     void set_inputs(const llama_ubatch * ubatch);
-    void set_outputs();
+    void set_outputs(const llm_graph_params & params);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it
     // this can only be done if we determine that the resulting graph using the new graph parameters
@@ -735,10 +750,12 @@ public:
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_pre_norm  = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
-    std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
-    std::map<llama_seq_id, ggml_tensor*> t_candidates;
-    std::map<llama_seq_id, ggml_tensor*> t_sampled;
-    std::map<llama_seq_id, ggml_tensor*> t_sampled_probs;
+    std::vector<ggml_tensor *> t_layer_inp;
+
+    std::map<llama_seq_id, ggml_tensor *> t_sampled_logits;
+    std::map<llama_seq_id, ggml_tensor *> t_candidates;
+    std::map<llama_seq_id, ggml_tensor *> t_sampled;
+    std::map<llama_seq_id, ggml_tensor *> t_sampled_probs;
 
     std::vector<llm_graph_input_ptr> inputs;
 
@@ -819,6 +836,8 @@ struct llm_graph_context {
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
+    llama_moe_slot_runtime       * moe_slots;
+    bool                           moe_decode_phase;
     const llama_cross            * cross;
 
     std::map<llama_seq_id, llama_sampler *> samplers;

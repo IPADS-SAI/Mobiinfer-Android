@@ -168,6 +168,18 @@ struct mtmd_context {
     const llama_vocab * vocab = nullptr; // can be nullptr if text_model is not provided
     mtmd_pos_type pos_type;
 
+    // Recorded at construction so the CLIP encoder can be released and rebuilt on demand
+    // while the rest of the context (vocab, templates, projector metadata) stays alive.
+    // See mtmd_vision_unload() / mtmd_vision_reload().
+    std::string         ms_load_fname;
+    mtmd_context_params ms_load_params {};
+    bool                ms_load_no_alloc = false;
+
+    // Capability (not residency): stays true across an mtmd_vision_unload() so that
+    // mtmd_support_vision() keeps describing what the model can do, not what is loaded.
+    bool                ms_has_vision = false;
+    bool                ms_has_audio  = false;
+
     // these are not token, but strings used to mark the beginning and end of image/audio embeddings
     std::string img_beg;
     std::string img_end;
@@ -207,7 +219,10 @@ struct mtmd_context {
         n_threads    (ctx_params.n_threads),
         media_marker (ctx_params.media_marker),
         n_embd_text  (text_model ? llama_model_n_embd_inp(text_model) : -1),
-        vocab        (text_model ? llama_model_get_vocab(text_model) : nullptr)
+        vocab        (text_model ? llama_model_get_vocab(text_model) : nullptr),
+        ms_load_fname(mmproj_fname ? mmproj_fname : ""),
+        ms_load_params(ctx_params),
+        ms_load_no_alloc(no_alloc)
     {
         if (ctx_params.image_marker != nullptr) {
             throw std::runtime_error("custom image_marker is not supported anymore, use media_marker instead");
@@ -236,22 +251,7 @@ struct mtmd_context {
             }
         }
 
-        clip_context_params ctx_clip_params {
-            /* use_gpu           */ ctx_params.use_gpu,
-            /* flash_attn_type   */ mtmd_get_clip_flash_attn_type(ctx_params.flash_attn_type),
-            /* image_min_tokens  */ ctx_params.image_min_tokens,
-            /* image_max_tokens  */ ctx_params.image_max_tokens,
-            /* image_max_slice_nums */ ctx_params.image_max_slice_nums,
-            /* warmup            */ ctx_params.warmup,
-            /* cb_eval           */ ctx_params.cb_eval,
-            /* cb_eval_user_data */ ctx_params.cb_eval_user_data,
-            /* no_alloc          */ no_alloc,
-        };
-
-        auto res = clip_init(mmproj_fname, ctx_clip_params);
-        ctx_v = res.ctx_v;
-        ctx_a = res.ctx_a;
-        if (!ctx_v && !ctx_a) {
+        if (!load_clip_weights()) {
             throw std::runtime_error(string_format("Failed to load CLIP model from %s\n", mmproj_fname));
         }
 
@@ -281,6 +281,37 @@ struct mtmd_context {
         if (ctx_a) {
             init_audio();
         }
+    }
+
+    // (Re-)create the CLIP context(s) from the mmproj recorded at construction.
+    // Leaves ctx_v / ctx_a null on failure. Does NOT build the derived preprocessing
+    // state -- callers run init_vision() / init_audio() once the encoders are loaded.
+    bool load_clip_weights() {
+        if (ms_load_fname.empty()) {
+            LOG_ERR("%s: no mmproj filename recorded, cannot load CLIP weights\n", __func__);
+            return false;
+        }
+
+        clip_context_params ctx_clip_params {
+            /* use_gpu           */ ms_load_params.use_gpu,
+            /* flash_attn_type   */ mtmd_get_clip_flash_attn_type(ms_load_params.flash_attn_type),
+            /* image_min_tokens  */ ms_load_params.image_min_tokens,
+            /* image_max_tokens  */ ms_load_params.image_max_tokens,
+            /* image_max_slice_nums */ ms_load_params.image_max_slice_nums,
+            /* warmup            */ ms_load_params.warmup,
+            /* cb_eval           */ ms_load_params.cb_eval,
+            /* cb_eval_user_data */ ms_load_params.cb_eval_user_data,
+            /* no_alloc          */ ms_load_no_alloc,
+        };
+
+        auto res = clip_init(ms_load_fname.c_str(), ctx_clip_params);
+        ctx_v = res.ctx_v;
+        ctx_a = res.ctx_a;
+
+        ms_has_vision = ctx_v != nullptr;
+        ms_has_audio  = ctx_a != nullptr;
+
+        return ctx_v != nullptr || ctx_a != nullptr;
     }
 
     void init_vision() {
@@ -682,10 +713,67 @@ void mtmd_free(mtmd_context * ctx) {
     delete ctx;
 }
 
-void mtmd_set_image_max_slice_nums(mtmd_context * ctx, int n) {
-    if (ctx && ctx->ctx_v) {
-        clip_set_image_max_slice_nums(ctx->ctx_v, n);
+bool mtmd_vision_loaded(const mtmd_context * ctx) {
+    return ctx != nullptr && ctx->ctx_v != nullptr;
+}
+
+bool mtmd_vision_unload(mtmd_context * ctx) {
+    if (!ctx) {
+        return false;
     }
+    if (!ctx->ctx_v && !ctx->ctx_a) {
+        return false;
+    }
+
+    // image_preproc / audio_preproc hold references into the CLIP context, so they must
+    // go first. Both are rebuilt by init_vision() / init_audio() on the next reload.
+    ctx->image_preproc.reset();
+    ctx->audio_preproc.reset();
+
+    clip_free(ctx->ctx_v);
+    clip_free(ctx->ctx_a);
+    ctx->ctx_v = nullptr;
+    ctx->ctx_a = nullptr;
+
+    // Scratch buffer owned by the encoder path; drop it too so the caller sees the full win.
+    ctx->image_embd_v.clear();
+    ctx->image_embd_v.shrink_to_fit();
+
+    return true;
+}
+
+bool mtmd_vision_reload(mtmd_context * ctx) {
+    if (!ctx) {
+        return false;
+    }
+    if (ctx->ctx_v) {
+        return true;
+    }
+    if (!ctx->load_clip_weights()) {
+        return false;
+    }
+    // Same order as the constructor: load first, then build the derived state.
+    if (ctx->ctx_v) {
+        ctx->init_vision();
+    }
+    if (ctx->ctx_a) {
+        ctx->init_audio();
+    }
+    return ctx->ctx_v != nullptr;
+}
+
+void mtmd_set_image_max_slice_nums(mtmd_context * ctx, int n) {
+    if (!ctx) {
+        return;
+    }
+    // Remember it even while the encoder is unloaded, so mtmd_vision_reload() re-applies it.
+    // clip_context_params.image_max_slice_nums is only read by clip_init(), so without this
+    // the setting would silently revert to the init-time value after an unload/reload cycle.
+    ctx->ms_load_params.image_max_slice_nums = n;
+    if (!ctx->ctx_v) {
+        return;
+    }
+    clip_set_image_max_slice_nums(ctx->ctx_v, n);
 }
 
 struct mtmd_tokenizer {
@@ -1220,11 +1308,27 @@ int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) 
                 ctx->image_embd_v.data() + i*n_mmproj_embd*n_tokens_per_image);
         }
     } else {
-        ok = clip_image_batch_encode(
-            ctx_clip,
-            ctx->n_threads,
-            &image_tokens->batch_f32,
-            ctx->image_embd_v.data());
+        const auto & entries = image_tokens->batch_f32.entries;
+        if (entries.size() > 1) {
+            // clip_image_batch_encode() 只支持 batch = 1（见 clip.cpp 里直接 `return false`），
+            // 且各条目的尺寸可以不同（概览 vs 切片），所以多条时逐条编码再按序拼接。
+            // 诊断用：把切片合并成单 chunk 后就会走到这里。
+            ok = true;
+            for (size_t i = 0; i < entries.size(); i++) {
+                const int n_tokens_per_image = clip_n_output_tokens(ctx_clip, entries[i].get());
+                ok = ok && clip_image_encode(
+                    ctx_clip,
+                    ctx->n_threads,
+                    entries[i].get(),
+                    ctx->image_embd_v.data() + i*n_mmproj_embd*n_tokens_per_image);
+            }
+        } else {
+            ok = clip_image_batch_encode(
+                ctx_clip,
+                ctx->n_threads,
+                &image_tokens->batch_f32,
+                ctx->image_embd_v.data());
+        }
     }
 
     return ok ? 0 : 1;
@@ -1253,11 +1357,13 @@ bool mtmd_decode_use_mrope(const mtmd_context * ctx) {
 }
 
 bool mtmd_support_vision(const mtmd_context * ctx) {
-    return ctx->ctx_v != nullptr;
+    // Capability, not residency -- remains true after mtmd_vision_unload().
+    return ctx->ms_has_vision;
 }
 
 bool mtmd_support_audio(const mtmd_context * ctx) {
-    return ctx->ctx_a != nullptr;
+    // Capability, not residency -- remains true after mtmd_vision_unload().
+    return ctx->ms_has_audio;
 }
 
 int mtmd_get_audio_sample_rate(const mtmd_context * ctx) {

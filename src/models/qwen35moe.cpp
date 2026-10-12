@@ -1,5 +1,7 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-moe-experts.h"
+#include "llama-moe-slot.h"
 
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
@@ -40,6 +42,150 @@ void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
 
 void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
+
+    // ── decode 窗口的物理布局：按 (family, 量化档位) 分组，每组一个 base ──────
+    //
+    // 为什么必须按档位分组：**每个张量的 slot 步长必须等于该层自己的
+    // bytes_per_expert**。Q4_K_M 是混合量化 —— 实测 V47 的 down 有 20 层 Q6_K
+    // (860160 B/专家)、20 层 Q4_K (589824 B/专家)。若把档位不同的层都 alias 到
+    // 同一个 base，非组长的视图会按**自己的**步长寻址：层内读写自洽，但**跨层
+    // 会互相覆盖** —— 那是静默错误（不报错、结果错）。
+    //
+    // 组内所有层同档位，于是可以安全共用一个 base：
+    //   base: ne[2] = prefill 容量 + Σ(组内各层宽度)
+    //     ├─ prefill view（组内共享）: offset 0,                    ne[2] = prefill 容量
+    //     └─ decode view（每层一份） : offset prefill 容量 + Σ前几层, ne[2] = c_il + K
+    //
+    // prefill 段与各层 decode 窗口**物理分离**（这是「加载/空闲期预热」的前提）：
+    // 若两者重叠，prefill 会直接覆盖预热读进去的专家，预热只能在 prefill 之后重做
+    // ——那笔读就会串行阻塞首 token。分离后 prefill 只写 [0, prefill 容量)，
+    // 各层 decode 窗口 [prefill 容量, …) 不受影响，预热可提前到 prefill 之前。
+    //
+    // 代价：每组多 `prefill 容量` 个槽位（本模型 256 槽 ≈ 330 MiB/组）。
+    // 进图的每个张量 ne[2] 都很小（prefill 容量或 c_il+K），于是 Metal 的
+    // mul_mat_id 上限（ne[2] <= 1024）不再把 c 卡在 1024/层数。
+    const int64_t dec_c = moe_decode_window();
+    // 每层解码视图 = 缓存区 c + 预读暂存区 K。分区见 llama-moe-slot.cpp 的
+    // install_prefetch_into_window：预读只在暂存区分配，不会淘汰缓存区条目。
+    //
+    // **按层宽度**：各层的「容量→miss」曲线差别大（layer 0 要 c≈200 才饱和，多数层
+    // c≈96 就饱和），均匀分配会让冷层浪费 slot。逐层宽度由 LLAMA_MOE_LAYER_WINDOWS
+    // 指定，见 llama_model::moe_layer_windows()。
+    const int64_t k_pf = moe_prefetch_slots();
+    const std::vector<int32_t> layer_c = moe_layer_windows();   // 下标 = MoE 层序号
+    const bool dec_enabled = dec_c > 0 && !layer_c.empty();
+    // 某个 MoE 层序号对应的总宽度（c_il + K）
+    auto width_of = [&](int moe_idx) -> int64_t {
+        if (!dec_enabled || moe_idx < 0 || moe_idx >= (int) layer_c.size()) {
+            return 0;
+        }
+        return (int64_t) layer_c[(size_t) moe_idx] + k_pf;
+    };
+    const int64_t prefill_cap = moe_slot_bank_size();
+
+    const llm_tensor fam_ids[4] = {
+        LLM_TENSOR_FFN_GATE_UP_EXPS, LLM_TENSOR_FFN_GATE_EXPS,
+        LLM_TENSOR_FFN_UP_EXPS,      LLM_TENSOR_FFN_DOWN_EXPS,
+    };
+    // family -> (bytes_per_expert -> 层号升序)
+    std::map<size_t, std::vector<int>> groups[4];
+    for (int il = 0; il < (int) n_layer; ++il) {
+        for (int fi = 0; fi < 4; ++fi) {
+            const auto * e = moe_experts_entry(tn(fam_ids[fi], "weight", il).str().c_str());
+            if (e) {
+                groups[fi][e->bytes_per_expert].push_back(il);
+            }
+        }
+    }
+    // 组长（真正分配内存的那一层）-> 分配的 slot 数。非组长按 prefill 容量建，
+    // 稍后统一改写成 base 上的 view。
+    std::map<std::string, int64_t> group_slots;
+    for (int fi = 0; fi < 4; ++fi) {
+        for (const auto & kv : groups[fi]) {
+            // 组内各层的宽度可能不同（按层分配），所以要**逐个累加**，不能用
+            // n_members * 单层宽度。
+            int64_t group_total = 0;
+            for (int il : kv.second) {
+                group_total += width_of(il);
+            }
+            group_slots[tn(fam_ids[fi], "weight", kv.second.front()).str()] =
+                dec_enabled ? (prefill_cap + group_total) : prefill_cap;
+        }
+    }
+    auto slots_for = [&](const LLM_TN_IMPL & name) -> int64_t {
+        const auto it = group_slots.find(name.str());
+        return it == group_slots.end() ? prefill_cap : it->second;
+    };
+
+    auto create_routed_tensor = [&](const LLM_TN_IMPL & tensor_name,
+                                    const std::initializer_list<int64_t> & dims,
+                                    int flags) {
+        // 专家张量的内容来自 experts（运行时 preadv 写入），跟模型文件无关：
+        //  - 必须避开 mmap 的文件映射包装（否则启用 mmap 时落进只读映射，写不进去）
+        //  - gguf 里也可能根本没有它（用 strip_experts.py 剥离过），此时按 manifest 合成
+        //
+        // 这里一律先按「非必需」创建，避免 create_tensor 在 gguf 缺项时直接抛；
+        // 找不到来源时再按调用方传的 flags 决定是否报错。
+        const bool required = !(flags & TENSOR_NOT_REQUIRED);
+        ggml_tensor * tensor = create_tensor_own_alloc(
+            ml, tensor_name, dims, flags | TENSOR_NOT_REQUIRED);
+
+        const auto * entry = moe_experts_entry(tensor_name.str().c_str());
+
+        if (!tensor && entry) {
+            tensor = create_expert_tensor_from_manifest(ml, tensor_name, dims, entry->type);
+        }
+        if (!tensor) {
+            if (required && moe_slot_bank_enabled()) {
+                throw std::runtime_error(format(
+                    "routed tensor '%s' is in neither the GGUF nor the MoE experts",
+                    tensor_name.str().c_str()));
+            }
+            return tensor;
+        }
+        if (!moe_slot_bank_enabled()) {
+            return tensor;
+        }
+        if (!entry) {
+            throw std::runtime_error(format(
+                "MoE experts is missing routed tensor '%s'",
+                tensor_name.str().c_str()));
+        }
+        // 核对「dims x 类型」的字节数 == experts 记录的 每专家字节 x 专家数。
+        // 模型的 expert_count 或量化档位与 experts 不一致时，这里立刻暴露，
+        // 而不是等到运行时读到错位字节（那种错是静默的）。
+        if (ggml_nbytes(tensor) != entry->bytes_per_expert * (size_t) n_expert) {
+            throw std::runtime_error(format(
+                "expert tensor '%s' byte size mismatch: tensor=%zu experts=%zu",
+                tensor_name.str().c_str(), ggml_nbytes(tensor),
+                entry->bytes_per_expert * (size_t) n_expert));
+        }
+
+        ml.virtualize_expert_tensor(
+            tensor,
+            n_expert,
+            slots_for(tensor_name),
+            entry->type,
+            entry->bytes_per_expert);
+        return tensor;
+    };
+
+    auto create_routed_gate_up = [&](llama_layer & layer, int il, int64_t n_ff_exp, int flags) {
+        layer.ffn_gate_up_exps = create_routed_tensor(
+            tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", il),
+            { n_embd, n_ff_exp * 2, n_expert },
+            TENSOR_NOT_REQUIRED | flags);
+        if (!layer.ffn_gate_up_exps) {
+            layer.ffn_gate_exps = create_routed_tensor(
+                tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", il),
+                { n_embd, n_ff_exp, n_expert },
+                flags);
+            layer.ffn_up_exps = create_routed_tensor(
+                tn(LLM_TENSOR_FFN_UP_EXPS, "weight", il),
+                { n_embd, n_ff_exp, n_expert },
+                flags);
+        }
+    };
 
     const uint32_t n_main = n_layer - hparams.nextn_predict_layers;
     const bool mtp_only   = (hparams.nextn_predict_layers > 0) &&
@@ -99,8 +245,8 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
 
         // Routed experts
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
-        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
+        layer.ffn_down_exps = create_routed_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
+        create_routed_gate_up(layer, il, n_ff_exp, flags);
 
         // Shared experts
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, flags);
@@ -126,8 +272,8 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
 
         // Routed experts
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, 0);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, 0);
-        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, 0);
+        layer.ffn_down_exps = create_routed_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, 0);
+        create_routed_gate_up(layer, il, n_ff_exp, 0);
 
         // Shared experts
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, 0);
@@ -149,6 +295,95 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
     }
     for (int i = (int) n_main; i < n_layer; ++i) {
         load_block_mtp(i);
+    }
+
+    // 每组一个物理 base，组内后层是它的 view（RAM = base，而不是每组一个 base × 组内层数）。
+    //
+    // 名字很关键：运行时 `bind()` 按张量名查 experts，所以 prefill 视图必须沿用
+    // 原始 GGUF 名；decode 视图加 `.dec` 后缀，由 `moe_experts_entry()` 剥掉再查。
+    if (moe_slot_bank_enabled()) {
+        struct fam_t {
+            ggml_tensor * llama_layer::* pf;
+            ggml_tensor * llama_layer::* pf_dec;
+        };
+        const fam_t fams[4] = {
+            { &llama_layer::ffn_gate_up_exps, &llama_layer::ffn_gate_up_exps_dec },
+            { &llama_layer::ffn_gate_exps,    &llama_layer::ffn_gate_exps_dec    },
+            { &llama_layer::ffn_up_exps,      &llama_layer::ffn_up_exps_dec      },
+            { &llama_layer::ffn_down_exps,    &llama_layer::ffn_down_exps_dec    },
+        };
+
+        size_t resident = 0;
+        int n_win = 0;
+        int n_grp = 0;
+
+        for (int fi = 0; fi < 4; ++fi) {
+            for (const auto & kv : groups[fi]) {
+                const std::vector<int> & members = kv.second;
+                if (members.empty()) {
+                    continue;
+                }
+                const int first = members.front();
+                ggml_tensor * base = layers[first].*fams[fi].pf;
+                if (!base) {
+                    continue;
+                }
+                const auto * e = moe_experts_entry(ggml_get_name(base));
+                if (!e || e->bytes_per_expert == 0) {
+                    throw std::runtime_error(format(
+                        "MoE base '%s' has no usable experts entry", ggml_get_name(base)));
+                }
+                if (e->bytes_per_expert != kv.first) {
+                    throw std::runtime_error(format(
+                        "MoE group for '%s' has inconsistent expert bytes", ggml_get_name(base)));
+                }
+                resident += ggml_nbytes(base);
+                n_grp++;
+
+                // 组内非组长的张量先转成 base 的 view —— 不这么做它们会真的分配内存，
+                // RAM 会变成「每组 base + 组内层数 × prefill 容量」。
+                for (size_t j = 1; j < members.size(); ++j) {
+                    ggml_tensor * t = layers[members[j]].*fams[fi].pf;
+                    if (t) {
+                        ml.alias_expert_slot_tensor(t, base);
+                    }
+                }
+
+                // 组长的张量就是 base 本身（ne[2] = 组的容量），必须换成 view 才能进图：
+                // 否则 base 的 ne[2] 可能 > 1024，Metal 的 mul_mat_id 会断言崩溃。
+                for (size_t j = 0; j < members.size(); ++j) {
+                    auto & L = layers[members[j]];
+                    if (j == 0) {
+                        const std::string orig = ggml_get_name(base);
+                        ggml_set_name(base, (orig + ".base").c_str());
+                        L.*fams[fi].pf = ml.window_expert_slot_tensor(
+                            orig.c_str(), base, 0, prefill_cap, e->bytes_per_expert);
+                    }
+                    n_win++;
+                    if (dec_enabled) {
+                        const std::string n2 = format("%s.dec", ggml_get_name(L.*fams[fi].pf));
+                        // 偏移 = prefill 段之后 + 组内**前面各层**宽度之和
+                        // （各层宽度可能不同）。prefill 段固定占 [0, prefill_cap)，
+                        // 与 decode 段物理隔离，见上面布局说明。
+                        int64_t off = prefill_cap;
+                        for (size_t k2 = 0; k2 < j; ++k2) {
+                            off += width_of(members[k2]);
+                        }
+                        const int64_t wj = width_of(members[j]);
+                        L.*fams[fi].pf_dec = ml.window_expert_slot_tensor(
+                            n2.c_str(), base, off, wj, e->bytes_per_expert);
+                    }
+                }
+            }
+        }
+
+        LLAMA_LOG_INFO(
+            "%s: MoE bank %d groups (family x quant), %.2f MiB resident; %d prefill windows%s\n",
+            __func__, n_grp, resident / 1024.0 / 1024.0, n_win,
+            dec_enabled ? format(", %d decode windows (c=%d, 按层宽度 %s)",
+                                 n_win, (int) dec_c,
+                                 getenv("LLAMA_MOE_LAYER_WINDOWS") ? "on" : "off").c_str()
+                        : " (no decode windows)");
     }
 }
 
@@ -183,6 +418,8 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     const int n_transformer_layers = n_layer - (int) hparams.nextn_predict_layers;
     for (int il = 0; il < n_transformer_layers; ++il) {
+        res->t_layer_inp[il] = inpL;
+
         ggml_tensor * inpSA = inpL;
 
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
@@ -215,6 +452,18 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
         cb(attn_post_norm, "attn_post_norm", il);
 
+        ggml_tensor * lookahead_next = nullptr;
+        if (moe_slots && moe_slots->lookahead_prefetch_enabled() && ubatch.n_tokens == 1 &&
+            il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp != nullptr) {
+            ggml_tensor * prefetch_router_logits = build_lora_mm(model.layers[il + 1].ffn_gate_inp, attn_post_norm);
+            cb(prefetch_router_logits, "prefetch_router_logits", il);
+            lookahead_next = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, prefetch_router_logits, moe_slots->lookahead_prefetch_depth()));
+            cb(lookahead_next, "prefetch_topk", il);
+            ggml_build_forward_expand(gf, lookahead_next);
+        }
+        if (moe_slots) {
+            moe_slots->set_lookahead_pred(lookahead_next);
+        }
         // MOE FFN layer
         cur = build_layer_ffn(attn_post_norm, il);
         cb(cur, "ffn_out", il);
@@ -454,8 +703,8 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 
     const float eps_norm = hparams.f_norm_rms_eps;
 
-    q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
-    k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
+    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
@@ -499,18 +748,26 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
+    // MoE-SSD 阶段选张量：decode 用每层独立的窗口张量（base 上的 view），
+    // prefill 用共享窗口。两者 ne[2] 不同，所以必须由阶段决定，不能共用。
+    const auto & L = model.layers[il];
+    ggml_tensor * p_up   = moe_decode_phase && L.ffn_up_exps_dec      ? L.ffn_up_exps_dec      : L.ffn_up_exps;
+    ggml_tensor * p_gate = moe_decode_phase && L.ffn_gate_exps_dec    ? L.ffn_gate_exps_dec    : L.ffn_gate_exps;
+    ggml_tensor * p_down = moe_decode_phase && L.ffn_down_exps_dec    ? L.ffn_down_exps_dec    : L.ffn_down_exps;
+    ggml_tensor * p_gu   = moe_decode_phase && L.ffn_gate_up_exps_dec ? L.ffn_gate_up_exps_dec : L.ffn_gate_up_exps;
+
     ggml_tensor * moe_out =
         build_moe_ffn(cur,
             model.layers[il].ffn_gate_inp,
-            model.layers[il].ffn_up_exps,
-            model.layers[il].ffn_gate_exps,
-            model.layers[il].ffn_down_exps,
+            p_up,
+            p_gate,
+            p_down,
             nullptr,
             n_expert, n_expert_used,
             LLM_FFN_SILU, true,
             hparams.expert_weights_scale,
             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, model.layers[il].ffn_gate_up_exps,
+            nullptr, p_gu,
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
             model.layers[il].ffn_down_exps_s);
