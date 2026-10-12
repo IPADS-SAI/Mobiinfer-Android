@@ -836,7 +836,7 @@ private:
                     params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
 
                     // draft models (DFlash/DSpark/EAGLE3) are dense, not the qwen35moe target
-                    params_dft.moe_sidecar.clear();
+                    params_dft.moe_experts.clear();
                     params_dft.moe_slot_bank = 0;
                     params_dft.moe_k_prefill = 0;
                     params_dft.moe_k_decode  = 0;
@@ -939,8 +939,8 @@ private:
             params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
 
             // draft models (DFlash/DSpark/EAGLE3) are dense, not the qwen35moe target;
-            // inheriting --moe-sidecar would try to open the target expert bank on the draft GGUF
-            params_dft.moe_sidecar.clear();
+            // inheriting --moe-experts would try to open the target expert bank on the draft GGUF
+            params_dft.moe_experts.clear();
             params_dft.moe_slot_bank = 0;
             params_dft.moe_k_prefill = 0;
             params_dft.moe_k_decode  = 0;

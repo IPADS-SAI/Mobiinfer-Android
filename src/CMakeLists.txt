@@ -30,8 +30,8 @@ add_library(llama
             llama-memory-hybrid-iswa.cpp
             llama-memory-recurrent.cpp
             llama-mmap.cpp
-            llama-moe-sidecar.cpp
-            llama-moe-sidecar.h
+            llama-moe-experts.cpp
+            llama-moe-experts.h
             llama-moe-slot.cpp
             llama-moe-slot.h
             llama-model-loader.cpp
