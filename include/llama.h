@@ -315,9 +315,9 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
-        // Expert-major sidecar manifest and slots per routed layer.
+        // Expert-major experts manifest and slots per routed layer.
         // Both fields must be set together.
-        const char * moe_sidecar_path;
+        const char * moe_experts_path;
         int32_t moe_slot_bank;
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
@@ -987,19 +987,19 @@ extern "C" {
 
     // MoE look-ahead expert prefetch depth. 0 = off (no next-layer predict / prefetch).
     // 1..16 = number of next-layer experts predicted and preadv'd into the shared-bank tail.
-    // No-op if the context has no MoE sidecar. Rebuilds the decode graph.
+    // No-op if the context has no MoE experts. Rebuilds the decode graph.
     LLAMA_API void llama_set_moe_lookahead_prefetch_depth(struct llama_context * ctx, int32_t depth);
     LLAMA_API int32_t llama_get_moe_lookahead_prefetch_depth(const struct llama_context * ctx);
 
     // After a finished generation: drop the MoE expert window's Metal buffers and
-    // host pages. Next llama_decode rewraps automatically. No-op without sidecar.
+    // host pages. Next llama_decode rewraps automatically. No-op without experts.
     // Disable with LLAMA_MOE_PARK_WINDOW=0.
     LLAMA_API void llama_moe_park_expert_memory(struct llama_context * ctx);
 
     // Pre-read the static expert-window prewarm table (LLAMA_MOE_PREWARM) into the per-layer
     // decode windows during an idle window *before* prefill. The decode windows are physically
     // separate from the prefill bank, so the data survives prefill and the prefill→decode
-    // transition only re-publishes the slot mappings (no I/O). No-op without a sidecar / table.
+    // transition only re-publishes the slot mappings (no I/O). No-op without a experts / table.
     // Must be called while no decode is in flight (e.g. after the vision encoder is unloaded).
     LLAMA_API void llama_moe_prewarm_experts(struct llama_context * ctx);
 
@@ -1011,7 +1011,7 @@ extern "C" {
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
 
-    // Runtime MoE top-k. 0 = model metadata. Must be <= GGUF / sidecar expert_used_count.
+    // Runtime MoE top-k. 0 = model metadata. Must be <= GGUF / experts expert_used_count.
     LLAMA_API void llama_set_n_expert_used(struct llama_context * ctx, int32_t n_expert_used);
     LLAMA_API int32_t llama_n_expert_used(const struct llama_context * ctx);
 

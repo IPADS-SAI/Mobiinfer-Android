@@ -198,7 +198,7 @@ struct llama_model_loader {
     /// 在**指定的 buft** 上新建一个空张量（不读 gguf、不进 weights_map）。
     ///
     /// 给「内容不由模型文件提供」的张量用：MoE 专家剥离出 gguf 之后，gguf 里根本没有
-    /// 这些张量，只能用 sidecar manifest 里的形状/类型合成一个占位张量，内容后续由
+    /// 这些张量，只能用 experts manifest 里的形状/类型合成一个占位张量，内容后续由
     /// preadv 填。不进 weights_map 是关键 —— 否则 load_all_data 会去文件里找它们。
     struct ggml_tensor * create_tensor_alloc(
         const llama_hparams & hparams,
@@ -215,7 +215,7 @@ struct llama_model_loader {
         struct ggml_tensor * tensor,
         int64_t n_expert,
         int64_t n_slots,
-        enum ggml_type sidecar_type,
+        enum ggml_type experts_type,
         size_t bytes_per_expert);
 
     // Make dst a view of src so later backend alloc only pays for src.

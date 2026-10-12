@@ -1,6 +1,6 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
-#include "llama-moe-sidecar.h"
+#include "llama-moe-experts.h"
 #include "llama-moe-slot.h"
 
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
@@ -91,7 +91,7 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
     std::map<size_t, std::vector<int>> groups[4];
     for (int il = 0; il < (int) n_layer; ++il) {
         for (int fi = 0; fi < 4; ++fi) {
-            const auto * e = moe_sidecar_entry(tn(fam_ids[fi], "weight", il).str().c_str());
+            const auto * e = moe_experts_entry(tn(fam_ids[fi], "weight", il).str().c_str());
             if (e) {
                 groups[fi][e->bytes_per_expert].push_back(il);
             }
@@ -120,7 +120,7 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
     auto create_routed_tensor = [&](const LLM_TN_IMPL & tensor_name,
                                     const std::initializer_list<int64_t> & dims,
                                     int flags) {
-        // 专家张量的内容来自 sidecar（运行时 preadv 写入），跟模型文件无关：
+        // 专家张量的内容来自 experts（运行时 preadv 写入），跟模型文件无关：
         //  - 必须避开 mmap 的文件映射包装（否则启用 mmap 时落进只读映射，写不进去）
         //  - gguf 里也可能根本没有它（用 strip_experts.py 剥离过），此时按 manifest 合成
         //
@@ -130,15 +130,15 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
         ggml_tensor * tensor = create_tensor_own_alloc(
             ml, tensor_name, dims, flags | TENSOR_NOT_REQUIRED);
 
-        const auto * entry = moe_sidecar_entry(tensor_name.str().c_str());
+        const auto * entry = moe_experts_entry(tensor_name.str().c_str());
 
         if (!tensor && entry) {
-            tensor = create_expert_tensor_from_sidecar(ml, tensor_name, dims, entry->type);
+            tensor = create_expert_tensor_from_manifest(ml, tensor_name, dims, entry->type);
         }
         if (!tensor) {
             if (required && moe_slot_bank_enabled()) {
                 throw std::runtime_error(format(
-                    "routed tensor '%s' is in neither the GGUF nor the MoE sidecar",
+                    "routed tensor '%s' is in neither the GGUF nor the MoE experts",
                     tensor_name.str().c_str()));
             }
             return tensor;
@@ -148,15 +148,15 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
         }
         if (!entry) {
             throw std::runtime_error(format(
-                "MoE sidecar is missing routed tensor '%s'",
+                "MoE experts is missing routed tensor '%s'",
                 tensor_name.str().c_str()));
         }
-        // 核对「dims x 类型」的字节数 == sidecar 记录的 每专家字节 x 专家数。
-        // 模型的 expert_count 或量化档位与 sidecar 不一致时，这里立刻暴露，
+        // 核对「dims x 类型」的字节数 == experts 记录的 每专家字节 x 专家数。
+        // 模型的 expert_count 或量化档位与 experts 不一致时，这里立刻暴露，
         // 而不是等到运行时读到错位字节（那种错是静默的）。
         if (ggml_nbytes(tensor) != entry->bytes_per_expert * (size_t) n_expert) {
             throw std::runtime_error(format(
-                "expert tensor '%s' byte size mismatch: tensor=%zu sidecar=%zu",
+                "expert tensor '%s' byte size mismatch: tensor=%zu experts=%zu",
                 tensor_name.str().c_str(), ggml_nbytes(tensor),
                 entry->bytes_per_expert * (size_t) n_expert));
         }
@@ -299,8 +299,8 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
 
     // 每组一个物理 base，组内后层是它的 view（RAM = base，而不是每组一个 base × 组内层数）。
     //
-    // 名字很关键：运行时 `bind()` 按张量名查 sidecar，所以 prefill 视图必须沿用
-    // 原始 GGUF 名；decode 视图加 `.dec` 后缀，由 `moe_sidecar_entry()` 剥掉再查。
+    // 名字很关键：运行时 `bind()` 按张量名查 experts，所以 prefill 视图必须沿用
+    // 原始 GGUF 名；decode 视图加 `.dec` 后缀，由 `moe_experts_entry()` 剥掉再查。
     if (moe_slot_bank_enabled()) {
         struct fam_t {
             ggml_tensor * llama_layer::* pf;
@@ -328,10 +328,10 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
                 if (!base) {
                     continue;
                 }
-                const auto * e = moe_sidecar_entry(ggml_get_name(base));
+                const auto * e = moe_experts_entry(ggml_get_name(base));
                 if (!e || e->bytes_per_expert == 0) {
                     throw std::runtime_error(format(
-                        "MoE base '%s' has no usable sidecar entry", ggml_get_name(base)));
+                        "MoE base '%s' has no usable experts entry", ggml_get_name(base)));
                 }
                 if (e->bytes_per_expert != kv.first) {
                     throw std::runtime_error(format(

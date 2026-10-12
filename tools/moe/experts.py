@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-# tools/moe/sidecar.py -> parents[2] = 仓库根（再拼 gguf-py）。脚本挪位置要同步改深度。
+# tools/moe/experts.py -> parents[2] = 仓库根（再拼 gguf-py）。脚本挪位置要同步改深度。
 LLAMA_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(LLAMA_ROOT / "gguf-py"))
 
@@ -207,7 +207,7 @@ def extract(args: argparse.Namespace) -> int:
 
     manifest = {
         "schema_version": 1,
-        "sidecar_kind": "omni_moe_gguf",
+        "experts_kind": "omni_moe_gguf",
         "layout": "layer_major_expert",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": {"model_files": [str(path) for path in model_paths]},
@@ -226,7 +226,7 @@ def extract(args: argparse.Namespace) -> int:
 
 def verify(args: argparse.Namespace) -> int:
     model_paths = resolve_model_paths(args.model)
-    manifest_path = args.sidecar.expanduser().resolve()
+    manifest_path = args.experts.expanduser().resolve()
     if manifest_path.is_dir():
         manifest_path = manifest_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -236,7 +236,7 @@ def verify(args: argparse.Namespace) -> int:
 
     with ExitStack() as stack:
         sources = [stack.enter_context(path.open("rb")) for path in model_paths]
-        sidecars: dict[str, Any] = {}
+        experts: dict[str, Any] = {}
         for entry in entries:
             source = expected_by_name.get(entry["tensor_name"])
             if source is None:
@@ -247,18 +247,18 @@ def verify(args: argparse.Namespace) -> int:
             if args.metadata_only:
                 continue
 
-            sidecar = sidecars.get(entry["repacked_file"])
-            if sidecar is None:
-                sidecar = stack.enter_context((manifest_path.parent / entry["repacked_file"]).open("rb"))
-                sidecars[entry["repacked_file"]] = sidecar
+            experts = experts.get(entry["repacked_file"])
+            if experts is None:
+                experts = stack.enter_context((manifest_path.parent / entry["repacked_file"]).open("rb"))
+                experts[entry["repacked_file"]] = experts
             size = entry["bytes_per_expert"]
             for expert in range(metadata["expert_count"]):
                 sources[source["source_shard_index"]].seek(source["source_offset"] + expert * size)
-                sidecar.seek(entry["repacked_offset"] + expert * entry["expert_stride"])
+                experts.seek(entry["repacked_offset"] + expert * entry["expert_stride"])
                 remaining = size
                 while remaining:
                     count = min(8 << 20, remaining)
-                    if sources[source["source_shard_index"]].read(count) != sidecar.read(count):
+                    if sources[source["source_shard_index"]].read(count) != experts.read(count):
                         raise SystemExit(f"byte mismatch for '{entry['tensor_name']}' expert {expert}")
                     remaining -= count
 
@@ -270,7 +270,7 @@ def verify(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Extract expert-major GGUF sidecars for Omni MoE experiments.")
+    parser = argparse.ArgumentParser(description="Extract expert-major GGUF experts for Omni MoE experiments.")
     commands = parser.add_subparsers(dest="command", required=True)
 
     extract_parser = commands.add_parser("extract")
@@ -282,7 +282,7 @@ def main() -> int:
 
     verify_parser = commands.add_parser("verify")
     verify_parser.add_argument("--model", required=True, type=Path)
-    verify_parser.add_argument("--sidecar", required=True, type=Path)
+    verify_parser.add_argument("--experts", required=True, type=Path)
     verify_parser.add_argument("--layers")
     verify_parser.add_argument("--metadata-only", action="store_true")
     verify_parser.set_defaults(func=verify)

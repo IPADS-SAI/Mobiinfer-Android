@@ -3,7 +3,7 @@
 
 为什么需要它
 ------------
-MoE-SSD 下专家的内容来自 sidecar（运行时 preadv 写入），gguf 里那份**从头到尾
+MoE-SSD 下专家的内容来自 experts（运行时 preadv 写入），gguf 里那份**从头到尾
 没被读过** —— `virtualize_expert_tensor` 会把它们从 weights_map 里摘掉。所以
 gguf 里那份专家数据是纯死重量（V47 上是 18.7 GiB 里的 ~17.6 GiB）。
 
@@ -16,12 +16,12 @@ gguf 里那份专家数据是纯死重量（V47 上是 18.7 GiB 里的 ~17.6 GiB
   - 常驻权重变成「可回收的文件页」，不再和 page cache 抢匿名内存
   - 少占 ~17.6 GiB 磁盘
 
-专家的形状/类型由 sidecar manifest 提供，所以剥掉之后引擎仍然能建出
+专家的形状/类型由 experts manifest 提供，所以剥掉之后引擎仍然能建出
 （空内容、待 preadv 填充的）专家张量。
 
 用法
 ----
-  python strip_experts.py --model in.gguf --sidecar <sidecar 目录> --out out-noshard.gguf
+  python strip_experts.py --model in.gguf --experts <experts 目录> --out out-les.gguf
 """
 from __future__ import annotations
 
@@ -37,15 +37,15 @@ sys.path.insert(0, str(LLAMA_ROOT / "gguf-py"))
 from gguf import GGUFReader, GGUFWriter, GGUFValueType  # noqa: E402
 
 
-def expert_names(sidecar_dir: Path) -> set[str]:
-    """从 sidecar manifest 取专家的 gguf 张量名。
+def expert_names(experts_dir: Path) -> set[str]:
+    """从 experts manifest 取专家的 gguf 张量名。
 
-    用 manifest 而不是名字模式匹配：manifest 是「哪些张量被搬进 sidecar」的权威记录，
+    用 manifest 而不是名字模式匹配：manifest 是「哪些张量被搬进 experts」的权威记录，
     而名字模式（比如以 `_exps` 结尾）会随架构变化、也可能误伤。
     """
-    manifest = sidecar_dir / "manifest.json"
+    manifest = experts_dir / "manifest.json"
     if not manifest.exists():
-        raise SystemExit(f"sidecar manifest 不存在: {manifest}")
+        raise SystemExit(f"experts manifest 不存在: {manifest}")
     entries = json.loads(manifest.read_text())["entries"]
     names = {e["original_gguf_tensor_name"] for e in entries}
     if not names:
@@ -56,7 +56,7 @@ def expert_names(sidecar_dir: Path) -> set[str]:
 def main() -> int:
     ap = argparse.ArgumentParser(description="剥掉 gguf 里的 MoE 专家张量")
     ap.add_argument("--model", required=True, help="源 gguf")
-    ap.add_argument("--sidecar", required=True, help="sidecar 目录（读 manifest.json）")
+    ap.add_argument("--experts", required=True, help="experts 目录（读 manifest.json）")
     ap.add_argument("--out", required=True, help="输出 gguf")
     ap.add_argument("--keep-experts", action="store_true",
                     help="只做一次「读进来再写出去」的往返，用于验证工具本身不改变模型")
@@ -67,7 +67,7 @@ def main() -> int:
     if not src.exists():
         raise SystemExit(f"源 gguf 不存在: {src}")
 
-    drop = set() if args.keep_experts else expert_names(Path(args.sidecar))
+    drop = set() if args.keep_experts else expert_names(Path(args.experts))
     if not args.keep_experts:
         print(f"将从 manifest 剥掉的专家张量: {len(drop)} 个")
 

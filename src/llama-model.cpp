@@ -5,7 +5,7 @@
 #include "llama-hparams.h"
 #include "llama-impl.h"
 #include "llama-mmap.h"
-#include "llama-moe-sidecar.h"
+#include "llama-moe-experts.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
 
@@ -911,7 +911,7 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
 //
 // 为什么需要：启用 mmap 时，llama_model::load_tensors 会把**默认 buft** 的张量
 // 整体包进模型文件的映射区（见那里的 is_default_buft 判断）。而 MoE 专家张量
-// 的内容来自 sidecar、由 preadv 在运行时写入，跟文件映射无关 —— 落进映射区就
+// 的内容来自 experts、由 preadv 在运行时写入，跟文件映射无关 —— 落进映射区就
 // 写不进去（映射是 MAP_PRIVATE 只读）。把它们放到这个 buft 上，走正常分配。
 //
 // 后端若不提供，返回 nullptr，调用方回退到默认行为。
@@ -1016,19 +1016,19 @@ struct llama_model::impl {
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
-    std::unique_ptr<llama_moe_sidecar> moe_sidecar;
+    std::unique_ptr<llama_moe_experts> moe_experts;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 
-    const bool has_sidecar = params.moe_sidecar_path && params.moe_sidecar_path[0] != '\0';
+    const bool has_experts = params.moe_experts_path && params.moe_experts_path[0] != '\0';
     const bool has_slots = params.moe_slot_bank > 0;
-    if (has_sidecar != has_slots) {
-        throw std::invalid_argument("MoE sidecar path and slot bank size must be set together");
+    if (has_experts != has_slots) {
+        throw std::invalid_argument("MoE experts path and slot bank size must be set together");
     }
-    if (has_sidecar) {
-        pimpl->moe_sidecar = std::make_unique<llama_moe_sidecar>(params.moe_sidecar_path);
+    if (has_experts) {
+        pimpl->moe_experts = std::make_unique<llama_moe_experts>(params.moe_experts_path);
     }
 }
 
@@ -1219,13 +1219,13 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     // per-arch hparams
     load_arch_hparams(ml);
 
-    if (pimpl->moe_sidecar) {
+    if (pimpl->moe_experts) {
         if (arch != LLM_ARCH_QWEN35MOE) {
-            throw std::runtime_error("MoE sidecar currently supports only qwen35moe");
+            throw std::runtime_error("MoE experts currently supports only qwen35moe");
         }
-        if (pimpl->moe_sidecar->expert_count() != (int32_t) hparams.n_expert ||
-            pimpl->moe_sidecar->expert_used_count() != (int32_t) hparams.n_expert_used) {
-            throw std::runtime_error("MoE sidecar expert counts do not match model metadata");
+        if (pimpl->moe_experts->expert_count() != (int32_t) hparams.n_expert ||
+            pimpl->moe_experts->expert_used_count() != (int32_t) hparams.n_expert_used) {
+            throw std::runtime_error("MoE experts expert counts do not match model metadata");
         }
         // bank 的下界是 top-k（一层的 unique 至少要能装下）。
         //
@@ -1237,15 +1237,15 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             throw std::runtime_error("MoE slot bank must be at least expert_used_count");
         }
         // Shared-bank RAM is bank x one layer. Cap it at the old bank=32-per-layer budget.
-        const int32_t n_moe_layers = pimpl->moe_sidecar->layer_count();
+        const int32_t n_moe_layers = pimpl->moe_experts->layer_count();
         constexpr int32_t kMoeSlotBankRamBaseline = 32;
         if (n_moe_layers > 0 && params.moe_slot_bank > kMoeSlotBankRamBaseline * n_moe_layers) {
             throw std::runtime_error("MoE shared slot bank exceeds the bank=32-per-layer RAM budget");
         }
-        const size_t bytes_all = pimpl->moe_sidecar->bytes_per_slot_all_layers();
+        const size_t bytes_all = pimpl->moe_experts->bytes_per_slot_all_layers();
         const size_t bytes_one = n_moe_layers > 0 ? bytes_all / (size_t) n_moe_layers : 0;
         LLAMA_LOG_INFO(
-            "%s: MoE sidecar shared slot bank: %d slots, %d layers, %.2f MiB resident (bank=32 x layers was %.2f MiB)\n",
+            "%s: MoE experts shared slot bank: %d slots, %d layers, %.2f MiB resident (bank=32 x layers was %.2f MiB)\n",
             __func__,
             params.moe_slot_bank,
             n_moe_layers,
@@ -1732,8 +1732,8 @@ ggml_tensor * llama_model_base::create_tensor_own_alloc(llama_model_loader & ml,
         tn, ne, flags);
 }
 
-ggml_tensor * llama_model_base::create_expert_tensor_from_sidecar(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, ggml_type type) {
-    // gguf 里没有这个专家张量（已剥离），只能用 sidecar manifest 的形状/类型合成。
+ggml_tensor * llama_model_base::create_expert_tensor_from_manifest(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, ggml_type type) {
+    // gguf 里没有这个专家张量（已剥离），只能用 experts manifest 的形状/类型合成。
     // 必须放在 alloc_only_buft 上：专家内容是 preadv 运行时写入的，不能被 mmap
     // 的文件映射包住（见 create_tensor_own_alloc 的说明）。
     ggml_backend_dev_t dev = tn.bid == -1
@@ -2089,26 +2089,26 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
 }
 
 bool llama_model::moe_slot_bank_enabled() const {
-    return pimpl->moe_sidecar != nullptr;
+    return pimpl->moe_experts != nullptr;
 }
 
 int32_t llama_model::moe_slot_bank_size() const {
-    return pimpl->moe_sidecar ? params.moe_slot_bank : 0;
+    return pimpl->moe_experts ? params.moe_slot_bank : 0;
 }
 
-int32_t llama_model::moe_sidecar_layer_count() const {
-    return pimpl->moe_sidecar ? pimpl->moe_sidecar->layer_count() : 0;
+int32_t llama_model::moe_experts_layer_count() const {
+    return pimpl->moe_experts ? pimpl->moe_experts->layer_count() : 0;
 }
 
 int32_t llama_model::moe_decode_window() const {
-    if (!pimpl->moe_sidecar) {
+    if (!pimpl->moe_experts) {
         return 0;
     }
     const char * s = std::getenv("LLAMA_MOE_DECODE_WINDOW");
     if (!s || !*s) {
         return 0;                       // 未设置 = 关闭
     }
-    const int32_t n_moe = pimpl->moe_sidecar->layer_count();
+    const int32_t n_moe = pimpl->moe_experts->layer_count();
     if (n_moe <= 0) {
         return 0;
     }
@@ -2140,10 +2140,10 @@ int32_t llama_model::moe_decode_window() const {
 
 std::vector<int32_t> llama_model::moe_layer_windows() const {
     std::vector<int32_t> out;
-    if (!pimpl->moe_sidecar) {
+    if (!pimpl->moe_experts) {
         return out;
     }
-    const int32_t n_moe = pimpl->moe_sidecar->layer_count();
+    const int32_t n_moe = pimpl->moe_experts->layer_count();
     if (n_moe <= 0) {
         return out;
     }
@@ -2188,7 +2188,7 @@ int32_t llama_model::moe_layer_windows_total() const {
 }
 
 int32_t llama_model::moe_prefetch_slots() const {
-    if (!pimpl->moe_sidecar) {
+    if (!pimpl->moe_experts) {
         return 0;
     }
     const char * s = std::getenv("LLAMA_MOE_LOOKAHEAD_PREFETCH");
@@ -2201,17 +2201,17 @@ int32_t llama_model::moe_prefetch_slots() const {
     return std::max(0, std::min(k, 64));
 }
 
-const llama_moe_sidecar_entry * llama_model::moe_sidecar_entry(const char * tensor_name) const {
-    if (!pimpl->moe_sidecar || !tensor_name) {
+const llama_moe_experts_entry * llama_model::moe_experts_entry(const char * tensor_name) const {
+    if (!pimpl->moe_experts || !tensor_name) {
         return nullptr;
     }
     // decode 窗口张量的名字是 `<原名>.dec`（见 qwen35moe 的窗口布局），
-    // 它们是同一份权重、同一个 sidecar entry，所以查表前剥掉后缀。
+    // 它们是同一份权重、同一个 experts entry，所以查表前剥掉后缀。
     std::string name = tensor_name;
     if (name.size() > 4 && name.compare(name.size() - 4, 4, ".dec") == 0) {
         name.resize(name.size() - 4);
     }
-    return pimpl->moe_sidecar->find(name.c_str());
+    return pimpl->moe_experts->find(name.c_str());
 }
 
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {
@@ -2460,7 +2460,7 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
-        /*.moe_sidecar_path            =*/ nullptr,
+        /*.moe_experts_path            =*/ nullptr,
         /*.moe_slot_bank               =*/ 0,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,

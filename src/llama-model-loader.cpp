@@ -1321,7 +1321,7 @@ ggml_tensor * llama_model_loader::create_tensor_alloc(
 void llama_model_loader::virtualize_expert_tensor(        ggml_tensor * tensor,
         int64_t n_expert,
         int64_t n_slots,
-        ggml_type sidecar_type,
+        ggml_type experts_type,
         size_t bytes_per_expert) {
     if (!tensor) {
         return;
@@ -1331,10 +1331,10 @@ void llama_model_loader::virtualize_expert_tensor(        ggml_tensor * tensor,
     if (tensor->data || tensor->buffer) {
         throw std::runtime_error("cannot virtualize an allocated expert tensor");
     }
-    if (tensor->type != sidecar_type) {
+    if (tensor->type != experts_type) {
         throw std::runtime_error(format(
-            "expert tensor '%s' type %s does not match sidecar type %s",
-            ggml_get_name(tensor), ggml_type_name(tensor->type), ggml_type_name(sidecar_type)));
+            "expert tensor '%s' type %s does not match experts type %s",
+            ggml_get_name(tensor), ggml_type_name(tensor->type), ggml_type_name(experts_type)));
     }
     // ne[2] 此时仍是 GGUF 里的原始值（= n_expert），下面会改成 n_slots。
     // n_slots 允许大于 n_expert：按层分区时 slot 数就大于专家数（同一专家在不同层
@@ -1354,10 +1354,10 @@ void llama_model_loader::virtualize_expert_tensor(        ggml_tensor * tensor,
         throw std::runtime_error(format("virtual expert tensor '%s' has unexpected size", name.c_str()));
     }
     // 把张量从 weights_map 摘掉，这样 load_all_data 不会去 gguf 里找它 —— 专家的
-    // 内容来自 sidecar，由 preadv 运行时写入。
+    // 内容来自 experts，由 preadv 运行时写入。
     //
     // 不检查返回值：gguf 里已经没有专家时（用 strip_experts.py 剥离过），张量是
-    // 按 sidecar manifest 合成的，本来就不在 weights_map 里。
+    // 按 experts manifest 合成的，本来就不在 weights_map 里。
     weights_map.erase(name);
 
     LLAMA_LOG_INFO("%s: virtualized %s from %lld experts to %lld slots (%.2f MiB)\n",

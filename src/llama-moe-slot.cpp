@@ -3,7 +3,7 @@
 #include "ggml-backend.h"
 #include "llama-impl.h"
 #include "llama-model.h"
-#include "llama-moe-sidecar.h"
+#include "llama-moe-experts.h"
 
 #include <algorithm>
 #include <atomic>
@@ -464,7 +464,7 @@ struct lookahead_expert_prefetch {
 struct llama_moe_slot_runtime::impl {
     struct binding {
         ggml_tensor * tensor = nullptr;
-        const llama_moe_sidecar_entry * entry = nullptr;
+        const llama_moe_experts_entry * entry = nullptr;
     };
 
     // 一次读取要用的「打包视图」：prefill 和 decode 各有自己的一套张量与文件布局。
@@ -493,7 +493,7 @@ struct llama_moe_slot_runtime::impl {
         size_t pack_stride = 0;
         std::string pack_path;
         std::vector<binding> bindings;
-        std::vector<size_t> pack_order; // bindings sorted by file offset, i.e. sidecar packed order
+        std::vector<size_t> pack_order; // bindings sorted by file offset, i.e. experts packed order
 
         // decode 专用的一套（每层独立窗口，ne[2] = c）。prefill 用上面那套。
         bool dec_pack_ok = false;
@@ -669,14 +669,14 @@ struct llama_moe_slot_runtime::impl {
                 }
             }
         }
-        // Sidecar loading preadv's the packed expert span straight into its slot, which requires both a
+        // Experts loading preadv's the packed expert span straight into its slot, which requires both a
         // packed layout and CPU-addressable slot tensors. Do not guess either, and do not silently fall
         // back to an upload path: private Metal buffers (non-unified memory) expose tensor->data as a
         // virtual address that is not writable from the CPU.
         for (const auto & layer : layers) {
             if (layer.enabled && !layer.pack_ok) {
                 throw std::runtime_error(
-                    "MoE sidecar layer is not packed; preadv loading requires gate/up/down contiguous per expert");
+                    "MoE experts layer is not packed; preadv loading requires gate/up/down contiguous per expert");
             }
             for (const auto & b : layer.bindings) {
                 if (!b.tensor->buffer || !ggml_backend_buffer_is_host_addressable(b.tensor->buffer)) {
@@ -1204,7 +1204,7 @@ struct llama_moe_slot_runtime::impl {
                     (int) lookahead.depth);
         }
 
-        const int32_t n_moe_layers = model.moe_sidecar_layer_count();
+        const int32_t n_moe_layers = model.moe_experts_layer_count();
         const size_t total = (size_t) decode_window * (size_t) n_moe_layers;
         moe_log("decode-cache: on cache=%d + prefetch=%d slots/layer × %d 层 = %zu slots "
                 "(%.0f MiB，与 %d-slot 的 prefill 共享 bank 同处一块 base)",
@@ -1259,9 +1259,9 @@ struct llama_moe_slot_runtime::impl {
         if (!tensor) {
             return;
         }
-        const auto * entry = model.moe_sidecar_entry(ggml_get_name(tensor));
+        const auto * entry = model.moe_experts_entry(ggml_get_name(tensor));
         if (!entry) {
-            throw std::runtime_error(format("missing sidecar entry for tensor '%s'", ggml_get_name(tensor)));
+            throw std::runtime_error(format("missing experts entry for tensor '%s'", ggml_get_name(tensor)));
         }
         if (tensor->ne[2] != expect_slots ||
             ggml_nbytes(tensor) != entry->bytes_per_expert * (size_t) expect_slots) {
@@ -1323,7 +1323,7 @@ struct llama_moe_slot_runtime::impl {
         state.pack_bytes = state.pack_stride;
     }
 
-    /// LLAMA_MOE_F_NOCACHE：sidecar 读是否绕过 page cache。
+    /// LLAMA_MOE_F_NOCACHE：experts 读是否绕过 page cache。
     ///   未设 / "0" → 全程不绕（默认）
     ///   "auto"     → 按阶段（prefill 绕、decode 不绕）
     ///   "1"        → 全程绕过
@@ -1338,13 +1338,13 @@ struct llama_moe_slot_runtime::impl {
         return m;
     }
 
-    bool sidecar_nocache_desired() const {
+    bool experts_nocache_desired() const {
         const int m = nocache_mode();
         return m < 0 ? want_nocache.load(std::memory_order_relaxed) : m != 0;
     }
 
-    /// 把已打开的 sidecar fd 的 F_NOCACHE 拨到 `on`。只改缓存行为，不动数据。
-    void apply_sidecar_nocache(bool on) {
+    /// 把已打开的 experts fd 的 F_NOCACHE 拨到 `on`。只改缓存行为，不动数据。
+    void apply_experts_nocache(bool on) {
 #ifndef _WIN32
         std::lock_guard<std::mutex> lock(fd_mutex);
         for (const auto & kv : fds) {
@@ -1357,7 +1357,7 @@ struct llama_moe_slot_runtime::impl {
         static bool logged[2] = { false, false };
         if (!logged[on ? 0 : 1]) {
             logged[on ? 0 : 1] = true;
-            moe_log("sidecar 读%s page cache（%s 阶段）", on ? "绕过" : "经过",
+            moe_log("experts 读%s page cache（%s 阶段）", on ? "绕过" : "经过",
                     on ? "prefill" : "decode");
         }
     }
@@ -1372,12 +1372,12 @@ struct llama_moe_slot_runtime::impl {
         const int fd = _open(path.c_str(), _O_RDONLY | _O_BINARY);
 #else
         const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-        if (sidecar_nocache_desired() && fcntl(fd, F_NOCACHE, 1) != 0) {
+        if (experts_nocache_desired() && fcntl(fd, F_NOCACHE, 1) != 0) {
             moe_log("F_NOCACHE 设置失败: %s", std::strerror(errno));
         }
 #endif
         if (fd < 0) {
-            throw std::runtime_error(format("failed to open MoE sidecar file '%s': %s", path.c_str(), std::strerror(errno)));
+            throw std::runtime_error(format("failed to open MoE experts file '%s': %s", path.c_str(), std::strerror(errno)));
         }
         fds.emplace(path, fd);
         return fd;
@@ -1417,7 +1417,7 @@ struct llama_moe_slot_runtime::impl {
 #ifdef _WIN32
             std::lock_guard<std::mutex> lock(io_mutex);
             if (_lseeki64(fd, (int64_t) (offset + done), SEEK_SET) < 0) {
-                throw std::runtime_error("failed to seek MoE sidecar");
+                throw std::runtime_error("failed to seek MoE experts");
             }
             const ssize_t result = _read(fd, cur[0].iov_base, (unsigned int) cur[0].iov_len);
 #else
@@ -1428,13 +1428,13 @@ struct llama_moe_slot_runtime::impl {
             }
             if (result <= 0) {
                 throw std::runtime_error(format(
-                    "failed to read MoE sidecar at offset %zu", offset + done));
+                    "failed to read MoE experts at offset %zu", offset + done));
             }
             done += (size_t) result;
         }
     }
 
-    // Reads the packed gate|up|down span (one contiguous run in the sidecar) with a single preadv,
+    // Reads the packed gate|up|down span (one contiguous run in the experts) with a single preadv,
     // writing each family straight into its own slot. One syscall, one write per byte: no staging
     // buffer and no second copy into the device buffer.
     int64_t read_expert_directv(const layer_state & state, int32_t expert, int32_t slot,
@@ -1582,7 +1582,7 @@ struct llama_moe_slot_runtime::impl {
 
     // 统计 pending 的「连续段」结构，用来判断「合并相邻专家的读」是否可行。
     //
-    // 背景：sidecar 是 expert-major，expert k 的字节在文件里位于
+    // 背景：experts 是 expert-major，expert k 的字节在文件里位于
     // `base + k * expert_stride`，所以**专家 id 连号 == 文件地址连号**。
     // 而 pending 是按 expert id 升序构建的，因此天然带着可用于合并的连续段。
     //
@@ -1690,7 +1690,7 @@ struct llama_moe_slot_runtime::impl {
         // 其余 N-1 个被静默跳过，slot 里留着上一层/上一个 token 的旧权重，
         // 模型输出会错但不报错。这条路径只在 io_threads==1 时进入，
         // 默认 4 所以长期潜伏；把它做成可调后才会踩到。
-        // 单线程还有个副作用：pending 是按 expert id 升序构建的，而 sidecar 是
+        // 单线程还有个副作用：pending 是按 expert id 升序构建的，而 experts 是
         // expert-major（offset = base + expert * stride），所以单线程等于**严格
         // 顺序读文件**，可能接近顺序读速率（实测比 4 线程的随机交织快）。
         if (t.n_th == 1) {
@@ -2320,7 +2320,7 @@ void llama_moe_slot_runtime::process(
     const bool window_mode = pimpl->decode_window > 0 && n_rows <= pimpl->window_max_rows;
     const bool lookahead_step = pimpl->lookahead.enabled && decode;
 
-    // auto 模式下按阶段切 sidecar 的缓存策略：prefill 绕过、decode 不绕过。
+    // auto 模式下按阶段切 experts 的缓存策略：prefill 绕过、decode 不绕过。
     //
     // 判据用批宽而不是 window_mode —— 后者还要求 decode 窗口开着，而窗口关掉时
     // decode 阶段照样存在，用它会连 decode 一起绕过缓存。本判据与 llama-context 的
@@ -2329,7 +2329,7 @@ void llama_moe_slot_runtime::process(
         const bool want = n_rows > pimpl->window_max_rows;
         if (pimpl->want_nocache.load(std::memory_order_relaxed) != want) {
             pimpl->want_nocache.store(want, std::memory_order_relaxed);
-            pimpl->apply_sidecar_nocache(want);
+            pimpl->apply_experts_nocache(want);
         }
     }
 
