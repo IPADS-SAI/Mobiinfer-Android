@@ -636,6 +636,8 @@ int llama_cli(int argc, char ** argv) {
             console::set_display(DISPLAY_TYPE_RESET);
         }
 
+        llama_moe_park_expert_memory(ctx_cli.ctx_server.get_llama_context());
+
         if (params.single_turn) {
             break;
         }

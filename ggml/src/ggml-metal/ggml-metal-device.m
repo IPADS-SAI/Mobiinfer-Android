@@ -8,6 +8,9 @@
 #include <Metal/Metal.h>
 
 #include <stdatomic.h>
+#include <errno.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #ifndef TARGET_OS_VISION
 #define TARGET_OS_VISION 0
@@ -1355,6 +1358,7 @@ const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_de
 struct ggml_metal_buffer_wrapper {
     void   * data;
     size_t   size;
+    size_t   metal_size; // page-aligned length actually passed to Metal
 
     id<MTLBuffer> metal;
 };
@@ -1511,8 +1515,9 @@ ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size,
     res->n_buffers = 1;
 
     if (res->all_data != NULL) {
-        res->buffers[0].size  = size;
-        res->buffers[0].metal = nil;
+        res->buffers[0].size       = size;
+        res->buffers[0].metal_size = size_aligned;
+        res->buffers[0].metal      = nil;
 
         if (size_aligned > 0) {
             if (props_dev->use_shared_buffers && shared) {
@@ -1580,9 +1585,10 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
 
     // the buffer fits into the max buffer size allowed by the device
     if (size_aligned <= props_dev->max_buffer_size) {
-        res->buffers[res->n_buffers].data  = ptr;
-        res->buffers[res->n_buffers].size  = size;
-        res->buffers[res->n_buffers].metal = nil;
+        res->buffers[res->n_buffers].data       = ptr;
+        res->buffers[res->n_buffers].size       = size;
+        res->buffers[res->n_buffers].metal_size = size_aligned;
+        res->buffers[res->n_buffers].metal      = nil;
 
         if (size_aligned > 0) {
             res->buffers[res->n_buffers].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:ptr length:size_aligned options:MTLResourceStorageModeShared deallocator:nil];
@@ -1607,9 +1613,10 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
         for (size_t i = 0; i < size; i += size_step) {
             const size_t size_step_aligned = (i + size_view <= size) ? size_view : (size_aligned - i);
 
-            res->buffers[res->n_buffers].data  = (void *) ((uint8_t *) ptr + i);
-            res->buffers[res->n_buffers].size  = size_step_aligned;
-            res->buffers[res->n_buffers].metal = nil;
+            res->buffers[res->n_buffers].data       = (void *) ((uint8_t *) ptr + i);
+            res->buffers[res->n_buffers].size       = size_step_aligned;
+            res->buffers[res->n_buffers].metal_size = size_step_aligned;
+            res->buffers[res->n_buffers].metal      = nil;
 
             if (size_step_aligned > 0) {
                 res->buffers[res->n_buffers].metal = [res->dev->mtl_device newBufferWithBytesNoCopy:(void *) ((uint8_t *) ptr + i) length:size_step_aligned options:MTLResourceStorageModeShared deallocator:nil];
@@ -1662,6 +1669,98 @@ void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
     }
 
     free(buf);
+}
+
+bool ggml_metal_buffer_park(ggml_metal_buffer_t buf) {
+    if (!buf || !buf->is_shared || !buf->owned) {
+        return false;
+    }
+
+    bool had_metal = false;
+    for (int i = 0; i < buf->n_buffers; i++) {
+        if (buf->buffers[i].metal != nil) {
+            had_metal = true;
+            break;
+        }
+    }
+
+    if (had_metal) {
+        ggml_metal_device_rsets_rm(buf->dev, buf->rset);
+        ggml_metal_buffer_rset_free(buf);
+        buf->rset = nil;
+
+        for (int i = 0; i < buf->n_buffers; i++) {
+            [buf->buffers[i].metal release];
+            buf->buffers[i].metal = nil;
+        }
+    }
+
+    // Host pages stay committed. MADV_FREE_REUSABLE lets iOS discard them under
+    // CLIP pressure; unpark then wraps zeros / GPU-faults the first decode.
+
+    GGML_LOG_INFO("%s: parked %.2f MiB (metal=%s) allocated now %.2f MiB\n",
+            __func__,
+            buf->all_size / 1024.0 / 1024.0,
+            had_metal ? "released" : "already-nil",
+            buf->dev->mtl_device.currentAllocatedSize / 1024.0 / 1024.0);
+    fprintf(stderr, "[ggml-metal] park: %.2f MiB metal=%s allocated now %.2f MiB\n",
+            buf->all_size / 1024.0 / 1024.0,
+            had_metal ? "released" : "already-nil",
+            buf->dev->mtl_device.currentAllocatedSize / 1024.0 / 1024.0);
+    fflush(stderr);
+    return true;
+}
+
+bool ggml_metal_buffer_unpark(ggml_metal_buffer_t buf) {
+    if (!buf || !buf->is_shared || !buf->owned) {
+        return false;
+    }
+
+    bool need = false;
+    for (int i = 0; i < buf->n_buffers; i++) {
+        if (buf->buffers[i].metal == nil && buf->buffers[i].metal_size > 0) {
+            need = true;
+            break;
+        }
+    }
+    if (!need) {
+        return true;
+    }
+
+    for (int i = 0; i < buf->n_buffers; i++) {
+        if (buf->buffers[i].metal != nil) {
+            continue;
+        }
+        const size_t len = buf->buffers[i].metal_size;
+        if (len == 0 || buf->buffers[i].data == NULL) {
+            continue;
+        }
+        buf->buffers[i].metal = [buf->dev->mtl_device newBufferWithBytesNoCopy:buf->buffers[i].data
+                                                                        length:len
+                                                                       options:MTLResourceStorageModeShared
+                                                                   deallocator:nil];
+        if (buf->buffers[i].metal == nil) {
+            GGML_LOG_ERROR("%s: failed to rewrap buffer %d, size = %.2f MiB\n",
+                    __func__, i, len / 1024.0 / 1024.0);
+            return false;
+        }
+    }
+
+    if (!ggml_metal_buffer_rset_init(buf)) {
+        GGML_LOG_ERROR("%s: failed to re-init residency set\n", __func__);
+        return false;
+    }
+    ggml_metal_device_rsets_add(buf->dev, buf->rset);
+
+    GGML_LOG_INFO("%s: rewrapped %.2f MiB, allocated now %.2f MiB\n",
+            __func__,
+            buf->all_size / 1024.0 / 1024.0,
+            buf->dev->mtl_device.currentAllocatedSize / 1024.0 / 1024.0);
+    fprintf(stderr, "[ggml-metal] unpark: rewrapped %.2f MiB, allocated now %.2f MiB\n",
+            buf->all_size / 1024.0 / 1024.0,
+            buf->dev->mtl_device.currentAllocatedSize / 1024.0 / 1024.0);
+    fflush(stderr);
+    return true;
 }
 
 void * ggml_metal_buffer_get_base(ggml_metal_buffer_t buf) {

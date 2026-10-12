@@ -137,7 +137,8 @@ static void duplex_test_case(struct omni_context * ctx_omni,
     });
 
     int speak = 0, listen = 0, completed = 0;
-    double sum_decode = 0, sum_e2e = 0;
+    double sum_decode = 0, sum_e2e = 0, sum_encode = 0, sum_prefill = 0;
+    double speak_sum_decode = 0, speak_sum_e2e = 0, speak_sum_encode = 0, speak_sum_prefill = 0;
 
     for (int il = 0; il < cnt && !g_is_interrupted; ++il) {
         OmniDuplexFrameResult r;
@@ -146,14 +147,25 @@ static void duplex_test_case(struct omni_context * ctx_omni,
             break;
         }
         (r.is_speak ? speak : listen)++;
-        sum_decode += r.ms_decode;
-        sum_e2e    += r.ms_total;
+        sum_decode  += r.ms_decode;
+        sum_e2e     += r.ms_total;
+        sum_encode  += r.ms_encode;
+        sum_prefill += r.ms_prefill;
+        if (r.is_speak) {
+            speak_sum_decode  += r.ms_decode;
+            speak_sum_e2e     += r.ms_total;
+            speak_sum_encode  += r.ms_encode;
+            speak_sum_prefill += r.ms_prefill;
+        }
         completed++;
 
-        printf("--- Chunk %lld/%d --- decode %.1fms | e2e %.1fms | n_past %d | %s\n",
-               (long long)r.user_seq, cnt, r.ms_decode, r.ms_total, r.n_past_after,
+        // Per-chunk timing breakdown
+        printf("--- Chunk %lld/%d --- frame_id=%lld | n_past=%d | %s\n",
+               (long long)r.user_seq, cnt, (long long)r.frame_id, r.n_past_after,
                r.is_speak ? ("<|speak|> \"" + (r.text.size() > 60 ? r.text.substr(0,60)+"..." : r.text) + "\"").c_str()
                           : "<|listen|>");
+        printf("    [timing] encode=%.1fms | prefill=%.1fms | decode=%.1fms | e2e=%.1fms\n",
+               r.ms_encode, r.ms_prefill, r.ms_decode, r.ms_total);
     }
 
     if (producer.joinable()) producer.join();
@@ -161,11 +173,21 @@ static void duplex_test_case(struct omni_context * ctx_omni,
 
     double total_s = std::chrono::duration<double>(
         std::chrono::high_resolution_clock::now() - total_t0).count();
-    printf("\n=== Summary: %d/%d chunks, %.3fs | avg decode %.1fms | avg e2e %.1fms | speak %d listen %d ===\n",
-           completed, cnt, total_s,
-           completed ? sum_decode / completed : 0,
-           completed ? sum_e2e    / completed : 0,
-           speak, listen);
+    printf("\n=== Overall Summary: %d/%d chunks, %.3fs ===\n", completed, cnt, total_s);
+    printf("    All chunks (n=%d): avg encode %.1fms | prefill %.1fms | decode %.1fms | e2e %.1fms\n",
+           completed,
+           completed ? sum_encode  / completed : 0,
+           completed ? sum_prefill / completed : 0,
+           completed ? sum_decode  / completed : 0,
+           completed ? sum_e2e     / completed : 0);
+    printf("    Speak chunks (n=%d): avg encode %.1fms | prefill %.1fms | decode %.1fms | e2e %.1fms\n",
+           speak,
+           speak ? speak_sum_encode  / speak : 0,
+           speak ? speak_sum_prefill / speak : 0,
+           speak ? speak_sum_decode  / speak : 0,
+           speak ? speak_sum_e2e     / speak : 0);
+    printf("    Listen chunks (n=%d)\n", listen);
+    printf("    speak %d | listen %d\n", speak, listen);
 }
 
 // ==================== 帮助信息 ====================

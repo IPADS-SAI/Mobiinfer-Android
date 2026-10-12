@@ -8,6 +8,7 @@
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
+#include "llama-moe-slot.h"
 #include "llama-model.h"
 #include "llama-ext.h"
 #include "llama.h"
@@ -34,6 +35,7 @@ llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
     model(model),
+    moe_slots(model.moe_slot_bank_enabled() ? std::make_unique<llama_moe_slot_runtime>(model) : nullptr),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
@@ -58,12 +60,6 @@ llama_context::llama_context(
         cparams.n_rs_seq = 0;
     }
 
-    cparams.n_threads        = params.n_threads;
-    cparams.n_threads_batch  = params.n_threads_batch;
-    cparams.yarn_ext_factor  = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
-    cparams.yarn_attn_factor = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
-    cparams.yarn_beta_fast   = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
-    cparams.yarn_beta_slow   = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
     cparams.embeddings                  = params.embeddings;
     cparams.embeddings_pre_norm         = false;
     cparams.embeddings_pre_norm_masked  = false;
@@ -71,6 +67,10 @@ llama_context::llama_context(
     cparams.no_perf          = params.no_perf;
     cparams.pooling_type     = params.pooling_type;
     cparams.warmup           = false;
+    cparams.n_expert_used    = 0;
+
+    cparams.embeddings_layer_inp.resize(hparams.n_layer, false);
+    embd_layer_inp.resize(hparams.n_layer);
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
@@ -80,10 +80,33 @@ llama_context::llama_context(
                                hparams.n_ctx_orig_yarn != 0 ? hparams.n_ctx_orig_yarn :
                                                               hparams.n_ctx_train;
 
+    // note: without these, cparams.yarn_* stay uninitialised and cparams.yarn_attn_factor
+    //       ends up as 0, which ggml_rope_ext treats as the magnitude scale -> the rotated
+    //       dims of Q/K come out as zero on every full-attention layer.
+    //       n_threads/n_threads_batch are read by graph_compute() -> leaving them uninitialised
+    //       makes llama_set_n_threads() the only way to set them, so -t is ignored.
+    cparams.n_threads        = params.n_threads;
+    cparams.n_threads_batch  = params.n_threads_batch;
+    cparams.yarn_ext_factor  = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
+    cparams.yarn_attn_factor = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
+    cparams.yarn_beta_fast   = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
+    cparams.yarn_beta_slow   = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
+
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
+    cparams.ctx_other = nullptr;
+
     cparams.ctx_type          = params.ctx_type;
+
+    if (model.arch == LLM_ARCH_DFLASH) {
+        if (model.tok_embd == nullptr || model.output == nullptr) {
+            if (params.ctx_other == nullptr) {
+                throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
+            }
+            cparams.ctx_other = params.ctx_other;
+        }
+    }
 
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
@@ -918,6 +941,14 @@ float * llama_context::get_embeddings_pre_norm_ith(int32_t i) {
     }
 }
 
+float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
+    output_reorder();
+
+    GGML_ASSERT(lid < embd_layer_inp.size() && embd_layer_inp[lid].has_data());
+
+    return embd_layer_inp[lid].data;
+}
+
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
 
@@ -1105,6 +1136,17 @@ void llama_context::set_embeddings_pre_norm(bool value, bool masked) {
     cparams.embeddings_pre_norm_masked = masked;
 }
 
+void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
+    LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
+
+    GGML_ASSERT(lid < model.hparams.n_layer);
+
+    cparams.embeddings_layer_inp[lid] = enable;
+
+    // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
+    sched_need_reserve = true;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -1128,6 +1170,70 @@ void llama_context::set_warmup(bool value) {
 
     // warmups are usually with small batches, so no need to reserve
     //sched_need_reserve = true;
+}
+
+void llama_context::set_moe_lookahead_prefetch_depth(int32_t depth) {
+    if (!moe_slots) {
+        return;
+    }
+    if (depth < 0) {
+        depth = 0;
+    }
+    if (depth > 16) {
+        depth = 16;
+    }
+    if (moe_slots->lookahead_prefetch_depth() == depth) {
+        return;
+    }
+    synchronize();
+    moe_slots->set_lookahead_prefetch_depth(depth);
+    // prefetch on/off and depth change the decode graph (router x hidden + top-k).
+    sched_need_reserve = true;
+}
+
+int32_t llama_context::get_moe_lookahead_prefetch_depth() const {
+    return moe_slots ? moe_slots->lookahead_prefetch_depth() : 0;
+}
+
+void llama_context::park_moe_expert_memory() {
+    if (!moe_slots) {
+        return;
+    }
+    synchronize();
+    moe_slots->park_expert_memory();
+}
+
+void llama_context::prewarm_moe_experts() {
+    if (!moe_slots) {
+        return;
+    }
+    synchronize();
+    moe_slots->prewarm_experts();
+}
+
+void llama_context::set_n_expert_used(int32_t n) {
+    const int32_t n_max = (int32_t) model.hparams.n_expert_used;
+    if (n < 0) {
+        n = 0;
+    }
+    if (n > n_max) {
+        LLAMA_LOG_WARN("%s: n_expert_used %d > hparams max %d; clamping\n", __func__, n, n_max);
+        n = n_max;
+    }
+    if (cparams.n_expert_used == n) {
+        return;
+    }
+    synchronize();
+    cparams.n_expert_used = n;
+    LLAMA_LOG_DEBUG("%s: n_expert_used = %d (hparams max %d)\n", __func__, n, n_max);
+    sched_need_reserve = true;
+}
+
+int32_t llama_context::n_expert_used() const {
+    if (cparams.n_expert_used > 0) {
+        return cparams.n_expert_used;
+    }
+    return (int32_t) model.hparams.n_expert_used;
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
@@ -1246,7 +1352,85 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+namespace {
+// ── 前向探针（诊断，默认关闭）────────────────────────────────────────────────
+//
+// LLAMA_FW_PROBE=1 时，每一次前向（process_ubatch 返回）打一行：
+//
+//   [fw] ctx=T|D gtype=N rows=N ms=X moe=X readids=X install=X writeids=X
+//
+// 各项都是**本次前向的增量**（不是累计值），消费方直接按 rows 分组即可。
+//   ctx  T = 目标模型（挂了 MoE slot 运行时），D = 草稿模型
+//   rows 批宽：单 token decode = 1，投机验证 = n_max+1，prefill = ubatch 宽
+//
+// 为什么要它：C_k（k 行前向的真实成本）是判断「多验证一行回不回本」的唯一依据，
+// 而 llama-cli 只给整段 eval time，反推要靠拟合。这里直接量，避免拟合误差。
+//
+// LLAMA_FW_PROBE_SYNC=1 额外在打印前 ggml_backend_sched_synchronize：把「异步提交
+// 之后还剩多少 GPU 尾部没被 CPU 侧计时覆盖」也暴露出来。两种口径都测一次做对比。
+struct fw_probe_guard {
+    bool                    on;
+    bool                    do_sync;
+    int64_t                 t0;
+    llama_moe_slot_runtime * slots;
+    ggml_backend_sched_t    sched;
+    int                     rows;
+    int                     gtype;
+    llama_moe_slot_runtime::counters c0;
+
+    fw_probe_guard(bool on_, bool do_sync_, llama_moe_slot_runtime * slots_,
+                   ggml_backend_sched_t sched_, int rows_, int gtype_)
+        : on(on_), do_sync(do_sync_), t0(on_ ? ggml_time_us() : 0), slots(slots_),
+          sched(sched_), rows(rows_), gtype(gtype_), c0{} {
+        if (on && slots) {
+            c0 = slots->counters_snapshot();
+        }
+    }
+
+    ~fw_probe_guard() {
+        if (!on) {
+            return;
+        }
+        if (do_sync && sched) {
+            ggml_backend_sched_synchronize(sched);
+        }
+        const double ms = (ggml_time_us() - t0) / 1000.0;
+        if (!slots) {
+            fprintf(stderr, "[fw] ctx=D gtype=%d rows=%d ms=%.3f\n", gtype, rows, ms);
+            return;
+        }
+        const auto c1 = slots->counters_snapshot();
+        fprintf(stderr,
+                "[fw] ctx=T gtype=%d rows=%d ms=%.3f moe=%.3f readids=%.3f install=%.3f writeids=%.3f"
+                " miss=%lld mib=%.2f uniq=%lld\n",
+                gtype, rows, ms,
+                (c1.process  - c0.process)  / 1e6,
+                (c1.readids  - c0.readids)  / 1e6,
+                (c1.install  - c0.install)  / 1e6,
+                (c1.writeids - c0.writeids) / 1e6,
+                (long long) (c1.miss  - c0.miss),
+                (c1.bytes - c0.bytes) / (1024.0 * 1024.0),
+                (long long) (c1.unique - c0.unique));
+    }
+};
+} // namespace
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    if (moe_slots) {
+        moe_slots->ensure_unparked();
+    }
+    // 前向探针：见上面 fw_probe_guard 的说明。默认关闭，零开销。
+    static const bool fw_probe = [] {
+        const char * p = std::getenv("LLAMA_FW_PROBE");
+        return p && *p && *p != '0';
+    }();
+    static const bool fw_probe_sync = [] {
+        const char * p = std::getenv("LLAMA_FW_PROBE_SYNC");
+        return p && *p && *p != '0';
+    }();
+    fw_probe_guard fw_guard(fw_probe, fw_probe_sync, moe_slots.get(), sched.get(),
+                            (int) ubatch.n_tokens, (int) gtype);
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1330,7 +1514,12 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
     const auto & hparams = model.hparams;
 
-    const int64_t n_embd  = hparams.n_embd_inp();
+    // eagle3/DFlash: features as encoder input, and non-draft paths fall back to model's input dim
+    // a DFlash draft is fed raw concatenated target features rather than token embeddings,
+    // so its embd rows are n_embd_inp_enc() wide instead of n_embd_inp()
+    const int64_t n_embd = model.arch == LLM_ARCH_DFLASH && batch_inp.embd
+                         ? hparams.n_embd_inp_enc()
+                         : hparams.n_embd_inp();
     const int64_t n_vocab = model.vocab.n_tokens();
 
     // note: during encode, we always pass the full sequence starting from pos = 0
@@ -1824,6 +2013,17 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         auto * t_logits        = res->get_logits();
         auto * t_embd          = cparams.embeddings          ? res->get_embd()        : nullptr;
+        // [诊断] MB_DUMP_INP_EMBD=1 时把**输入** embedding 当作输出返回：
+        // 用来给 llama_model_token_embd() 的结果取真值做逐位比对。默认关闭。
+        {
+            static const bool dump_inp_embd = [] {
+                const char * e = std::getenv("MB_DUMP_INP_EMBD");
+                return e && *e && *e != '0';
+            }();
+            if (dump_inp_embd && res->get_inp_embd() != nullptr) {
+                t_embd = res->get_inp_embd();
+            }
+        }
         auto * t_h_pre_norm    = cparams.embeddings_pre_norm ? res->get_h_pre_norm()  : nullptr;
 
         if (t_embd && res->get_embd_pooled()) {
@@ -1904,6 +2104,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     }
             }
         }
+
+        extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
 
         // extract pre-norm embeddings (hidden state before the final output norm)
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -2022,9 +2224,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         has_embd   = true;
     }
 
-
     size_t backend_float_count = 0;
     size_t backend_token_count = 0;
+    size_t embd_layer_inp_float_count = 0;
 
     logits.size        = has_logits        ? n_vocab*n_outputs_max     : 0;
     embd.size          = has_embd          ? n_embd_out*n_outputs_max  : 0;
@@ -2034,6 +2236,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         // unmasked: pre-norm row exists for every token in the batch, not just
         // those flagged via batch.logits[i] -> size by token count instead.
         embd_pre_norm.size = (size_t) n_embd * n_batch;
+    }
+
+    for (bool enabled : cparams.embeddings_layer_inp) {
+        if (enabled) {
+            embd_layer_inp_float_count += (size_t) n_embd * n_batch;
+        }
     }
 
     // Allocate backend sampling output buffers if there are backend samplers configured.
@@ -2050,8 +2258,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
-        (logits.size + embd.size + embd_pre_norm.size + backend_float_count) * sizeof(float) +
-        (                                               backend_token_count) * sizeof(llama_token);
+        (logits.size + embd.size + embd_pre_norm.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
+        (                                                                         backend_token_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
@@ -2068,6 +2276,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             logits.data = nullptr;
             embd.data = nullptr;
             embd_pre_norm.data = nullptr;
+            for (auto & layer_inp : embd_layer_inp) {
+                layer_inp = {nullptr, 0};
+            }
         }
 
         auto * buft = ggml_backend_cpu_buffer_type();
@@ -2098,6 +2309,15 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     embd_pre_norm = has_embd_pre_norm ? buffer_view<float>{(float *) (base + offset), embd_pre_norm.size} : buffer_view<float>{nullptr, 0};
     offset += embd_pre_norm.size * sizeof(float);
+
+    for (uint32_t il = 0; il < embd_layer_inp.size(); ++il) {
+        if (cparams.embeddings_layer_inp[il]) {
+            embd_layer_inp[il] = buffer_view<float>{(float *) (base + offset), (size_t) n_embd * n_batch};
+            offset += embd_layer_inp[il].size * sizeof(float);
+        } else {
+            embd_layer_inp[il] = buffer_view<float>{nullptr, 0};
+        }
+    }
 
     if (has_sampling) {
         sampling.logits = {(float *) (base + offset), (size_t)(n_vocab*n_outputs_max)};
@@ -2143,6 +2363,34 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     return n_outputs_max;
 }
 
+void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+    for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
+        if (!cparams.embeddings_layer_inp[il]) {
+            continue;
+        }
+        if (!embd_layer_inp[il].has_data()) {
+            GGML_ABORT("output layer input buffer not allocated");
+        }
+        ggml_tensor * t = res->get_layer_inp((int) il);
+        if (!t) {
+            GGML_ABORT("layer input tensor not found");
+        }
+
+        const size_t nbytes = ggml_nbytes(t);
+        const size_t nfloats = nbytes / sizeof(float);
+        GGML_ASSERT(n_tokens > 0);
+        GGML_ASSERT(nfloats % n_tokens == 0);
+
+        const size_t row_floats = nfloats / n_tokens;
+        const size_t dst_offset = token_offset * row_floats;
+        GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
+
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+        GGML_ASSERT(backend != nullptr);
+        ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+    }
+}
+
 void llama_context::output_reorder() {
     const uint64_t n_vocab = model.vocab.n_tokens();
     const uint64_t n_embd  = model.hparams.n_embd;
@@ -2166,6 +2414,16 @@ void llama_context::output_reorder() {
         if (embd_pre_norm.size > 0) {
             for (uint64_t k = 0; k < n_embd; k++) {
                 std::swap(embd_pre_norm.data[i0*n_embd + k], embd_pre_norm.data[i1*n_embd + k]);
+            }
+        }
+
+        if (embd_layer_inp.size() > 0) {
+            for (int lid = 0; lid < (int) embd_layer_inp.size(); ++lid) {
+                if (embd_layer_inp[lid].size > 0) {
+                    for (uint64_t k = 0; k < n_embd; ++k) {
+                        std::swap(embd_layer_inp[lid].data[i0*n_embd + k], embd_layer_inp[lid].data[i1*n_embd + k]);
+                    }
+                }
             }
         }
 
@@ -2296,6 +2554,16 @@ llm_graph_params llama_context::graph_params(
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
+        /*.moe_slots   =*/ moe_slots.get(),
+        // MoE-SSD 阶段：批宽落在窗口覆盖范围内时才是「窗口阶段」。
+        //
+        // 判据必须与 llama-moe-slot 的 window_mode **逐字一致** —— 它同时决定运行期
+        // 往哪段槽位写、以及建图用哪套张量（每层 `.dec` 视图 vs prefill 共享视图）。
+        // 两处不一致 → 张量所指的槽段与实际写入的槽段错位 → 静默读错专家权重。
+        // n_tokens 本身不足以判断（单 token 的 prefill 与 decode 都是 1），
+        // 所以用运行期解析出来的同一个 window_max_rows。
+        /*.moe_decode_phase =*/ moe_slots != nullptr && moe_slots->decode_window() > 0 &&
+                                ubatch.n_tokens <= moe_slots->window_max_rows(),
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
@@ -3530,12 +3798,44 @@ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void *
     ctx->set_abort_callback(abort_callback, abort_callback_data);
 }
 
+void llama_set_moe_lookahead_prefetch_depth(llama_context * ctx, int32_t depth) {
+    if (ctx) {
+        ctx->set_moe_lookahead_prefetch_depth(depth);
+    }
+}
+
+int32_t llama_get_moe_lookahead_prefetch_depth(const llama_context * ctx) {
+    return ctx ? ctx->get_moe_lookahead_prefetch_depth() : 0;
+}
+
+void llama_moe_park_expert_memory(llama_context * ctx) {
+    if (ctx) {
+        ctx->park_moe_expert_memory();
+    }
+}
+
+void llama_moe_prewarm_experts(llama_context * ctx) {
+    if (ctx) {
+        ctx->prewarm_moe_experts();
+    }
+}
+
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
 }
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
+}
+
+void llama_set_n_expert_used(llama_context * ctx, int32_t n_expert_used) {
+    if (ctx) {
+        ctx->set_n_expert_used(n_expert_used);
+    }
+}
+
+int32_t llama_n_expert_used(const llama_context * ctx) {
+    return ctx ? ctx->n_expert_used() : 0;
 }
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {
@@ -3598,6 +3898,20 @@ float * llama_get_embeddings_pre_norm_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
     return ctx->get_embeddings_pre_norm_ith(i);
+}
+
+void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
+    ctx->set_embeddings_layer_inp(lid, value);
+}
+
+float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
+    ctx->synchronize();
+
+    return ctx->get_embeddings_layer_inp(lid);
+}
+
+llama_context * llama_get_ctx_other(struct llama_context * ctx) {
+    return ctx->get_cparams().ctx_other;
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
@@ -3692,6 +4006,10 @@ int32_t llama_set_adapter_cvec(
 //
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {
+    if (!ctx) {
+        return nullptr;
+    }
+
     return ctx->get_memory();
 }
 

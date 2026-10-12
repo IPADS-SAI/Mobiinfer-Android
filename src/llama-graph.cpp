@@ -4,6 +4,7 @@
 #include "llama-model.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
+#include "llama-moe-slot.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -506,7 +507,11 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
-    mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    // the mask is left unallocated when the graph only stores K/V without attending
+    // (e.g. DFlash's KV-injection pass)
+    if (self_kq_mask && self_kq_mask->buffer) {
+        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
     if (self_k_rot) {
         mctx->set_input_k_rot(self_k_rot);
@@ -911,6 +916,11 @@ void llm_graph_result::reset() {
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
+    t_h_pre_norm  = nullptr;
+
+    t_layer_inp.resize(LLAMA_MAX_LAYERS);
+    std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
+
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -939,7 +949,7 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
     }
 }
 
-void llm_graph_result::set_outputs() {
+void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);
     }
@@ -951,6 +961,15 @@ void llm_graph_result::set_outputs() {
     }
     if (t_h_pre_norm != nullptr) {
         ggml_set_output(t_h_pre_norm);
+    }
+    {
+        const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
+        for (size_t il = 0; il < embeddings_layer_inp.size(); ++il) {
+            if (embeddings_layer_inp[il]) {
+                GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
+                ggml_set_output(t_layer_inp[il]);
+            }
+        }
     }
     for (auto & [seq_id, t] : t_sampled) {
         if (t != nullptr) {
@@ -1035,7 +1054,10 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     n_embd_head_v    (hparams.n_embd_head_v()),
     n_embd_v_gqa     (hparams.n_embd_v_gqa()),
     n_expert         (hparams.n_expert),
-    n_expert_used    (cparams.warmup ? hparams.n_expert : hparams.n_expert_used),
+    n_expert_used    (cparams.warmup && params.moe_slots == nullptr ? hparams.n_expert
+                      : (cparams.n_expert_used > 0
+                         ? std::min((int64_t) cparams.n_expert_used, (int64_t) hparams.n_expert_used)
+                         : (int64_t) hparams.n_expert_used)),
     freq_base        (cparams.rope_freq_base),
     freq_scale       (cparams.rope_freq_scale),
     ext_factor       (cparams.yarn_ext_factor),
@@ -1054,6 +1076,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cvec             (params.cvec),
     loras            (params.loras),
     mctx             (params.mctx),
+    moe_slots        (params.moe_slots),
+    moe_decode_phase (params.moe_decode_phase),
     cross            (params.cross),
     samplers         (params.samplers),
     cb_func          (params.cb),
@@ -1606,7 +1630,77 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    ggml_tensor * selected_experts_mm = selected_experts;
+    if (moe_slots && moe_slots->uses_layer(il)) {
+        selected_experts_mm = moe_slots->build_slot_ids_tensor(ctx0, selected_experts, il);
+        cb(selected_experts_mm, "ffn_moe_slots", il);
+    }
+
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+
+    // ── A2：把 MoE 拆成两段，让「已驻留专家」的计算盖住「缺失专家」的读取 ──
+    //
+    // 结构（Metal 按 split 提交，所以这个顺序天然产生重叠）：
+    //   MTL0: [位置 0..split_at) 的 gate/up → swiglu → down    ← 提交后立刻开算
+    //   CPU : phase B 节点 —— 读那些被延后的缺失专家              ← 与上面的 GPU 重叠
+    //   MTL0: [位置 split_at..8) 同样的链
+    //   MTL0: concat 回原顺序 → 加权 → 求和
+    //
+    // 只拆 ids、不拆 weights：weights 是 [1, n_expert_used, n_tokens]，expert 维
+    // 与 token 维的步长交错，切出来是非连续视图（ggml 会断言）。concat 回原顺序后
+    // 再整体加权，求和顺序与不拆完全一致 —— 输出可逐字节校验。
+    //
+    // 只在「没有 bias / 没有 per-expert scale / 没有合并 gate_up」时启用，
+    // 其它情况回退到原路径。
+    // 只在 **decode 阶段**启用，用引擎既有的 `moe_decode_phase`（图缓存 key 的一部分）
+    // 而不是自己判断 n_tokens —— prefill 与 decode 本来就不必走同一套逻辑：
+    //   - prefill 是带宽受限（93% 时间在读），重叠延迟没有意义，反而多一次 matmul
+    //   - prefill 走 mul_mm_id，它的 map0 kernel 只对特定 ne20 预编译
+    //     （实测 ne20=7/5 编译失败），decode 走 mul_mv_id 没这个限制
+    if (moe_decode_phase &&
+        moe_slots && moe_slots->uses_layer(il) && moe_slots->matmul_split() > 0 &&
+        !weight_before_ffn && !gate_up_exps && gate_exps && up_exps && down_exps &&
+        !up_exps_b && !gate_exps_b && !down_exps_b &&
+        !up_exps_s && !gate_exps_s && !down_exps_s &&
+        (int) n_expert_used > moe_slots->matmul_split()) {
+        const int split_at = (int) n_expert_used - moe_slots->matmul_split();
+        auto slice_ids = [&](ggml_tensor * t, int lo, int hi) {
+            return ggml_view_2d(ctx0, t, hi - lo, n_tokens, t->nb[1], (size_t) lo * t->nb[0]);
+        };
+
+        ggml_tensor * ids_a = slice_ids(selected_experts_mm, 0, split_at);
+        ggml_tensor * u_a = build_lora_mm_id(up_exps,   cur, ids_a);
+        ggml_tensor * g_a = build_lora_mm_id(gate_exps, cur, ids_a);
+        ggml_tensor * d_a = build_lora_mm_id(down_exps, ggml_swiglu_split(ctx0, g_a, u_a), ids_a);
+        cb(d_a, "ffn_moe_split_a", il);
+        ggml_build_forward_expand(gf, d_a);
+
+        ggml_tensor * ids_full_b = moe_slots->build_deferred_trigger(ctx0, selected_experts_mm, d_a, il);
+        cb(ids_full_b, "ffn_moe_deferred_read", il);
+
+        ggml_tensor * ids_b = slice_ids(ids_full_b, split_at, (int) n_expert_used);
+        ggml_tensor * u_b = build_lora_mm_id(up_exps,   cur, ids_b);
+        ggml_tensor * g_b = build_lora_mm_id(gate_exps, cur, ids_b);
+        ggml_tensor * d_b = build_lora_mm_id(down_exps, ggml_swiglu_split(ctx0, g_b, u_b), ids_b);
+        cb(d_b, "ffn_moe_split_b", il);
+
+        ggml_tensor * cat = ggml_concat(ctx0, d_a, d_b, 1);   // [n_embd, n_expert_used, n_tokens]
+        ggml_tensor * wsum = ggml_mul(ctx0, cat, weights);
+        cb(wsum, "ffn_moe_weighted", il);
+        ggml_build_forward_expand(gf, wsum);
+
+        ggml_tensor * out = nullptr;
+        for (uint32_t i = 0; i < (uint32_t) n_expert_used; ++i) {
+            ggml_tensor * ei = ggml_view_2d(ctx0, wsum, n_embd, n_tokens, wsum->nb[2], (size_t) i * wsum->nb[1]);
+            ggml_build_forward_expand(gf, ei);
+            out = out ? ggml_add(ctx0, out, ei) : ei;
+        }
+        if (n_expert_used == 1) {
+            out = ggml_cont(ctx0, out);
+        }
+        cb(out, "ffn_moe_out", il);
+        return out;
+    }
 
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
@@ -1618,13 +1712,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
+
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts_mm); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (gate_up_exps_b) {
-            gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, selected_experts);
+            gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, selected_experts_mm);
             cb(gate_up, "ffn_moe_gate_up_biased", il);
         }
 
@@ -1644,11 +1739,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, selected_experts_mm); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_b) {
-            up = ggml_add_id(ctx0, up, up_exps_b, selected_experts);
+            up = ggml_add_id(ctx0, up, up_exps_b, selected_experts_mm);
             cb(up, "ffn_moe_up_biased", il);
         }
 
@@ -1662,14 +1757,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, selected_experts_mm); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
         }
 
         if (gate_exps_b) {
-            cur = ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
+            cur = ggml_add_id(ctx0, cur, gate_exps_b, selected_experts_mm);
             cb(cur, "ffn_moe_gate_biased", il);
         }
 
@@ -1752,11 +1847,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, selected_experts_mm); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_b) {
-        experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
+        experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts_mm);
         cb(experts, "ffn_moe_down_biased", il);
     }
 
@@ -1877,6 +1972,20 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     }
 
     res->t_inp_embd = cur;
+
+    // [诊断] MB_DUMP_INP_EMBD=1 时把输入 embedding 真正建成图输出。
+    // 不这么做的话它只是个中间张量，缓冲区会被调度器复用，读出来是别的数据。
+    // 默认关闭，不影响任何正常路径。
+    {
+        static const bool dump_inp_embd = [] {
+            const char * e = std::getenv("MB_DUMP_INP_EMBD");
+            return e && *e && *e != '0';
+        }();
+        if (dump_inp_embd) {
+            ggml_set_output(cur);
+            ggml_build_forward_expand(gf, cur);
+        }
+    }
 
     // For Granite architecture
     if (hparams.f_embedding_scale != 0.0f) {

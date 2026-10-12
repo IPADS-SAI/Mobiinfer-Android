@@ -112,7 +112,27 @@ MTMD_API mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
 
 MTMD_API void mtmd_free(mtmd_context * ctx);
 
+// live-update MiniCPM-V slice cap; next image encode picks it up. 1 = overview only
 MTMD_API void mtmd_set_image_max_slice_nums(mtmd_context * ctx, int n);
+
+// Drop the CLIP (vision/audio encoder) weights while keeping the rest of the context --
+// tokenizer, media marker, slice templates and per-projection metadata -- alive.
+//
+// Text-only use keeps working afterwards: mtmd_tokenize() with no bitmaps and
+// mtmd_helper_eval_chunk_single() on a text chunk never touch the CLIP context, so a
+// text-only conversation needs no reload. Only operations that actually consume a
+// bitmap (mtmd_tokenize() with n_bitmaps > 0, mtmd_encode_chunk) need the weights back.
+//
+// Returns true if weights were resident and have been released.
+MTMD_API bool mtmd_vision_unload(mtmd_context * ctx);
+
+// Re-create the CLIP context from the mmproj file recorded at init time, reusing the
+// parameters the context was built with (including any later mtmd_set_image_max_slice_nums).
+// No-op returning true if the weights are already resident.
+MTMD_API bool mtmd_vision_reload(mtmd_context * ctx);
+
+// Whether the encoder weights are currently resident.
+MTMD_API bool mtmd_vision_loaded(const mtmd_context * ctx);
 
 // whether we need to set non-causal mask before llama_decode
 // if chunk is nullptr, we assume the default case where chunk is an image chunk

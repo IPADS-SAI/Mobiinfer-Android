@@ -56,6 +56,12 @@ GGML_BACKEND_API void ggml_backend_metal_capture_next_compute(ggml_backend_t bac
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
 
+// Park/unpark an owned shared Metal buffer: release the MTLBuffer (drops
+// currentAllocatedSize); unpark rewraps the same virtual address. Host pages
+// stay committed. GPU must be idle. Returns false if not applicable.
+GGML_BACKEND_API bool ggml_backend_metal_buffer_park  (ggml_backend_buffer_t buffer);
+GGML_BACKEND_API bool ggml_backend_metal_buffer_unpark(ggml_backend_buffer_t buffer);
+
 #ifdef __cplusplus
 }
 #endif
