@@ -1348,9 +1348,13 @@ struct llama_moe_slot_runtime::impl {
 #ifndef _WIN32
         std::lock_guard<std::mutex> lock(fd_mutex);
         for (const auto & kv : fds) {
+#ifdef F_NOCACHE
             if (fcntl(kv.second, F_NOCACHE, on ? 1 : 0) != 0) {
                 moe_log("F_NOCACHE 切换失败: %s", std::strerror(errno));
             }
+#else
+            (void) kv;
+#endif
         }
 #endif
         // 只在每个方向各打一次，避免长会话刷屏。
@@ -1372,9 +1376,11 @@ struct llama_moe_slot_runtime::impl {
         const int fd = _open(path.c_str(), _O_RDONLY | _O_BINARY);
 #else
         const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+#ifdef F_NOCACHE
         if (experts_nocache_desired() && fcntl(fd, F_NOCACHE, 1) != 0) {
             moe_log("F_NOCACHE 设置失败: %s", std::strerror(errno));
         }
+#endif
 #endif
         if (fd < 0) {
             throw std::runtime_error(format("failed to open MoE experts file '%s': %s", path.c_str(), std::strerror(errno)));

@@ -2563,9 +2563,9 @@ kernel void kernel_gated_delta_net_impl(
 
     const float scale = 1.0f / sqrt((float)S_v);
 
-    // input state layout (D, K, n_seqs): per-seq stride is K*H*D; we read slot 0.
+    // input state layout [S_v, S_v, H, n_seqs] (s0 only): per-seq stride is H*D.
     // state is stored transposed: M[i20][is] = S[is][i20], so row i20 is contiguous
-    const uint state_in_base = (i23*K*args.ne21 + i21)*S_v*S_v + i20*S_v;
+    const uint state_in_base = (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
     device const float * s_ptr = (device const float *) (s) + state_in_base;
 
     float ls[NSG];
@@ -2584,9 +2584,8 @@ kernel void kernel_gated_delta_net_impl(
     device const float * b_ptr = (device const float *) (b) + (i23*args.ne22*args.ne21 + i21);
     device const float * g_ptr = (device const float *) (g) + (i23*args.ne22*args.ne21 + i21)*G;
 
-    // snapshot slot mapping: target_slot = t - shift. When n_tokens < K, only the last
-    // n_tokens slots are written; earlier slots are left untouched (caller-owned).
-    const int shift = (int)args.ne22 - (int)K;
+    // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
+    // When n_tokens < K, only slots 0..n_tokens-1 are written; older slots are caller-owned.
 
     // output state base offset: after attention scores
     const uint attn_size = args.ne22 * args.ne21 * S_v * args.ne23;
@@ -2644,7 +2643,7 @@ kernel void kernel_gated_delta_net_impl(
         g_ptr += args.ne21*G;
 
         if (K > 1) {
-            const int target_slot = (int)t - shift;
+            const int target_slot = (int)args.ne22 - 1 - (int)t;
             if (target_slot >= 0 && target_slot < (int)K) {
                 device float * dst_state = (device float *) (dst) + attn_size + (uint)target_slot * state_size_per_snap + state_out_base;
                 FOR_UNROLL (short j = 0; j < NSG; j++) {
@@ -4385,14 +4384,15 @@ kernel void kernel_rope_norm(
     float sin_theta;
 
     for (int i0 = 2*tiitg; i0 < args.ne0; i0 += 2*tptg.x) {
-        if (i0 < args.n_dims) {
-            const int ic = i0/2;
+        if (i0 >= args.n_offs && i0 < args.n_offs + args.n_dims) {
+            const int iw = i0 - args.n_offs; // relative idx
+            const int ic = iw/2;
 
-            const float theta = theta_base * pow(args.freq_base, inv_ndims*i0);
+            const float theta = theta_base * pow(args.freq_base, inv_ndims*iw);
 
             const float freq_factor = args.src2 ? ((device const float *) src2)[ic] : 1.0f;
 
-            rope_yarn(theta/freq_factor, args.freq_scale, corr_dims, i0, args.ext_factor, args.attn_factor, &cos_theta, &sin_theta);
+            rope_yarn(theta/freq_factor, args.freq_scale, corr_dims, iw, args.ext_factor, args.attn_factor, &cos_theta, &sin_theta);
 
             device const T * const src = (device T *)(src0 + i3*args.nb03 + i2*args.nb02 + i1*args.nb01 + i0*args.nb00);
             device       T * dst_data  = (device T *)( dst + i3*args.nb3  + i2*args.nb2  + i1*args.nb1  + i0*args.nb0);
@@ -4403,6 +4403,10 @@ kernel void kernel_rope_norm(
             dst_data[0] = x0*cos_theta - x1*sin_theta;
             dst_data[1] = x0*sin_theta + x1*cos_theta;
         } else {
+            if (args.inplace) {
+                continue;
+            }
+
             device const T * const src = (device T *)(src0 + i3*args.nb03 + i2*args.nb02 + i1*args.nb01 + i0*args.nb00);
             device       T * dst_data  = (device T *)( dst + i3*args.nb3  + i2*args.nb2  + i1*args.nb1  + i0*args.nb0);
 
@@ -4438,17 +4442,18 @@ kernel void kernel_rope_neox(
     float sin_theta;
 
     for (int i0 = 2*tiitg; i0 < args.ne0; i0 += 2*tptg.x) {
-        if (i0 < args.n_dims) {
-            const int ic = i0/2;
+        if (i0 >= args.n_offs && i0 < args.n_offs + args.n_dims) {
+            const int iw = i0 - args.n_offs; // relative idx
+            const int ic = iw/2;
 
-            const float theta = theta_base * pow(args.freq_base, inv_ndims*i0);
+            const float theta = theta_base * pow(args.freq_base, inv_ndims*iw);
 
             const float freq_factor = args.src2 ? ((device const float *) src2)[ic] : 1.0f;
 
-            rope_yarn(theta/freq_factor, args.freq_scale, corr_dims, i0, args.ext_factor, args.attn_factor, &cos_theta, &sin_theta);
+            rope_yarn(theta/freq_factor, args.freq_scale, corr_dims, iw, args.ext_factor, args.attn_factor, &cos_theta, &sin_theta);
 
-            device const T * const src = (device T *)(src0 + i3*args.nb03 + i2*args.nb02 + i1*args.nb01 + ic*args.nb00);
-            device       T * dst_data  = (device T *)( dst + i3*args.nb3  + i2*args.nb2  + i1*args.nb1  + ic*args.nb0);
+            device const T * const src = (device T *)(src0 + i3*args.nb03 + i2*args.nb02 + i1*args.nb01 + (args.n_offs + ic)*args.nb00);
+            device       T * dst_data  = (device T *)( dst + i3*args.nb3  + i2*args.nb2  + i1*args.nb1  + (args.n_offs + ic)*args.nb0);
 
             const float x0 = src[0];
             const float x1 = src[args.n_dims/2];
@@ -4456,6 +4461,10 @@ kernel void kernel_rope_neox(
             dst_data[0]             = x0*cos_theta - x1*sin_theta;
             dst_data[args.n_dims/2] = x0*sin_theta + x1*cos_theta;
         } else {
+            if (args.inplace) {
+                continue;
+            }
+
             device const T * const src = (device T *)(src0 + i3*args.nb03 + i2*args.nb02 + i1*args.nb01 + i0*args.nb00);
             device       T * dst_data  = (device T *)( dst + i3*args.nb3  + i2*args.nb2  + i1*args.nb1  + i0*args.nb0);
 
@@ -4490,8 +4499,9 @@ kernel void kernel_rope_multi(
     float sin_theta;
 
     for (int i0 = 2*tiitg; i0 < args.ne0; i0 += 2*tptg.x) {
-        if (i0 < args.n_dims) {
-            const int ic = i0/2;
+        if (i0 >= args.n_offs && i0 < args.n_offs + args.n_dims) {
+            const int iw = i0 - args.n_offs; // relative idx
+            const int ic = iw/2;
 
             // mrope theta calculations
             // note: the rest is the same as kernel_rope_neox
@@ -4524,14 +4534,14 @@ kernel void kernel_rope_multi(
             }
             // end of mrope
 
-            const float theta = theta_base * pow(args.freq_base, inv_ndims*i0);
+            const float theta = theta_base * pow(args.freq_base, inv_ndims*iw);
 
             const float freq_factor = args.src2 ? ((device const float *) src2)[ic] : 1.0f;
 
-            rope_yarn(theta/freq_factor, args.freq_scale, corr_dims, i0, args.ext_factor, args.attn_factor, &cos_theta, &sin_theta);
+            rope_yarn(theta/freq_factor, args.freq_scale, corr_dims, iw, args.ext_factor, args.attn_factor, &cos_theta, &sin_theta);
 
-            device const T * const src = (device T *)(src0 + i3*args.nb03 + i2*args.nb02 + i1*args.nb01 + ic*args.nb00);
-            device       T * dst_data  = (device T *)( dst + i3*args.nb3  + i2*args.nb2  + i1*args.nb1  + ic*args.nb0);
+            device const T * const src = (device T *)(src0 + i3*args.nb03 + i2*args.nb02 + i1*args.nb01 + (args.n_offs + ic)*args.nb00);
+            device       T * dst_data  = (device T *)( dst + i3*args.nb3  + i2*args.nb2  + i1*args.nb1  + (args.n_offs + ic)*args.nb0);
 
             const float x0 = src[0];
             const float x1 = src[args.n_dims/2];
@@ -4539,6 +4549,10 @@ kernel void kernel_rope_multi(
             dst_data[0]             = x0*cos_theta - x1*sin_theta;
             dst_data[args.n_dims/2] = x0*sin_theta + x1*cos_theta;
         } else {
+            if (args.inplace) {
+                continue;
+            }
+
             device const T * const src = (device T *)(src0 + i3*args.nb03 + i2*args.nb02 + i1*args.nb01 + i0*args.nb00);
             device       T * dst_data  = (device T *)( dst + i3*args.nb3  + i2*args.nb2  + i1*args.nb1  + i0*args.nb0);
 

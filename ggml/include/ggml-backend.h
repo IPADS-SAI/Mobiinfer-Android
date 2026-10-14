@@ -34,16 +34,18 @@ extern "C" {
     // Backend buffer type
     //
 
-    GGML_API const char *          ggml_backend_buft_name          (ggml_backend_buffer_type_t buft);
-    GGML_API ggml_backend_buffer_t ggml_backend_buft_alloc_buffer  (ggml_backend_buffer_type_t buft, size_t size);
-    GGML_API size_t                ggml_backend_buft_get_alignment (ggml_backend_buffer_type_t buft);
-    GGML_API size_t                ggml_backend_buft_get_max_size  (ggml_backend_buffer_type_t buft);
-    GGML_API size_t                ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
-    GGML_API bool                  ggml_backend_buft_is_host       (ggml_backend_buffer_type_t buft);
+    GGML_API const char *          ggml_backend_buft_name            (ggml_backend_buffer_type_t buft);
+    GGML_API ggml_backend_buffer_t ggml_backend_buft_alloc_buffer    (ggml_backend_buffer_type_t buft, size_t size);
+    GGML_API ggml_backend_buffer_t ggml_backend_buft_alloc_buffer_n  (ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors);
+    GGML_API size_t                ggml_backend_buft_get_alignment   (ggml_backend_buffer_type_t buft);
+    GGML_API size_t                ggml_backend_buft_get_max_size    (ggml_backend_buffer_type_t buft);
+    GGML_API size_t                ggml_backend_buft_get_alloc_size  (ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
+    GGML_API size_t                ggml_backend_buft_get_alloc_size_n(ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors);
+    GGML_API bool                  ggml_backend_buft_is_host         (ggml_backend_buffer_type_t buft);
     // true if tensor->data in this buffer type is a valid pointer that the CPU can read/write directly,
     // even when the buffer is not a plain host buffer (e.g. unified-memory device buffers)
     GGML_API bool                  ggml_backend_buft_is_host_addressable(ggml_backend_buffer_type_t buft);
-    GGML_API ggml_backend_dev_t    ggml_backend_buft_get_device    (ggml_backend_buffer_type_t buft);
+    GGML_API ggml_backend_dev_t    ggml_backend_buft_get_device      (ggml_backend_buffer_type_t buft);
 
     //
     // Backend buffer
@@ -159,6 +161,8 @@ extern "C" {
         bool buffer_from_host_ptr;
         // event synchronization
         bool events;
+        // mmap is supported for loading
+        bool mmap_support;
     };
 
     // all the device properties
