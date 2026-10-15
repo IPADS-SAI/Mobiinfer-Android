@@ -8,12 +8,19 @@ struct llama_model;
 
 class llama_moe_slot_runtime {
 public:
+    static constexpr int max_prefetch_depth = 16;
+    // Model allocation and runtime must reserve the same number of slots.
+    static int normalize_prefetch_depth(int bank, int requested) {
+        const int depth = requested < 0 ? 0 : (requested > max_prefetch_depth ? max_prefetch_depth : requested);
+        return bank >= 2 * depth + 8 ? depth : 0;
+    }
     explicit llama_moe_slot_runtime(const llama_model & model);
     ~llama_moe_slot_runtime();
 
     bool uses_layer(int layer) const;
     bool lookahead_prefetch_enabled() const;
     int  lookahead_prefetch_depth() const;
+    int  lookahead_prefetch_max_rows() const;
     /// 每层 decode 窗口宽度（slot 数）。0 = 未启用按层窗口。
     int  decode_window() const;
     /// 窗口覆盖的最大批宽（行数）。1 = 只服务单 token decode；>1 时投机验证

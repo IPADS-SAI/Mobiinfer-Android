@@ -6,6 +6,7 @@
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-moe-experts.h"
+#include "llama-moe-slot.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
 
@@ -2212,8 +2213,8 @@ int32_t llama_model::moe_prefetch_slots() const {
         return 0;
     }
     const char * d = std::getenv("LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH");
-    int32_t k = d ? atoi(d) : 8;
-    return std::max(0, std::min(k, 64));
+    const int32_t k = d ? atoi(d) : 8;
+    return llama_moe_slot_runtime::normalize_prefetch_depth(params.moe_slot_bank, k);
 }
 
 const llama_moe_experts_entry * llama_model::moe_experts_entry(const char * tensor_name) const {
