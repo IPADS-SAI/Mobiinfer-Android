@@ -148,6 +148,7 @@ static size_t opt_mbuf_dyn    = 512ul * 1024 * 1024;      // max dynamic (comput
 static size_t opt_mbuf_static = 1ul * 1024 * 1024 * 1024; // max static (weight/KV) buffer size
 static size_t opt_mbuf_total  = 0;                        // total buffer space limit (0 = unconstrained)
 
+static int    opt_moe_hmx_min_rows = HTP_MM_HMX_MIN_NROWS;
 static int    opt_mm_select  = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 static int    opt_fa_select  = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 static int    opt_fa_head_split = 1; // 1 = partition flash_attn by KV heads in multicore (default on), 0 = token-based (original)
@@ -660,6 +661,7 @@ struct ggml_backend_hexagon_device_context {
     ggml_backend_buffer_type buffer_type       = {};
     ggml_backend_buffer_type host_buffer_type  = {};
     ggml_backend_buffer_type fence_buffer_type = {};
+    ggml_backend_buffer_type alloc_only_buffer_type = {};
 
     std::unique_ptr<ggml_hexagon_session> sess;
 
@@ -896,6 +898,16 @@ static enum ggml_status ggml_backend_hexagon_buffer_init_tensor(ggml_backend_buf
     sbuf->tensor_extra.push_back(extra);
 
     tensor->extra = extra;
+    auto dev_ctx = static_cast<ggml_backend_hexagon_buffer_type_context *>(buffer->buft->context)->dev_ctx;
+    if (buffer->buft == &dev_ctx->alloc_only_buffer_type && ggml_hexagon_is_repack_type(tensor->type)) {
+        extra->flags |= GGML_HEXAGON_TENSOR_REPACK | GGML_HEXAGON_TENSOR_WEIGHT;
+        if (tensor->view_src) {
+            const size_t raw_stride = ggml_row_size(tensor->type, tensor->ne[0]) * tensor->ne[1];
+            GGML_ASSERT(raw_stride && tensor->view_offs % raw_stride == 0);
+            const size_t tiled_stride = ggml_hexagon_tiled_row_size(tensor->type, hex_round_up(tensor->ne[0], 32)) * hex_round_up(tensor->ne[1], 32);
+            tensor->data = (uint8_t *) tensor->view_src->data + (tensor->view_offs / raw_stride) * tiled_stride;
+        }
+    }
     if (ggml_hexagon_is_repack_type(tensor->type)) {
         if (sess->needs_repack.count(tensor)) {
             extra->flags |= GGML_HEXAGON_TENSOR_REPACK;
@@ -2878,6 +2890,12 @@ static bool ggml_backend_hexagon_buffer_type_is_host(ggml_backend_buffer_type_t 
     GGML_UNUSED(buft);
 }
 
+static bool ggml_backend_hexagon_buffer_type_is_host_addressable(ggml_backend_buffer_type_t buft) {
+    // rpcmem exposes a writable CPU mapping of shared DSP memory.
+    GGML_UNUSED(buft);
+    return true;
+}
+
 static bool ggml_backend_hexagon_host_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
     return true;
     GGML_UNUSED(buft);
@@ -3066,6 +3084,7 @@ static ggml_backend_buffer_type_i ggml_backend_hexagon_buffer_type_interface = {
     /* .get_alloc_size      = */ ggml_backend_hexagon_buffer_type_get_alloc_size,
     /* .get_alloc_size_n    = */ ggml_backend_hexagon_buffer_type_get_alloc_size_n,
     /* .is_host             = */ ggml_backend_hexagon_buffer_type_is_host,
+    /* .is_host_addressable = */ ggml_backend_hexagon_buffer_type_is_host_addressable,
 };
 
 static ggml_backend_buffer_type_i ggml_backend_hexagon_host_buffer_type_interface = {
@@ -3089,6 +3108,11 @@ ggml_backend_hexagon_device_context::ggml_backend_hexagon_device_context(int dev
     host_buffer_type.iface   = ggml_backend_hexagon_host_buffer_type_interface;
     host_buffer_type.context = new ggml_backend_hexagon_buffer_type_context(config.name + "-HOST", this);
 
+    // Runtime expert slots must not share the model file mapping.
+    alloc_only_buffer_type.device = dev;
+    alloc_only_buffer_type.iface = ggml_backend_hexagon_buffer_type_interface;
+    alloc_only_buffer_type.context = new ggml_backend_hexagon_buffer_type_context(config.name + "-ALLOC", this);
+
     fence_buffer_type.device  = dev;
     fence_buffer_type.iface   = ggml_backend_hexagon_buffer_type_interface;
     fence_buffer_type.context = new ggml_backend_hexagon_buffer_type_context(config.name + "-FENCE", this);
@@ -3098,6 +3122,7 @@ ggml_backend_hexagon_device_context::~ggml_backend_hexagon_device_context() {
     delete static_cast<ggml_backend_hexagon_buffer_type_context *>(buffer_type.context);
     delete static_cast<ggml_backend_hexagon_buffer_type_context *>(host_buffer_type.context);
     delete static_cast<ggml_backend_hexagon_buffer_type_context *>(fence_buffer_type.context);
+    delete static_cast<ggml_backend_hexagon_buffer_type_context *>(alloc_only_buffer_type.context);
 }
 
 static bool ggml_backend_buffer_is_hexagon(const struct ggml_backend_buffer * b) {
@@ -5474,7 +5499,11 @@ static bool ggml_hexagon_matmul_is_hmx_eligible(
     // M alignment: Use HMX when M > HTP_MM_HMX_MIN_NROWS.
     // For MUL_MAT_ID, src1 shape is [K, n_expert_used, n_tokens, 1], so n_tokens is ne12.
     const int m = is_matmul_id ? ne12 : ne11;
-    if (m <= HTP_MM_HMX_MIN_NROWS) {
+    // Small speculative batches may have only one or two rows per expert.
+    // Keep dense matmul unchanged; an optional higher MoE threshold avoids
+    // padded HMX work and repeated expert dequantization in that case.
+    const int min_rows = is_matmul_id ? opt_moe_hmx_min_rows : HTP_MM_HMX_MIN_NROWS;
+    if (m <= min_rows) {
         return false;
     }
 
@@ -9591,7 +9620,8 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
 static bool ggml_backend_hexagon_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
 
-    bool supp = (buft == &dev_ctx->host_buffer_type) || (buft == &dev_ctx->buffer_type);
+    bool supp = (buft == &dev_ctx->host_buffer_type) || (buft == &dev_ctx->buffer_type) ||
+                (buft == &dev_ctx->alloc_only_buffer_type);
 
     HEX_VERBOSE("ggml-hex: %s device-supports-buft %s %s\n", dev_ctx->c_name(), ggml_backend_buft_name(buft), supp ? "yes" : "no");
     return supp;
@@ -9827,8 +9857,54 @@ static ggml_backend_buffer_type_t ggml_backend_hexagon_split_buffer_type(int mai
     return &dev_ctx->buffer_type;
 }
 
+static bool ggml_backend_hexagon_upload_moe_expert(ggml_tensor * tensor, int32_t slot, const void * data, size_t size) {
+    if (!tensor || !tensor->buffer || !ggml_backend_buffer_is_hexagon(tensor->buffer) ||
+        slot < 0 || slot >= tensor->ne[2] || tensor->ne[3] != 1 ||
+        size != (size_t) tensor->nb[2] || !ggml_hexagon_is_repack_type(tensor->type)) return false;
+    // alloc-only view initialization converts GGUF offsets to padded DSP offsets.
+    ggml_tensor slice = *tensor;
+    const size_t stride = ggml_hexagon_tiled_row_size(tensor->type, hex_round_up(tensor->ne[0], 32)) * hex_round_up(tensor->ne[1], 32);
+    slice.ne[2] = slice.ne[3] = 1;
+    slice.data = (uint8_t *) tensor->data + (size_t) slot * stride;
+    auto extra = static_cast<ggml_hexagon_tensor_extra *>(tensor->extra);
+    extra->flags |= GGML_HEXAGON_TENSOR_REPACK | GGML_HEXAGON_TENSOR_WEIGHT;
+    repack_tensor_tiled(&slice, data, size);
+    return true;
+}
+
+static ggml_backend_buffer_type_t ggml_backend_hexagon_buffer_type_alloc_only(size_t device) {
+    auto reg = ggml_backend_hexagon_reg();
+    if (device >= ggml_backend_reg_dev_count(reg)) return nullptr;
+    auto dev = ggml_backend_reg_dev_get(reg, device);
+    auto ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
+    return &ctx->alloc_only_buffer_type;
+}
+
+// Offline conversion uses the exact same layout as live expert upload.
+static size_t ggml_backend_hexagon_pack_moe_expert(void * dst, const void * src, int type, int64_t ne0, int64_t ne1) {
+    if (ne0 <= 0 || ne1 <= 0 || !ggml_hexagon_is_repack_type((ggml_type) type)) return 0;
+    const size_t bytes = ggml_hexagon_tiled_row_size((ggml_type) type, hex_round_up(ne0, 32)) * hex_round_up(ne1, 32);
+    if (dst && src) {
+        ggml_tensor tensor = {};
+        tensor.type = (ggml_type) type;
+        tensor.ne[0] = ne0; tensor.ne[1] = ne1; tensor.ne[2] = tensor.ne[3] = 1;
+        tensor.data = dst;
+        repack_tensor_tiled(&tensor, src, ggml_row_size(tensor.type, ne0) * ne1);
+    }
+    return bytes;
+}
+
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_pack_moe_expert") == 0) {
+        return (void *) ggml_backend_hexagon_pack_moe_expert;
+    }
+    if (strcmp(name, "ggml_backend_upload_moe_expert") == 0) {
+        return (void *) ggml_backend_hexagon_upload_moe_expert;
+    }
+    if (strcmp(name, "ggml_backend_dev_buffer_type_alloc_only") == 0) {
+        return (void *) ggml_backend_hexagon_buffer_type_alloc_only;
+    }
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
         return (void *) ggml_backend_hexagon_split_buffer_type;
     }
@@ -9983,6 +10059,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_nhvx     = getenv("GGML_HEXAGON_NHVX");
     const char * str_nhmx     = getenv("GGML_HEXAGON_NHMX");
     const char * str_mm_select = getenv("GGML_HEXAGON_MM_SELECT");
+    const char * str_moe_hmx_min_rows = getenv("GGML_HEXAGON_MOE_HMX_MIN_ROWS");
     const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
     const char * str_fa_head_split = getenv("GGML_HEXAGON_FA_HEAD_SPLIT");
     const char * str_gdn_select = getenv("GGML_HEXAGON_GDN_SELECT");
@@ -10047,6 +10124,10 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_nhvx      = str_nhvx     ? strtoul(str_nhvx, NULL, 0)             : opt_nhvx;
     opt_nhmx      = str_nhmx     ? atoi(str_nhmx)                         : opt_nhmx;
     opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
+    if (str_moe_hmx_min_rows) {
+        opt_moe_hmx_min_rows = std::max((int) HTP_MM_HMX_MIN_NROWS, std::min(4096, atoi(str_moe_hmx_min_rows)));
+        GGML_LOG_INFO("ggml-hex: MoE HMX threshold > %d rows\n", opt_moe_hmx_min_rows);
+    }
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
     opt_fa_head_split = str_fa_head_split ? atoi(str_fa_head_split)       : opt_fa_head_split;
     opt_gdn_select    = str_gdn_select    ? atoi(str_gdn_select)          : opt_gdn_select;

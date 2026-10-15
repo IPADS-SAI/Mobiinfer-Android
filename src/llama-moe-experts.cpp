@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -79,6 +80,16 @@ llama_moe_experts::llama_moe_experts(const char * input_path) {
     const std::string layout = manifest.value("layout", std::string());
     if (layout != "layer_major_expert" && layout != "expert_major") {
         throw std::runtime_error(format("MoE experts layout '%s' is not expert-major", layout.c_str()));
+    }
+
+    if (manifest.contains("backend_layout")) {
+        if (manifest.value("backend_layout", std::string()) != "hexagon-tiled-v1") {
+            throw std::runtime_error("unsupported backend expert layout");
+        }
+        const char * packed_dir = std::getenv("LLAMA_MOE_HTP_PACKED_DIR");
+        if (!packed_dir || !*packed_dir || !fs::equivalent(fs::path(packed_dir), manifest_dir)) {
+            throw std::runtime_error("tiled expert manifest requires LLAMA_MOE_HTP_PACKED_DIR pointing at its directory");
+        }
     }
 
     const auto & model = manifest.at("model");

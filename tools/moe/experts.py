@@ -247,18 +247,18 @@ def verify(args: argparse.Namespace) -> int:
             if args.metadata_only:
                 continue
 
-            experts = experts.get(entry["repacked_file"])
-            if experts is None:
-                experts = stack.enter_context((manifest_path.parent / entry["repacked_file"]).open("rb"))
-                experts[entry["repacked_file"]] = experts
+            expert_file = experts.get(entry["repacked_file"])
+            if expert_file is None:
+                expert_file = stack.enter_context((manifest_path.parent / entry["repacked_file"]).open("rb"))
+                experts[entry["repacked_file"]] = expert_file
             size = entry["bytes_per_expert"]
             for expert in range(metadata["expert_count"]):
                 sources[source["source_shard_index"]].seek(source["source_offset"] + expert * size)
-                experts.seek(entry["repacked_offset"] + expert * entry["expert_stride"])
+                expert_file.seek(entry["repacked_offset"] + expert * entry["expert_stride"])
                 remaining = size
                 while remaining:
                     count = min(8 << 20, remaining)
-                    if sources[source["source_shard_index"]].read(count) != experts.read(count):
+                    if sources[source["source_shard_index"]].read(count) != expert_file.read(count):
                         raise SystemExit(f"byte mismatch for '{entry['tensor_name']}' expert {expert}")
                     remaining -= count
 

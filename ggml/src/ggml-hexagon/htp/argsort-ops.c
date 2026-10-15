@@ -321,49 +321,144 @@ static void top_k_select_tiled(dma_queue * dma_q, struct htp_thread_trace * tr,
                                float * out_values, int32_t * out_indices,
                                uint32_t chunk_base) {
     const uint32_t tile_elems = 1024;
-    uint32_t n_tiles            = (n + tile_elems - 1) / tile_elems;
-    uint32_t candidate_count    = n_tiles * k;
-    uint32_t merge_n_vec        = hmx_ceil_div(candidate_count, 32);
-    uint32_t merge_n_vec_pow2   = 1;
-    while (merge_n_vec_pow2 < merge_n_vec) merge_n_vec_pow2 <<= 1;
-    uint32_t merge_elems        = merge_n_vec_pow2 * 32;
-    float * candidate_values    = values_buf + tile_elems;
-    int32_t * candidate_indices = indices_buf + tile_elems;
-    uint32_t candidate_pos      = 0;
 
-    for (uint32_t offset = 0; offset < n; offset += tile_elems) {
-        uint32_t tile_count = MIN(tile_elems, n - offset);
-        dma_sync_read(dma_q, values_buf, src_addr + (size_t) offset * sizeof(float), tile_count * sizeof(float));
+    // one DMA for the whole chunk into VTCM, then select in VTCM (no per-tile DMA)
+    dma_sync_read(dma_q, values_buf, src_addr, n * sizeof(float));
 
-        htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) offset);
-        if (tile_count < tile_elems) {
-            hvx_splat_f32_u((uint8_t *) (values_buf + tile_count), -INFINITY, tile_elems - tile_count);
-        }
 
-        bitonic_sort_vtcm_desc((uint8_t *) values_buf, (uint8_t *) indices_buf, tile_elems / 32, true);
-        uint32_t tile_k = MIN(k, tile_count);
-        for (uint32_t j = 0; j < tile_k; j++) {
-            candidate_values[candidate_pos] = values_buf[j];
-            candidate_indices[candidate_pos] = indices_buf[j] + (int32_t) offset;
-            candidate_pos++;
-        }
-        htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) offset);
+
+    float   best_val[64];
+    int32_t best_idx[64];
+    for (uint32_t j = 0; j < k; j++) {
+        best_val[j] = -INFINITY;
+        best_idx[j] = 0;
     }
 
-    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, 0);
-    if (merge_elems > candidate_pos) {
-        hvx_splat_f32_u((uint8_t *) (candidate_values + candidate_pos), -INFINITY, merge_elems - candidate_pos);
-        for (uint32_t j = candidate_pos; j < merge_elems; j++) {
-            candidate_indices[j] = 0;
+    // process full tiles in descending-max order; stop as soon as the next tile
+    // cannot enter the running top-k. this sorts only the few tiles that matter.
+    enum { TOPK_MAX_TILES = 256 };
+    const uint32_t n_full = n / tile_elems;
+
+    if (n_full <= TOPK_MAX_TILES) {
+        float tmax[TOPK_MAX_TILES];
+        for (uint32_t t = 0; t < n_full; t++) {
+            tmax[t] = hvx_reduce_max_f32((const uint8_t *) (values_buf + (size_t) t * tile_elems), tile_elems);
+        }
+
+        for (;;) {
+            uint32_t bt = UINT32_MAX;
+            float    bm = -INFINITY;
+            for (uint32_t t = 0; t < n_full; t++) {
+                if (tmax[t] > bm) {
+                    bm = tmax[t];
+                    bt = t;
+                }
+            }
+            if (bt == UINT32_MAX || bm <= best_val[k - 1]) {
+                break;
+            }
+            tmax[bt] = -INFINITY;
+
+            // extract the tile's top-k with k vectorized argmax passes (desc order);
+            // each pass masks the selected element. no full sort needed.
+            const uint32_t offset = bt * tile_elems;
+            float   tile_v[64];
+            int32_t tile_i[64];
+            htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) bt);
+            for (uint32_t p = 0; p < k; p++) {
+                float   mv;
+                int32_t mi;
+                hvx_argmax_f32(values_buf + offset, tile_elems, 0, &mv, &mi);
+                tile_v[p] = mv;
+                tile_i[p] = mi;
+                values_buf[offset + mi] = -INFINITY;
+            }
+            htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) bt);
+
+            float   merged_val[64];
+            int32_t merged_idx[64];
+            uint32_t a = 0, b = 0, o = 0;
+            while (o < k && a < k && b < k) {
+                if (best_val[a] >= tile_v[b]) {
+                    merged_val[o] = best_val[a];
+                    merged_idx[o] = best_idx[a];
+                    a++;
+                } else {
+                    merged_val[o] = tile_v[b];
+                    merged_idx[o] = tile_i[b] + (int32_t) offset;
+                    b++;
+                }
+                o++;
+            }
+            while (o < k && a < k) {
+                merged_val[o] = best_val[a];
+                merged_idx[o] = best_idx[a];
+                a++;
+                o++;
+            }
+            while (o < k && b < k) {
+                merged_val[o] = tile_v[b];
+                merged_idx[o] = tile_i[b] + (int32_t) offset;
+                b++;
+                o++;
+            }
+            for (uint32_t j = o; j < k; j++) {
+                merged_val[j] = -INFINITY;
+                merged_idx[j] = 0;
+            }
+            for (uint32_t j = 0; j < k; j++) {
+                best_val[j] = merged_val[j];
+                best_idx[j] = merged_idx[j];
+            }
+        }
+    } else {
+        // very large chunk: sequential scan with per-tile prefilter
+        for (uint32_t offset = 0; offset + tile_elems <= n; offset += tile_elems) {
+            if (hvx_reduce_max_f32((const uint8_t *) (values_buf + offset), tile_elems) <= best_val[k - 1]) {
+                continue;
+            }
+            bitonic_sort_vtcm_desc((uint8_t *) (values_buf + offset), (uint8_t *) (indices_buf + offset), tile_elems / 32, true);
+            for (uint32_t b = 0; b < k; b++) {
+                const float   v = values_buf[offset + b];
+                const int32_t ix = indices_buf[offset + b] + (int32_t) offset;
+                if (v <= best_val[k - 1]) {
+                    continue;
+                }
+                uint32_t p = 0;
+                while (p < k && best_val[p] >= v) {
+                    p++;
+                }
+                for (uint32_t q = k - 1; q > p; q--) {
+                    best_val[q] = best_val[q - 1];
+                    best_idx[q] = best_idx[q - 1];
+                }
+                best_val[p] = v;
+                best_idx[p] = ix;
+            }
         }
     }
 
-    bitonic_sort_vtcm_desc((uint8_t *) candidate_values, (uint8_t *) candidate_indices, merge_n_vec_pow2, false);
-    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, 0);
+    // tail (< tile_elems): scalar insert into the running best
+    for (uint32_t offset = n_full * tile_elems; offset < n; offset++) {
+        const float v = values_buf[offset];
+        if (v <= best_val[k - 1]) {
+            continue;
+        }
+        uint32_t p = 0;
+        while (p < k && best_val[p] >= v) {
+            p++;
+        }
+        for (uint32_t q = k - 1; q > p; q--) {
+            best_val[q] = best_val[q - 1];
+            best_idx[q] = best_idx[q - 1];
+        }
+        best_val[p] = v;
+        best_idx[p] = (int32_t) offset;
+    }
 
     for (uint32_t j = 0; j < k; j++) {
-        out_values[j]  = candidate_values[j];
-        out_indices[j] = candidate_indices[j] + (int32_t) chunk_base;
+        out_values[j]  = best_val[j];
+        out_indices[j] = best_idx[j] + (int32_t) chunk_base;
     }
 }
 

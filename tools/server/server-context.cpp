@@ -2637,6 +2637,34 @@ private:
 
             generating.push_back(&slot);
 
+            // Optional text-only recurrent checkpoints reduce history replay on
+            // the next chat turn. Save before drafting or appending batch tokens.
+            static const int decode_checkpoint_step = [] {
+                const char * value = std::getenv("LLAMA_SERVER_DECODE_CHECKPOINT_STEP");
+                const int step = value ? std::atoi(value) : 0;
+                return step > 0 ? std::max(8, std::min(256, step)) : 0;
+            }();
+            const int64_t checkpoint_tokens = slot.prompt.n_tokens();
+            const bool checkpoint_spacing = slot.prompt.checkpoints.empty() ||
+                checkpoint_tokens >= slot.prompt.checkpoints.back().n_tokens + decode_checkpoint_step;
+            if (decode_checkpoint_step > 0 && params_base.n_ctx_checkpoints > 0 &&
+                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                slot.task->params.cache_prompt && !slot.prompt.tokens.has_mtmd &&
+                slot.spec_draft.empty() && slot.n_decoded >= decode_checkpoint_step && checkpoint_spacing) {
+                const auto memory = llama_get_memory(ctx_tgt);
+                const auto pos_min = llama_memory_seq_pos_min(memory, slot.id);
+                const auto pos_max = llama_memory_seq_pos_max(memory, slot.id);
+                const bool draft_aligned = !ctx_dft ||
+                    llama_memory_seq_pos_max(llama_get_memory(ctx_dft.get()), slot.id) == pos_max;
+                // A checkpoint must describe precisely the accepted prefix, not
+                // speculative future tokens still present in a context.
+                if (pos_min >= 0 && pos_max + 1 == slot.prompt.tokens.pos_next() && draft_aligned) {
+                    create_checkpoint(slot, 0, pos_min, pos_max);
+                    SLT_INF(slot, "decode checkpoint at %" PRId64 " cached tokens, n_decoded=%d\n",
+                            checkpoint_tokens, slot.n_decoded);
+                }
+            }
+
             if (spec) {
                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
 

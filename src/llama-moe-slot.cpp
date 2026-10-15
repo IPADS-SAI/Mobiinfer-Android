@@ -53,6 +53,61 @@ static int moe_ssd_io_threads() {
     return n;
 }
 
+
+// Optional persistent helpers avoid pthread creation for every MoE layer.
+// Each caller owns a pool; prefetch never competes with main-path jobs here.
+class moe_io_pool {
+    std::mutex call_mutex, mutex;
+    std::condition_variable go, done;
+    std::vector<std::thread> threads;
+    std::function<void()> job;
+    uint64_t generation = 0;
+    int active = 0, remaining = 0;
+    bool quit = false;
+
+    void stop() {
+        { std::lock_guard<std::mutex> lock(mutex); quit = true; }
+        go.notify_all();
+        for (auto & thread : threads) if (thread.joinable()) thread.join();
+    }
+public:
+    ~moe_io_pool() { stop(); }
+    bool run(int count, const std::function<void()> & fn) {
+        const char * enabled = std::getenv("LLAMA_MOE_IO_POOL");
+        if (!enabled || *enabled != '1') return false;
+        std::lock_guard<std::mutex> caller(call_mutex);
+        if (threads.empty()) {
+            try {
+                for (int id = 0; id < moe_ssd_io_threads(); ++id) {
+                    threads.emplace_back([this, id]() {
+                        uint64_t seen = 0;
+                        std::unique_lock<std::mutex> lock(mutex);
+                        for (;;) {
+                            go.wait(lock, [&]() { return quit || seen != generation; });
+                            if (quit) return;
+                            seen = generation;
+                            if (id >= active) continue;
+                            auto fn = job;
+                            lock.unlock();
+                            fn();
+                            lock.lock();
+                            if (--remaining == 0) done.notify_one();
+                        }
+                    });
+                }
+            } catch (...) { stop(); throw; }
+        }
+        std::unique_lock<std::mutex> lock(mutex);
+        active = remaining = count;
+        job = fn;
+        ++generation;
+        go.notify_all();
+        done.wait(lock, [&]() { return remaining == 0; });
+        job = nullptr;
+        return true;
+    }
+};
+
 // slot_to_expert 的哨兵值。
 //   kSlotFree    -1：空位，可分配
 //   kSlotPending -2：已被预读 worker **认领**、内容尚未写完。主路径必须跳过它
@@ -118,7 +173,7 @@ static metal_buf_fn lookup_metal_buf_fn(ggml_backend_buffer_t buf, const char * 
 // Predicted ids are preadv'd into a ping-pong tail of the shared bank after install, overlapping
 // the current layer's GPU work. Hits remap for free; misses still install on the critical path.
 struct lookahead_expert_prefetch {
-    static constexpr int32_t kMaxDepth = 16;
+    static constexpr int32_t kMaxDepth = llama_moe_slot_runtime::max_prefetch_depth;
 
     struct hit {
         int32_t expert;
@@ -174,6 +229,7 @@ struct lookahead_expert_prefetch {
     std::atomic<uint64_t> n_evict_total{0};   // 淘汰总次数
     std::atomic<uint64_t> n_pred_bytes{0};    // worker 实际读进去的字节
     bool ready = false;
+    moe_io_pool io_pool;
 
     void init(int32_t slots, int32_t experts, int32_t last_moe, std::function<void(int, int, int)> fn) {
         n_slots = slots;
@@ -187,10 +243,7 @@ struct lookahead_expert_prefetch {
         if (on && on[0] != '\0' && on[0] != '0') {
             want = 8;
             if (const char * d = std::getenv("LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH")) {
-                const int v = atoi(d);
-                if (v >= 0 && v <= kMaxDepth) {
-                    want = v;
-                }
+                want = atoi(d);
             }
         } else {
             // the mechanism was called FATE before this rename; keep the old spellings loud
@@ -215,15 +268,10 @@ struct lookahead_expert_prefetch {
         if (!ready) {
             return;
         }
-        if (want < 0) {
-            want = 0;
-        }
-        if (want > kMaxDepth) {
-            want = kMaxDepth;
-        }
-        if (want > 0 && n_slots < 2 * want + 8) {
-            moe_log("lookahead-prefetch: off, bank %d too small for depth %d", (int) n_slots, (int) want);
-            want = 0;
+        const int32_t configured = want;
+        want = llama_moe_slot_runtime::normalize_prefetch_depth(n_slots, want);
+        if (configured > 0 && want == 0) {
+            moe_log("lookahead-prefetch: off, bank %d too small for depth %d", (int) n_slots, (int) configured);
         }
         const int32_t cur = enabled ? depth : 0;
         if (want == cur && (want == 0 || th.joinable())) {
@@ -438,6 +486,8 @@ struct lookahead_expert_prefetch {
             };
             if (n_th == 1) {
                 read_one();
+            } else if (io_pool.run(n_th, read_one)) {
+                // All reads completed on persistent workers.
             } else {
                 std::vector<std::thread> helpers;
                 helpers.reserve((size_t) n_th);
@@ -509,6 +559,7 @@ struct llama_moe_slot_runtime::impl {
         std::vector<int32_t> slot_to_expert;
         std::vector<int32_t> expert_to_slot;
         std::vector<uint64_t> slot_age;
+        std::vector<uint8_t> protected_experts;
         uint64_t age = 0;
         std::mutex mutex;
     };
@@ -521,6 +572,8 @@ struct llama_moe_slot_runtime::impl {
         int32_t expert = -1;
         int32_t slot = -1;
     };
+
+    moe_io_pool io_pool;
 
     struct install_timing {
         int n = 0;
@@ -573,6 +626,7 @@ struct llama_moe_slot_runtime::impl {
     std::atomic<uint64_t> io_calls_all{0};
     uint64_t last_io_bytes = 0;
     uint64_t last_io_calls = 0;
+    int64_t last_io_flush_ns = now_ns();
     // 「图执行期间的专家管理耗时」累计，见 add_process_ns。
     std::atomic<int64_t> process_ns{0};
     // 诊断：把 process() 内部再拆三层，用来定位「记账 3.5 → 19.5 ms」那笔异常。
@@ -642,6 +696,7 @@ struct llama_moe_slot_runtime::impl {
             finalize_pack(state);
             state.slot_to_expert.assign(n_slots, kSlotFree);
             state.expert_to_slot.assign(n_expert, kSlotFree);
+            state.protected_experts.assign(n_expert, 0);
             state.slot_age.assign(n_slots, 0);
             // window_start 不在这里算 —— decode_window 要到 resolve_decode_window()
             // 才确定，此处还是 0。在那边统一赋值，否则所有层会共用窗口起点 [0, W)，
@@ -846,6 +901,8 @@ struct llama_moe_slot_runtime::impl {
                 if (st.slot_to_expert[(size_t) cand] == kSlotPending) {
                     continue;
                 }
+                const int32_t resident = st.slot_to_expert[(size_t) cand];
+                if (resident >= 0 && st.protected_experts[(size_t) resident]) continue;
                 if (st.slot_age[(size_t) cand] < oldest) {
                     oldest = st.slot_age[(size_t) cand];
                     slot = cand;
@@ -876,6 +933,89 @@ struct llama_moe_slot_runtime::impl {
         st.slot_age[(size_t) slot] = ++st.age;
         st.n_prefetch_published++;
         return true;
+    }
+
+    static int prefill_warm_rows() {
+        const char * value = std::getenv("LLAMA_MOE_PREFILL_WARM_ROWS");
+        return value ? std::max(0, std::min(256, std::atoi(value))) : 0;
+    }
+
+    // Preserve recently used prefill experts in the physically separate decode
+    // window. The existing prewarm placement path republishes their mappings
+    // when decode begins; no extra file reads or expert allocations are needed.
+    // Called with the layer mutex held, after all shared-bank reads completed.
+    void warm_from_prefill(layer_state & st, int layer, const std::vector<int32_t> & experts,
+                           const std::vector<int32_t> & slots, int n_rows) {
+        const int rows = std::min(prefill_warm_rows(), n_rows);
+        if (rows <= 0 || !shared_bank || decode_window <= 0 || st.dec_bindings.empty()) return;
+        const int capacity = st.window_width - prefetch_slots;
+        const size_t ranks = experts.size() / n_rows;
+        if (capacity <= 0 || ranks == 0 || experts.size() != slots.size()) return;
+
+        using pack_fn = size_t (*)(void *, const void *, int, int64_t, int64_t);
+        struct family_copy { const binding * src; const binding * dst; size_t bytes; };
+        std::vector<family_copy> families;
+        for (const auto & src : st.bindings) {
+            auto dst = std::find_if(st.dec_bindings.begin(), st.dec_bindings.end(),
+                [&](const binding & b) { return b.entry == src.entry; });
+            if (dst == st.dec_bindings.end()) throw std::runtime_error("prefill warm family missing");
+            auto dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(src.tensor->buffer));
+            auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            auto pack = reg ? (pack_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_pack_moe_expert") : nullptr;
+            // This path is specific to the verified Hexagon tiled layout.
+            if (!pack) return;
+            if (src.tensor->type != dst->tensor->type || src.tensor->ne[0] != dst->tensor->ne[0] ||
+                src.tensor->ne[1] != dst->tensor->ne[1] ||
+                !ggml_backend_buffer_is_host_addressable(src.tensor->buffer) ||
+                !ggml_backend_buffer_is_host_addressable(dst->tensor->buffer)) {
+                throw std::runtime_error("prefill warm incompatible family");
+            }
+            const size_t bytes = pack(nullptr, nullptr, src.tensor->type, src.tensor->ne[0], src.tensor->ne[1]);
+            if (!bytes) throw std::runtime_error("prefill warm unsupported type");
+            const uintptr_t src_begin = (uintptr_t) src.tensor->data;
+            const uintptr_t dst_begin = (uintptr_t) dst->tensor->data;
+            if (src_begin < dst_begin + bytes * dst->tensor->ne[2] &&
+                dst_begin < src_begin + bytes * src.tensor->ne[2]) {
+                throw std::runtime_error("prefill and decode warm buffers overlap");
+            }
+            families.push_back({ &src, &*dst, bytes });
+        }
+
+        const int64_t start = now_ns();
+        std::vector<uint8_t> seen((size_t) n_expert, 0);
+        std::vector<prewarm_place> placed;
+        size_t copied = 0;
+        const char * rank_order = std::getenv("LLAMA_MOE_PREFILL_WARM_RANK_FIRST");
+        const bool rank_first = rank_order && *rank_order && *rank_order != '0';
+        // Slot selection only: required experts and routing weights are unchanged.
+        // Default traversal preserves the previous reverse-row order exactly.
+        for (size_t candidate = 0; candidate < (size_t) rows * ranks &&
+                (int) placed.size() < capacity; ++candidate) {
+                const int row = n_rows - 1 - (int) (rank_first ? candidate % rows : candidate / ranks);
+                const size_t rank = rank_first ? candidate / rows : candidate % ranks;
+                const size_t index = (size_t) row * ranks + rank;
+                const int expert = experts[index];
+                if (seen[(size_t) expert]) continue;
+                seen[(size_t) expert] = 1;
+                const int dst_slot = (int) placed.size();
+                for (const auto & family : families) {
+                    if (slots[index] < 0 || slots[index] >= family.src->tensor->ne[2] ||
+                        dst_slot >= family.dst->tensor->ne[2]) {
+                        throw std::runtime_error("prefill warm slot out of range");
+                    }
+                    std::memcpy((uint8_t *) family.dst->tensor->data + dst_slot * family.bytes,
+                                (uint8_t *) family.src->tensor->data + slots[index] * family.bytes,
+                                family.bytes);
+                    copied += family.bytes;
+                }
+                placed.push_back({ layer, expert, dst_slot });
+        }
+        prewarm_placed.erase(std::remove_if(prewarm_placed.begin(), prewarm_placed.end(),
+            [&](const prewarm_place & p) { return p.layer == layer; }), prewarm_placed.end());
+        prewarm_placed.insert(prewarm_placed.end(), placed.begin(), placed.end());
+        prewarm_ready = !prewarm_placed.empty();
+        moe_log("prefill-warm: layer=%d rows=%d rank_first=%d experts=%zu copied=%.1fMiB wall=%.3fms",
+                layer, rows, (int) rank_first, placed.size(), mib_of(copied), ms_of(now_ns() - start));
     }
 
     void install_prefetch_into_window(int layer, int32_t expert) {
@@ -1133,6 +1273,11 @@ struct llama_moe_slot_runtime::impl {
                 const int32_t w = c_il + prefetch_slots;
                 layers[il].window_start = 0;
                 layers[il].window_width = w;
+                // Runtime metadata must cover both the prefill bank and the
+                // complete per-layer cache/prefetch window.
+                const size_t capacity = (size_t) std::max(n_slots, w);
+                layers[il].slot_to_expert.resize(capacity, kSlotFree);
+                layers[il].slot_age.resize(capacity, 0);
                 layer_width[il] = w;
             }
             // 打印一下分布，确认按层生效
@@ -1385,6 +1530,13 @@ struct llama_moe_slot_runtime::impl {
         if (fd < 0) {
             throw std::runtime_error(format("failed to open MoE experts file '%s': %s", path.c_str(), std::strerror(errno)));
         }
+#if defined(__linux__)
+        const char * random_reads = std::getenv("LLAMA_MOE_FADVISE_RANDOM");
+        if (random_reads && *random_reads != '0') {
+            const int advice_error = posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+            if (advice_error) moe_log("random-read advice failed: %s", std::strerror(advice_error));
+        }
+#endif
         fds.emplace(path, fd);
         return fd;
     }
@@ -1473,10 +1625,64 @@ struct llama_moe_slot_runtime::impl {
         const size_t base   = window_mode ? state.dec_pack_base   : state.pack_base;
         const size_t stride = window_mode ? state.dec_pack_stride : state.pack_stride;
 
+        // Optional offline tiled files: retain the raw manifest and compute the
+        // backend strides independently. Never feed tiled bytes to raw upload.
+        const char * packed_dir = std::getenv("LLAMA_MOE_HTP_PACKED_DIR");
+        if (packed_dir && *packed_dir && mode == 0) {
+            using pack_fn = size_t (*)(void *, const void *, int, int64_t, int64_t);
+            struct iovec packed_iov[8];
+            size_t packed_stride = 0;
+            if (order.empty() || order.size() > 8) throw std::runtime_error("invalid packed expert families");
+            for (size_t i = 0; i < order.size(); ++i) {
+                const binding & b = bindings[order[i]];
+                auto dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(b.tensor->buffer));
+                auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                auto pack = reg ? (pack_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_pack_moe_expert") : nullptr;
+                if (!pack) throw std::runtime_error("offline tiled experts require the Hexagon backend");
+                const size_t bytes = pack(nullptr, nullptr, b.tensor->type, b.tensor->ne[0], b.tensor->ne[1]);
+                if (!bytes) throw std::runtime_error("unsupported offline expert type");
+                packed_iov[i].iov_base = (uint8_t *) b.tensor->data + (size_t) slot * bytes;
+                packed_iov[i].iov_len = bytes;
+                packed_stride += bytes;
+            }
+            const size_t slash = path.find_last_of("/");
+            const std::string packed_path = std::string(packed_dir) + "/" + path.substr(slash == std::string::npos ? 0 : slash + 1);
+            const int64_t start = now_ns();
+            const int packed_fd = fd_for(packed_path);
+            const size_t packed_offset = (size_t) expert * packed_stride;
+            readv_span(packed_fd, packed_offset, packed_iov, (int) order.size());
+#if defined(__linux__)
+            // Once retained in a DSP cache slot, the same expert pages need not
+            // occupy Linux page cache too. This advice changes no file bytes.
+            const char * drop_pages = std::getenv("LLAMA_MOE_DROP_CACHED_EXPERT_PAGES");
+            if (window_mode && drop_pages && *drop_pages != '0') {
+                const int advice_error = posix_fadvise(packed_fd, packed_offset, packed_stride, POSIX_FADV_DONTNEED);
+                if (advice_error) moe_log("expert page-cache advice failed: %s", std::strerror(advice_error));
+            }
+#endif
+            const int64_t elapsed = now_ns() - start;
+            stats.pread_ns.fetch_add(elapsed, std::memory_order_relaxed);
+            stats.n_bytes.fetch_add(packed_stride, std::memory_order_relaxed);
+            stats.n_miss.fetch_add(1, std::memory_order_relaxed);
+            return elapsed;
+        }
+
         struct iovec iov[8];
         const int n = (int) order.size();
         if (n <= 0 || n > 8) {
             throw std::runtime_error("invalid MoE packed family count for preadv");
+        }
+        using upload_fn = bool (*)(ggml_tensor *, int32_t, const void *, size_t);
+        std::vector<upload_fn> uploads((size_t) n, nullptr);
+        bool staging = false;
+        for (int i = 0; i < n; ++i) {
+            const binding & b = bindings[order[(size_t) i]];
+            auto dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(b.tensor->buffer));
+            if (dev) {
+                auto reg = ggml_backend_dev_backend_reg(dev);
+                uploads[(size_t) i] = (upload_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_upload_moe_expert");
+                staging = staging || uploads[(size_t) i] != nullptr;
+            }
         }
         size_t nbytes = 0;
         size_t max_exp = 0;
@@ -1496,6 +1702,20 @@ struct llama_moe_slot_runtime::impl {
                 iov[i].iov_len  = b.entry->bytes_per_expert;
                 nbytes += b.entry->bytes_per_expert;
             }
+        } else if (staging && mode == 0) {
+            // HTP consumes tiled weights, so raw disk bytes require backend upload.
+            static thread_local std::vector<uint8_t> raw;
+            size_t total = 0;
+            for (int i = 0; i < n; ++i) total += bindings[order[(size_t) i]].entry->bytes_per_expert;
+            raw.resize(total);
+            size_t pos = 0;
+            for (int i = 0; i < n; ++i) {
+                const binding & b = bindings[order[(size_t) i]];
+                iov[i].iov_base = raw.data() + pos;
+                iov[i].iov_len = b.entry->bytes_per_expert;
+                pos += iov[i].iov_len;
+            }
+            nbytes = total;
         } else {
             for (int i = 0; i < n; ++i) {
                 const binding & b = bindings[order[(size_t) i]];
@@ -1526,6 +1746,18 @@ struct llama_moe_slot_runtime::impl {
 
         const int64_t t0 = now_ns();
         readv_span(fd, offset, iov, n);
+        if (staging && mode == 0) {
+            for (int i = 0; i < n; ++i) {
+                const binding & b = bindings[order[(size_t) i]];
+                if (uploads[(size_t) i]) {
+                    if (!uploads[(size_t) i](b.tensor, slot, iov[i].iov_base, iov[i].iov_len)) {
+                        throw std::runtime_error(format("backend cannot upload MoE expert slot: %s", ggml_get_name(b.tensor)));
+                    }
+                } else {
+                    memcpy((uint8_t *) b.tensor->data + (size_t) slot * b.entry->bytes_per_expert, iov[i].iov_base, iov[i].iov_len);
+                }
+            }
+        }
         const int64_t dt = now_ns() - t0;
         stats.pread_ns.fetch_add(dt, std::memory_order_relaxed);
         stats.n_bytes.fetch_add(nbytes, std::memory_order_relaxed);
@@ -1705,21 +1937,18 @@ struct llama_moe_slot_runtime::impl {
             }
         } else {
             std::atomic<int> next{0};
-            std::vector<std::thread> threads;
-            threads.reserve((size_t) t.n_th);
-            for (int th = 0; th < t.n_th; ++th) {
-                threads.emplace_back([&]() {
-                    for (;;) {
-                        const int i = next.fetch_add(1, std::memory_order_relaxed);
-                        if (i >= n) {
-                            break;
-                        }
-                        read_one(i);
-                    }
-                });
-            }
-            for (auto & th : threads) {
-                th.join();
+            auto work = [&]() {
+                for (;;) {
+                    const int i = next.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= n) break;
+                    read_one(i);
+                }
+            };
+            if (!io_pool.run(t.n_th, work)) {
+                std::vector<std::thread> threads;
+                threads.reserve((size_t) t.n_th);
+                for (int th = 0; th < t.n_th; ++th) threads.emplace_back(work);
+                for (auto & th : threads) th.join();
             }
         }
         t.wall_ns = now_ns() - wall0;
@@ -1806,13 +2035,16 @@ struct llama_moe_slot_runtime::impl {
         // 多步累计当成单步值（实测虚报过 24 倍）。`span=` 就是干这个的。
         const uint64_t span = idx > last_flush_idx ? idx - last_flush_idx : 1;
         last_flush_idx = idx;
+        const int64_t flush_ns = now_ns();
+        const double interval_s = (flush_ns - last_io_flush_ns) / 1e9;
+        last_io_flush_ns = flush_ns;
         const double wall_s = cur.wall_ns / 1e9;
         const double mibs = wall_s > 0.0 ? (cur.bytes / (1024.0 * 1024.0)) / wall_s : 0.0;
         const double uniq = cur.n_layers > 0 ? (double) cur.unique_sum / (double) cur.n_layers : 0.0;
         const double avg_run = cur.runs.n > 0 ? (double) cur.runs.experts / (double) cur.runs.n : 0.0;
         moe_log("%s #%llu tok=%d used=%d layers=%d unique/l=%.0f miss=%d hit=%d pack=%d/%d nth=%d "
                 "pread_wall=%.0fms pread_sum=%.0fms bytes=%.0fMiB par=%.2f io=%.0fMiB/s "
-                "readall=%.0fMiB calls=%llu realio=%.0fMiB/s span=%llu pmgmt=%.1fms "
+                "readall=%.0fMiB calls=%llu realio=%.0fMiB/s interval_ms=%.1f span=%llu pmgmt=%.1fms "
                 "pfskip=%llu pfwait=%llu/%.1fms pfread=%llu pfpub=%llu pfhit=%llu pfpredict=%llu pevsave=%llu pevforced=%llu pfcached=%llu usedpf=%llu "
                 "runs=%d avg_run=%.1f max_run=%d zerocopy=%.0f%%",
             kind,
@@ -1833,8 +2065,10 @@ struct llama_moe_slot_runtime::impl {
             mibs,
             mib_of(all_delta),
             (unsigned long long) calls_delta,
-            // 真·带宽：完整字节 / 本步墙钟（含 compute，所以这是下限）。
-            wall_s > 0.0 ? (double) all_delta / (1024.0 * 1024.0) / wall_s : 0.0,
+            // Complete bytes and elapsed time cover the same logging interval.
+            // This is process throughput, including compute between callbacks.
+            interval_s > 0.0 ? (double) all_delta / (1024.0 * 1024.0) / interval_s : 0.0,
+            interval_s * 1000.0,
             (unsigned long long) span,
             ms_of(proc_delta),
             (unsigned long long) arm_skip_delta,
@@ -1928,6 +2162,7 @@ struct llama_moe_slot_runtime::impl {
     /// 预读每层每步只新增约 2.4 个（而不是 8 个），不会造成成批淘汰。
     bool prefetch_unified = true;
     bool was_window = false;
+    int protected_layer = -1;
     /// 仅在 LLAMA_MOE_F_NOCACHE=auto（按阶段）时被翻转：prefill 绕、decode 不绕。
     /// 必须 atomic：主线程在 process() 里写它时**不持** fd_mutex，而 fd_for() 会被
     /// 预读 worker 的子线程调用并读它 → 无同步的并发读写。relaxed 够用：
@@ -2235,6 +2470,14 @@ int llama_moe_slot_runtime::lookahead_prefetch_depth() const {
     return pimpl->lookahead.enabled ? (int) pimpl->lookahead.depth : 0;
 }
 
+// Opt-in: speculative verification can overlap next-layer expert I/O too.
+// Clamp to the established window capacity so prefill stays on its shared bank.
+int llama_moe_slot_runtime::lookahead_prefetch_max_rows() const {
+    const char * value = std::getenv("LLAMA_MOE_PREFETCH_MAX_ROWS");
+    const int requested = value ? std::atoi(value) : 1;
+    return std::max(1, std::min(requested, (int) pimpl->window_max_rows));
+}
+
 int llama_moe_slot_runtime::decode_window() const {
     return (int) pimpl->decode_window;
 }
@@ -2312,6 +2555,15 @@ void llama_moe_slot_runtime::process(
             slot_ids ? (long long) slot_ids->ne[1] : -1));
     }
 
+    // This callback depends on the preceding layer output, so the previous
+    // layer weights are no longer in use. Keep current weights protected from
+    // late prefetch eviction until the next dependent callback is reached.
+    if (pimpl->protected_layer >= 0) {
+        auto & previous = pimpl->layers[(size_t) pimpl->protected_layer];
+        std::lock_guard<std::mutex> release(previous.mutex);
+        std::fill(previous.protected_experts.begin(), previous.protected_experts.end(), 0);
+        pimpl->protected_layer = -1;
+    }
     auto & state = pimpl->layers[layer];
 
     const int32_t n_rows = (int32_t) expert_ids->ne[1];
@@ -2324,7 +2576,7 @@ void llama_moe_slot_runtime::process(
     // 上限由 window_max_rows 按缓存区容量夹紧（见 resolve_decode_window），
     // 「并集装不下」的风险在那里就被消掉，不会落到这里的运行期。
     const bool window_mode = pimpl->decode_window > 0 && n_rows <= pimpl->window_max_rows;
-    const bool lookahead_step = pimpl->lookahead.enabled && decode;
+    const bool lookahead_step = pimpl->lookahead.enabled && n_rows <= lookahead_prefetch_max_rows();
 
     // auto 模式下按阶段切 experts 的缓存策略：prefill 绕过、decode 不绕过。
     //
@@ -2347,6 +2599,12 @@ void llama_moe_slot_runtime::process(
     if (lookahead_step && window_mode) {
         std::vector<lookahead_expert_prefetch::hit> ignored;   // 窗口模式不返回 hit
         pimpl->lookahead.take(layer, ignored);
+    }
+
+    if (!window_mode && pimpl->prefill_warm_rows() > 0 && pimpl->lookahead.enabled) {
+        // Drain before taking a layer lock: the worker also locks its target.
+        pimpl->lookahead.reset();
+        pimpl->lookahead.drain();
     }
 
     std::lock_guard<std::mutex> lock(state.mutex);
@@ -2425,7 +2683,7 @@ void llama_moe_slot_runtime::process(
         requested[experts[i]] = 1;
     }
 
-    if (pimpl->lookahead.enabled && !decode) {
+    if (pimpl->lookahead.enabled && !lookahead_step) {
         pimpl->lookahead.reset();
     }
     // 非窗口模式：在这里取预读结果（命中已在乒乓区，需搬到目标 slot）。
@@ -2540,6 +2798,13 @@ void llama_moe_slot_runtime::process(
                     if (resident == kSlotPending) {
                         continue;
                     }
+                    if (resident == kSlotFree) {
+                        slot = candidate;
+                        break;
+                    }
+                    if (resident < 0 || resident >= pimpl->n_expert) {
+                        throw std::runtime_error("invalid resident expert in MoE eviction");
+                    }
                     if (pass == 0 && !keep.empty() && keep[(size_t) resident]) {
                         continue;   // 预测下一步要用，先不动它
                     }
@@ -2592,6 +2857,18 @@ void llama_moe_slot_runtime::process(
     }
     pimpl->unique_sum.fetch_add(n_unique, std::memory_order_relaxed);
 
+    // Reading in expert-file order changes only the I/O schedule. Slot assignments
+    // and router rank order remain untouched, so the matmul reduction is identical.
+    static const bool sort_prefill_reads = [] {
+        const char * value = std::getenv("LLAMA_MOE_PREFILL_SORT_READS");
+        return value && *value && *value != '0';
+    }();
+    if (!window_mode && sort_prefill_reads) {
+        std::sort(pending.begin(), pending.end(), [](const auto & a, const auto & b) {
+            return a.expert < b.expert;
+        });
+    }
+
     const llama_moe_slot_runtime::impl::install_timing timing =
         pimpl->install_pending(state, pending, window_mode);
     pimpl->install_ns.fetch_add(timing.wall_ns, std::memory_order_relaxed);
@@ -2606,6 +2883,25 @@ void llama_moe_slot_runtime::process(
     if (lookahead_step && lookahead_pred) {
         std::vector<int32_t> pred;
         pimpl->read_i32_ids(lookahead_pred, pred);
+        if (lookahead_pred->ne[1] > 1) {
+            // Alternate token rows at each rank, then remove duplicates. The
+            // finite I/O depth serves several candidate tokens before rank 2.
+            std::vector<int32_t> ranked;
+            std::vector<uint8_t> seen((size_t) pimpl->n_expert, 0);
+            ranked.reserve(pred.size());
+            const size_t ranks = (size_t) lookahead_pred->ne[0];
+            const size_t rows = (size_t) lookahead_pred->ne[1];
+            for (size_t rank = 0; rank < ranks; ++rank) {
+                for (size_t row = 0; row < rows; ++row) {
+                    const int32_t expert = pred[row * ranks + rank];
+                    if (expert >= 0 && expert < pimpl->n_expert && !seen[(size_t) expert]) {
+                        seen[(size_t) expert] = 1;
+                        ranked.push_back(expert);
+                    }
+                }
+            }
+            pred.swap(ranked);
+        }
         // 「缓存 + 预测」的结合点（零 I/O）：把预测留给**目标层**，
         // 它下一步淘汰时可以避开这些条目。不是预读 —— 不读任何字节。
         {
@@ -2737,8 +3033,15 @@ void llama_moe_slot_runtime::process(
     }
     {
         const int64_t t0 = now_ns();
+        if (window_mode) {
+            state.protected_experts = requested;
+            pimpl->protected_layer = layer;
+        }
         pimpl->write_i32_ids(slot_ids, slots);
         pimpl->writeids_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
+    }
+    if (!window_mode && pimpl->prefill_warm_rows() > 0) {
+        pimpl->warm_from_prefill(state, layer, experts, slots, n_rows);
     }
 }
 

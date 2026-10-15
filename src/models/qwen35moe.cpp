@@ -88,12 +88,14 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
         LLM_TENSOR_FFN_UP_EXPS,      LLM_TENSOR_FFN_DOWN_EXPS,
     };
     // family -> (bytes_per_expert -> 层号升序)
-    std::map<size_t, std::vector<int>> groups[4];
+    // A bank belongs to one device; cross-device views cannot share allocation contexts.
+    using bank_key = std::pair<size_t, ggml_backend_dev_t>;
+    std::map<bank_key, std::vector<int>> groups[4];
     for (int il = 0; il < (int) n_layer; ++il) {
         for (int fi = 0; fi < 4; ++fi) {
             const auto * e = moe_experts_entry(tn(fam_ids[fi], "weight", il).str().c_str());
             if (e) {
-                groups[fi][e->bytes_per_expert].push_back(il);
+                groups[fi][{e->bytes_per_expert, dev_layer(il)}].push_back(il);
             }
         }
     }
@@ -333,7 +335,7 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
                     throw std::runtime_error(format(
                         "MoE base '%s' has no usable experts entry", ggml_get_name(base)));
                 }
-                if (e->bytes_per_expert != kv.first) {
+                if (e->bytes_per_expert != kv.first.first) {
                     throw std::runtime_error(format(
                         "MoE group for '%s' has inconsistent expert bytes", ggml_get_name(base)));
                 }
@@ -453,7 +455,8 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         cb(attn_post_norm, "attn_post_norm", il);
 
         ggml_tensor * lookahead_next = nullptr;
-        if (moe_slots && moe_slots->lookahead_prefetch_enabled() && ubatch.n_tokens == 1 &&
+        if (moe_slots && moe_slots->lookahead_prefetch_enabled() &&
+            ubatch.n_tokens <= (uint32_t) moe_slots->lookahead_prefetch_max_rows() &&
             il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp != nullptr) {
             ggml_tensor * prefetch_router_logits = build_lora_mm(model.layers[il + 1].ffn_gate_inp, attn_post_norm);
             cb(prefetch_router_logits, "prefetch_router_logits", il);

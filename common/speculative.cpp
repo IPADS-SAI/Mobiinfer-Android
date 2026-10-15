@@ -942,7 +942,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             return true;
         }
 
-        if (batch_in.token == nullptr || batch_in.embd != nullptr) {
+        static const bool media_features_enabled = [] {
+            const char * value = std::getenv("LLAMA_DSPARK_MEDIA_FEATURES");
+            return value && *value && *value != '0';
+        }();
+        const bool media_features = is_dspark && media_features_enabled &&
+            batch_in.token == nullptr && batch_in.embd != nullptr;
+        if (!media_features && (batch_in.token == nullptr || batch_in.embd != nullptr)) {
             return true;
         }
 
@@ -997,11 +1003,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 if (is_mrope) {
                     enc_pos.resize((size_t) 4 * n_chunk);
                     for (int32_t i = 0; i < n_chunk; ++i) {
-                        const llama_pos p = batch_in.pos[i_batch_beg[seq_id] + offset + i];
-                        enc_pos[0 * n_chunk + i] = p;
-                        enc_pos[1 * n_chunk + i] = p;
-                        enc_pos[2 * n_chunk + i] = p;
-                        enc_pos[3 * n_chunk + i] = 0;
+                        const int32_t row = i_batch_beg[seq_id] + offset + i;
+                        const llama_pos p = batch_in.pos[row];
+                        // Embedding media batches carry section-major M-RoPE
+                        // coordinates. Text token batches carry one scalar row.
+                        for (int32_t axis = 0; axis < 4; ++axis) {
+                            enc_pos[axis * n_chunk + i] = media_features
+                                ? batch_in.pos[axis * n_tokens + row]
+                                : (axis == 3 ? 0 : p);
+                        }
                     }
                 }
 
@@ -1030,12 +1040,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
 
                 for (int32_t i = 0; i < n_chunk; ++i) {
-                    const llama_pos p = batch_in.pos[i_batch_beg[seq_id] + offset + i];
+                    const int32_t row = i_batch_beg[seq_id] + offset + i;
+                    const llama_pos p = batch_in.pos[row];
                     batch_inject.pos[i] = p;
                     if (is_mrope) {
-                        batch_inject.pos[1 * n_chunk + i] = p;
-                        batch_inject.pos[2 * n_chunk + i] = p;
-                        batch_inject.pos[3 * n_chunk + i] = 0;
+                        for (int32_t axis = 1; axis < 4; ++axis) {
+                            batch_inject.pos[axis * n_chunk + i] = media_features
+                                ? batch_in.pos[axis * n_tokens + row]
+                                : (axis == 3 ? 0 : p);
+                        }
                     }
                     batch_inject.n_seq_id[i]  = 1;
                     batch_inject.seq_id[i][0] = seq_id;
@@ -1046,6 +1059,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
                     return false;
+                }
+                if (media_features) {
+                    LOG_INF("DSpark: injected %d media target-feature rows for seq %d (%d position rows)\n",
+                            n_chunk, seq_id, is_mrope ? 4 : 1);
                 }
             }
         }
@@ -1071,7 +1088,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             common_sampler_reset(smpls[seq_id].get());
 
-            const int32_t n = (int32_t) dp.n_past;
+            int32_t n = (int32_t) dp.n_past;
+            static const bool use_target_positions = [] {
+                const char * value = std::getenv("LLAMA_DSPARK_TARGET_POSITIONS");
+                return value && *value && *value != '0';
+            }();
+            if (is_dspark && use_target_positions) {
+                // Multimodal token count differs from the target's logical
+                // M-RoPE position. Draft queries must follow the accepted prefix.
+                const llama_pos last = llama_memory_seq_pos_max(llama_get_memory(params.ctx_tgt), seq_id);
+                if (last >= 0) {
+                    n = last + 1;
+                    if (n != dp.n_past) {
+                        LOG_DBG("DSpark: target draft position seq=%d pos=%d token_count=%d\n",
+                                seq_id, n, (int) dp.n_past);
+                    }
+                }
+            }
 
             const int32_t n_draft = params.n_max;
 
