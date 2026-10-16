@@ -121,6 +121,7 @@ struct llama_context {
     int32_t get_moe_lookahead_prefetch_depth() const;
     void park_moe_expert_memory();
     void prewarm_moe_experts();
+    void set_moe_prefill_final(bool value);
     // 0 restores hparams top-k. Clamped to [1, hparams.n_expert_used].
     void set_n_expert_used(int32_t n);
     int32_t n_expert_used() const;
@@ -260,6 +261,8 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+    bool moe_prefill_final = false;
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,

@@ -85,6 +85,7 @@ public:
     /// decode 段与 prefill 段物理分离，所以这笔读能活过 prefill，阶段切换只重挂映射。
     /// 调用期间不得有 decode 在飞（App：mmproj 卸载后、prefill 前）。
     void prewarm_experts();
+    void set_prefill_warm_enabled(bool enabled);
 
 private:
     static void map_custom(

@@ -2116,6 +2116,11 @@ int32_t llama_model::moe_experts_layer_count() const {
     return pimpl->moe_experts ? pimpl->moe_experts->layer_count() : 0;
 }
 
+bool llama_model::moe_phase_reuse() const {
+    const char * value = std::getenv("LLAMA_MOE_PHASE_REUSE");
+    return arch == LLM_ARCH_QWEN35MOE && value && *value && *value != '0';
+}
+
 int32_t llama_model::moe_decode_window() const {
     if (!pimpl->moe_experts) {
         return 0;

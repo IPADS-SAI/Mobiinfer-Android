@@ -655,6 +655,8 @@ struct llama_model {
     /// 每层 decode 窗口宽度（slot 数），0 = 未启用。
     /// 由 `LLAMA_MOE_DECODE_WINDOW` 决定（`auto` = bank / MoE 层数）。
     int32_t moe_decode_window() const;
+    // Experimental Qwen3.5 MoE layout: overlap prefill and decode expert storage.
+    bool moe_phase_reuse() const;
 
     /// 每层的 decode 窗口宽度（**按 MoE 层序号**，不含预读暂存区）。
     ///
