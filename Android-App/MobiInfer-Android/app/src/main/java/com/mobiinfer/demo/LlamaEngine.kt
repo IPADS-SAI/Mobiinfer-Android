@@ -1,0 +1,1553 @@
+package com.mobiinfer.demo
+
+import android.content.Context
+import android.content.SharedPreferences
+import android.util.Log
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.math.roundToInt
+
+sealed class LlamaState {
+    object Uninitialized : LlamaState()
+    object Initializing : LlamaState()
+    object Initialized : LlamaState()
+    object LoadingModel : LlamaState()
+    object ModelReady : LlamaState()
+    object ProcessingSystemPrompt : LlamaState()
+    object PrefillingImage : LlamaState()
+    object ProcessingUserPrompt : LlamaState()
+    object Generating : LlamaState()
+    object UnloadingModel : LlamaState()
+    data class Error(val exception: Exception) : LlamaState()
+}
+
+class LlamaEngine private constructor(
+    private val context: Context,
+    private val nativeLibDir: String
+) {
+
+    companion object {
+        private val TAG = LlamaEngine::class.java.simpleName
+
+        @Volatile
+        private var instance: LlamaEngine? = null
+
+        // Per-turn token budget. iOS demo (MTMDParams.swift) uses 100 because
+        // ANE makes generation fast enough that the cap is rarely hit; on
+        // Android with CPU-only inference users complained about replies
+        // getting truncated mid-sentence, so we raise it to a safer ceiling.
+        // 512 tokens is roughly 250-350 Chinese characters per turn, which
+        // covers the vast majority of single-turn answers; the n_ctx=4096
+        // buffer plus shift_context() in llama_jni.cpp still keeps multi-turn
+        // chats stable.
+        const val DEFAULT_PREDICT_LENGTH = 1024
+
+        const val MODEL_SUBDIR = "models"
+
+        private const val PREFS_NAME = "model_prefs"
+        private const val KEY_SELECTED_MODEL = "selected_model_id"
+        private const val KEY_IMAGE_MAX_SLICE = "image_max_slice_nums"
+        private const val KEY_IMAGE_SCALE_FACTOR = "image_scale_factor"
+        private const val KEY_MEMORY_BUDGET_MB = "minicpm47_memory_budget_mb"
+        const val MIN_MEMORY_BUDGET_MB = 5500
+        const val MAX_MEMORY_BUDGET_MB = 6000
+
+        fun getMemoryBudgetMb(context: Context): Int = prefs(context)
+            .getInt(KEY_MEMORY_BUDGET_MB, MAX_MEMORY_BUDGET_MB)
+            .coerceIn(MIN_MEMORY_BUDGET_MB, MAX_MEMORY_BUDGET_MB)
+
+        fun setMemoryBudgetMb(context: Context, value: Int) {
+            require(value in MIN_MEMORY_BUDGET_MB..MAX_MEMORY_BUDGET_MB && value % 100 == 0)
+            prefs(context).edit().putInt(KEY_MEMORY_BUDGET_MB, value).apply()
+        }
+        private const val KEY_MODEL_SWITCHED = "model_switched"
+        private const val KEY_ENABLE_THINKING = "enable_thinking"
+
+        // MiniCPM-V's hard upper bound on slice count.  Values higher than 9
+        // get clamped by clip.cpp::get_best_grid anyway; we cap on the UI
+        // side to keep the slider semantics honest.
+        const val MIN_IMAGE_SLICE = 1
+        const val MAX_IMAGE_SLICE = 9
+        // Out-of-the-box we run with MiniCPM-V's full slice budget (9 =
+        // the model's built-in default) so first-launch image quality
+        // matches what the model card promises.  Users who care about
+        // prefill latency drop the chat-page slider down to 1 (no
+        // slicing, ~9x fewer image tokens).
+        const val DEFAULT_IMAGE_SLICE = MAX_IMAGE_SLICE
+        const val MIN_IMAGE_SCALE_FACTOR = 0.1f
+        const val MAX_IMAGE_SCALE_FACTOR = 1.0f
+        const val DEFAULT_IMAGE_SCALE_FACTOR = 0.5f
+
+        fun getInstance(context: Context): LlamaEngine =
+            instance ?: synchronized(this) {
+                val nativeLibDir = context.applicationInfo.nativeLibraryDir
+                require(nativeLibDir.isNotBlank()) { "Expected a valid native library path!" }
+                LlamaEngine(context, nativeLibDir).also { instance = it }
+            }
+
+        private fun prefs(context: Context): SharedPreferences =
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+        fun getSelectedModel(context: Context): ModelInfo {
+            val modelId = prefs(context).getString(KEY_SELECTED_MODEL, ModelInfo.DEFAULT_MODEL.id) ?: ModelInfo.DEFAULT_MODEL.id
+            return ModelInfo.AVAILABLE_MODELS.find { it.id == modelId } ?: ModelInfo.DEFAULT_MODEL
+        }
+
+        fun setSelectedModel(context: Context, modelId: String) {
+            prefs(context).edit().putString(KEY_SELECTED_MODEL, modelId).apply()
+        }
+
+        fun markModelSwitched(context: Context) {
+            prefs(context).edit().putBoolean(KEY_MODEL_SWITCHED, true).apply()
+        }
+
+        fun consumeModelSwitched(context: Context): Boolean {
+            val switched = prefs(context).getBoolean(KEY_MODEL_SWITCHED, false)
+            if (switched) {
+                prefs(context).edit().putBoolean(KEY_MODEL_SWITCHED, false).apply()
+            }
+            return switched
+        }
+
+        // Slice cap is persisted globally (not per-model) - users keep
+        // their preferred speed / quality trade-off across model swaps,
+        // and v4 / v4.6 / 2.6 all use the same slicing semantics.
+        fun getImageMaxSliceNums(context: Context): Int =
+            prefs(context).getInt(KEY_IMAGE_MAX_SLICE, DEFAULT_IMAGE_SLICE)
+                .coerceIn(MIN_IMAGE_SLICE, MAX_IMAGE_SLICE)
+
+        fun setImageMaxSliceNumsPref(context: Context, n: Int) {
+            val clamped = n.coerceIn(MIN_IMAGE_SLICE, MAX_IMAGE_SLICE)
+            prefs(context).edit().putInt(KEY_IMAGE_MAX_SLICE, clamped).apply()
+        }
+
+        fun getImageScaleFactor(context: Context): Float =
+            prefs(context).getFloat(KEY_IMAGE_SCALE_FACTOR, DEFAULT_IMAGE_SCALE_FACTOR)
+                .coerceIn(MIN_IMAGE_SCALE_FACTOR, MAX_IMAGE_SCALE_FACTOR)
+
+        fun setImageScaleFactorPref(context: Context, factor: Float) {
+            val clamped = factor.coerceIn(MIN_IMAGE_SCALE_FACTOR, MAX_IMAGE_SCALE_FACTOR)
+            val stepped = (clamped * 10).roundToInt() / 10f
+            prefs(context).edit().putFloat(KEY_IMAGE_SCALE_FACTOR, stepped).apply()
+        }
+
+        fun getEnableThinking(context: Context): Boolean =
+            prefs(context).getBoolean(KEY_ENABLE_THINKING, false)
+
+        fun setEnableThinkingPref(context: Context, enable: Boolean) {
+            prefs(context).edit().putBoolean(KEY_ENABLE_THINKING, enable).apply()
+        }
+
+        fun modelDir(context: Context): String =
+            File(context.filesDir, MODEL_SUBDIR).absolutePath
+
+        fun modelDirFor(context: Context, model: ModelInfo): String =
+            File(modelDir(context), model.id).absolutePath
+
+        fun modelPath(context: Context): String {
+            val model = getSelectedModel(context)
+            return File(modelDirFor(context, model), model.ggufFileName).absolutePath
+        }
+
+        fun mmprojPath(context: Context): String? {
+            val model = getSelectedModel(context)
+            val mmproj = model.mmprojFileName ?: return null
+            return File(modelDirFor(context, model), mmproj).absolutePath
+        }
+
+        fun acousticPath(context: Context): String? {
+            val model = getSelectedModel(context)
+            val acoustic = model.acousticFileName ?: return null
+            return File(modelDirFor(context, model), acoustic).absolutePath
+        }
+
+        fun modelsExist(context: Context): Boolean {
+            val model = getSelectedModel(context)
+            if (missingExpertFile(context, model) != null) return false
+            if (!File(modelPath(context)).exists()) return false
+            if (model.isTextOnly) return true
+            if (model.isTts) {
+                val ap = acousticPath(context) ?: return true
+                return File(ap).exists()
+            }
+            val mp = mmprojPath(context) ?: return true
+            return File(mp).exists()
+        }
+
+        private fun missingExpertFile(context: Context, model: ModelInfo): File? {
+            // Bundle payloads are enumerated by the SHA256SUMS manifest, so the
+            // draft GGUF (if any) is not otherwise tracked here; check it too,
+            // otherwise a missing draft would look like a complete download.
+            model.draftFileName?.let { draft ->
+                val draftFile = File(modelDirFor(context, model), draft)
+                if (!draftFile.isFile || !draftFile.canRead() || draftFile.length() == 0L) {
+                    return draftFile
+                }
+            }
+            val name = model.expertsDirectory ?: return null
+            val dir = File(modelDirFor(context, model), name)
+            return (listOf(File(dir, "manifest.json")) + (0 until 40).map {
+                File(dir, "layer_%03d.bin".format(java.util.Locale.ROOT, it))
+            }).firstOrNull { !it.isFile || !it.canRead() || it.length() == 0L }
+        }
+
+        // Rename map for files that were previously sideloaded with a
+        // different name and now need to match the iOS demo's filenames so a
+        // re-push isn't required. Keyed by ModelInfo.id; values are
+        // (oldName -> newName) pairs scoped to that model's sub-directory.
+        // Maps any historical filename (left) to the current canonical name
+        // (right) for files that may already exist in a user's per-model
+        // sub-directory. Each entry is consulted on app start; if a left-hand
+        // file is found it is renamed to the right-hand one. MD5 checks then
+        // either accept it or trigger a re-download. Keep the rename targets
+        // in sync with [ModelInfo.AVAILABLE_MODELS].
+        private val LEGACY_FILE_RENAMES: Map<String, List<Pair<String, String>>> = mapOf(
+            "minicpm-v-4_6-instruct" to listOf(
+                // Earliest sideloaded LLM name, then our previous demo name,
+                // both rolled forward to the released HF filename. The GGUF
+                // content is byte-stable across these names (LFS-hashed on
+                // HF, MD5-pinned on OBS) so renaming is safe.
+                "MiniCPM-V4.6-instruct-Q4_K_M.gguf" to "MiniCPM-V-4_6-Q4_K_M.gguf",
+                "minicpmv46-llm-Q4_K_M.gguf" to "MiniCPM-V-4_6-Q4_K_M.gguf"
+                // NOTE: deliberately *not* renaming the legacy mmproj
+                // filenames here; their bytes are not necessarily compatible
+                // with the demo's current clip.cpp. They are purged outright
+                // by [STALE_MMPROJ_NAMES] below.
+            ),
+            "minicpm5-0.9b" to listOf(
+                // Pre-release name (`0.9B`) → post-release HF/MS name (`1B`).
+                // The pre-release gguf came from a pre-public OBS bucket and
+                // may be byte-identical to or slightly different from the
+                // OpenBMB-published HF/MS variant; the downstream MD5/LFS
+                // check inside downloadFile will accept the matching bytes
+                // or quietly trigger a re-download, so renaming is always
+                // safe.
+                "MiniCPM5-0.9B-Q4_K_M.gguf" to "MiniCPM5-1B-Q4_K_M.gguf"
+            ),
+            "voxcpm2" to listOf(
+                // BaseLM was quantized from F16 to Q4_K_M (~3.1 GB → ~1.0 GB).
+                "VoxCPM2-BaseLM-F16.gguf" to "VoxCPM2-BaseLM-Q4_K_M.gguf"
+            )
+        )
+
+        // Pre-v2.0 the v4.6 mmproj came from a temporary OBS bucket and went
+        // through several incompatible revisions (pre-release / sealed
+        // minicpmv4_6 / demo-merger). To keep the rollout clean we purge any
+        // file that matches a known stale name; modelsExist() then reports
+        // "missing" and the new HF/MS racing download fetches the canonical
+        // OpenBMB-published `mmproj-model-f16.gguf` (whose MD5 is pinned in
+        // ModelInfo and verified after download).
+        private val STALE_MMPROJ_NAMES: Map<String, List<String>> = mapOf(
+            "minicpm-v-4_6-instruct" to listOf(
+                "mmproj-v46-model-f16.gguf",
+                // v1.7-v1.9 demo: bytes converted on the Support-iOS-Demo
+                // branch (clip.projector_type=merger). Upstream master mtmd
+                // accepts the original minicpmv4_6 projector natively so we
+                // no longer need this re-conversion; the file would also
+                // fail the new MD5 anyway.
+                "mmproj-model-merger-f16.gguf"
+                // Intentionally NOT listing "mmproj-model-f16.gguf" here:
+                // that IS the canonical name from v2.0 onwards. If a user
+                // has a stale copy from an even earlier OBS revision sitting
+                // under that name, the MD5 check inside downloadFile will
+                // delete it and re-download cleanly.
+            )
+        )
+
+        // One-shot migration: previously all model files lived flat under models/.
+        // With multiple models (v4, v4.6, ...) some filenames collide (e.g. mmproj-model-f16.gguf),
+        // so each model now gets its own subdirectory keyed by ModelInfo.id.
+        // Also handles renaming files that have been sideloaded under a
+        // legacy name (see [LEGACY_FILE_RENAMES]).
+        fun migrateLegacyLayoutIfNeeded(context: Context) {
+            val rootDir = File(modelDir(context))
+            if (!rootDir.exists()) return
+
+            for (model in ModelInfo.AVAILABLE_MODELS) {
+                val targetDir = File(rootDir, model.id)
+                val flatGguf = File(rootDir, model.ggufFileName)
+                val flatMmproj = model.mmprojFileName?.let { File(rootDir, it) }
+                if (flatGguf.exists() || (flatMmproj != null && flatMmproj.exists())) {
+                    if (!targetDir.exists()) targetDir.mkdirs()
+                    if (flatGguf.exists()) {
+                        val dst = File(targetDir, model.ggufFileName)
+                        if (!dst.exists() && flatGguf.renameTo(dst)) {
+                            Log.i(TAG, "Migrated legacy ${model.ggufFileName} into ${model.id}/")
+                        }
+                    }
+                    if (flatMmproj != null && flatMmproj.exists() && model.mmprojFileName != null) {
+                        val dst = File(targetDir, model.mmprojFileName)
+                        if (!dst.exists() && flatMmproj.renameTo(dst)) {
+                            Log.i(TAG, "Migrated legacy ${model.mmprojFileName} into ${model.id}/")
+                        }
+                    }
+                }
+
+                LEGACY_FILE_RENAMES[model.id]?.let { renames ->
+                    val perModelDir = File(rootDir, model.id)
+                    if (!perModelDir.exists()) return@let
+                    for ((oldName, newName) in renames) {
+                        val src = File(perModelDir, oldName)
+                        val dst = File(perModelDir, newName)
+                        if (src.exists() && !dst.exists() && src.renameTo(dst)) {
+                            Log.i(TAG, "Renamed legacy ${model.id}/$oldName -> $newName")
+                        }
+                    }
+                }
+
+                // Purge any stale mmproj cached under a previous filename:
+                // the OBS object behind that name has been re-converted at
+                // least once and the cached bytes may be incompatible with
+                // the demo's current clip.cpp (would crash inside
+                // mtmd_init_from_file). Companion .tmp from a partial old
+                // download is dropped too. This is intentionally one-way -
+                // we never try to "rescue" the bytes by renaming.
+                STALE_MMPROJ_NAMES[model.id]?.let { stale ->
+                    val perModelDir = File(rootDir, model.id)
+                    if (!perModelDir.exists()) return@let
+                    for (name in stale) {
+                        val f = File(perModelDir, name)
+                        if (f.exists() && f.delete()) {
+                            Log.i(TAG, "Purged stale mmproj ${model.id}/$name (incompatible OBS revision)")
+                        }
+                        val tmp = File(perModelDir, "$name.tmp")
+                        if (tmp.exists() && tmp.delete()) {
+                            Log.i(TAG, "Purged stale mmproj tmp ${model.id}/$name.tmp")
+                        }
+                    }
+                }
+            }
+        }
+
+        // Maps a selected [ModelInfo] to the matching MiniCPM-V family version
+        // tag that the (legacy) fork mtmd-ios.h would have returned via
+        // mtmd_get_minicpmv_version.  Used in [loadModel] to push the value
+        // down to native after loadMmproj.
+        //   - 46  : MiniCPM-V-4.6 instruct (the demo's only V-4.6 build)
+        //   - 5   : MiniCPM-V-4 (corresponds to upstream `clip.minicpmv_version=5`)
+        //   - 0   : no match / unknown -> native treats as "no vision-version
+        //           gating; use default n_ctx + plain assistant prefix"
+        // Kept in the companion object so [downloadModels] / [loadModel] /
+        // any future callers can reuse the same mapping without re-grepping
+        // model ids in three places.
+        fun inferMinicpmvVersion(model: ModelInfo): Int = when (model.id) {
+            "minicpm-v-4_7"          -> 47
+            "minicpm-v-4_6-instruct" -> 46
+            "minicpm-v-4"            -> 5
+            else                     -> 0
+        }
+
+        // Per-file source descriptor used by [downloadFileMultiSource] / racing.
+        private data class FileSource(val label: String, val url: URL)
+
+        /**
+         * One tick of download progress. [fraction] is the *overall* share of
+         * [ModelInfo.totalBytes] fetched so far (across every file), so the
+         * UI can drive a single determinate bar instead of a per-file one.
+         */
+        data class DownloadProgress(
+            val message: String,
+            val downloadedBytes: Long,
+            val totalBytes: Long,
+        ) {
+            val fraction: Float
+                get() = if (totalBytes > 0L) {
+                    (downloadedBytes.toDouble() / totalBytes.toDouble()).toFloat().coerceIn(0f, 1f)
+                } else 0f
+        }
+
+        /**
+         * Accumulates byte counts across the files of one download so each
+         * tick reports a single overall fraction: [completedBytes] holds the
+         * finalized files, and [overall] adds the bytes read so far in the
+         * file currently streaming.
+         */
+        private class ProgressSink(
+            private val context: Context,
+            private val grandTotal: Long,
+            private val emit: (DownloadProgress) -> Unit,
+        ) {
+            private var completedBytes = 0L
+            private var lastSampleTime = 0L
+            private var lastSampleBytes = 0L
+            private var smoothedBytesPerSec = 0.0
+
+            /** Emit an informational message at the current overall offset. */
+            fun message(text: String) = emit(DownloadProgress(text, completedBytes, grandTotal))
+
+            /** Emit ongoing progress: [downloadedInFile] bytes into the current file. */
+            fun overall(downloadedInFile: Long) {
+                val done = completedBytes + downloadedInFile
+                val now = System.currentTimeMillis()
+                if (lastSampleTime > 0L) {
+                    val dtMs = now - lastSampleTime
+                    if (dtMs > 0L) {
+                        val inst = (done - lastSampleBytes).toDouble() * 1000.0 / dtMs
+                        smoothedBytesPerSec =
+                            if (smoothedBytesPerSec <= 0.0) inst else smoothedBytesPerSec * 0.7 + inst * 0.3
+                    }
+                }
+                lastSampleTime = now
+                lastSampleBytes = done
+
+                val pct = if (grandTotal > 0L) {
+                    ((done * 100L) / grandTotal).toInt().coerceIn(0, 100)
+                } else 0
+                val mbPerSec = smoothedBytesPerSec / (1024.0 * 1024.0)
+                emit(DownloadProgress(context.getString(R.string.download_overall_progress, pct, mbPerSec), done, grandTotal))
+            }
+
+            /** Record a file that finished (or was already present) on disk. */
+            fun fileFinished(actualBytes: Long) {
+                completedBytes += actualBytes
+                // Re-baseline the speed sampler so a skipped/completed file's
+                // instantaneous byte jump isn't read as a burst of throughput.
+                lastSampleTime = 0L
+                overall(0L)
+            }
+        }
+
+        // Racing winner state passed from header-probe goroutines to the
+        // body-streaming logic. [conn] is the still-open HttpURLConnection
+        // whose response headers we accepted; the loser connections are
+        // disconnected before [body] is reached.
+        private data class RaceWinner(
+            val index: Int,
+            val source: String,
+            val conn: HttpURLConnection,
+            val responseCode: Int,
+            val contentLength: Long,
+        )
+
+        suspend fun downloadModels(
+            context: Context,
+            onProgress: (DownloadProgress) -> Unit
+        ) = withContext(Dispatchers.IO) {
+            val model = getSelectedModel(context)
+            val dir = File(modelDirFor(context, model))
+            if (!dir.exists()) dir.mkdirs()
+            val sink = ProgressSink(context, model.totalBytes, onProgress)
+
+            // Bundle models (e.g. the 4.7 Hexagon package) are more than a
+            // single gguf/mmproj pair: a ModelScope-hosted checksum manifest
+            // enumerates every payload file. Handle them on their own path and
+            // skip the racing single-file logic below.
+            val bundleManifest = model.bundleManifestFile
+            if (bundleManifest != null) {
+                val msBase = model.msRepo?.takeIf { it.isNotBlank() }
+                    ?.let { "https://www.modelscope.cn/models/$it/resolve/${model.msBranch}" }
+                    ?: throw RuntimeException("Model ${model.id} has no ModelScope repo for its bundle manifest")
+                downloadBundle(context, dir, msBase, bundleManifest, sink)
+                sink.message(context.getString(R.string.download_all_complete))
+                return@withContext
+            }
+
+            // Per file, build the *full* candidate-source list. HF + MS run
+            // in parallel; directGgufUrl/directMmprojUrl, if present, are
+            // registered as a third candidate. The first source to deliver
+            // valid response headers wins, the others get disconnected.
+            // Mirrors iOS opt-r1's MBModelDownloadHelperV2.downloadV2.
+            data class FileSpec(
+                val name: String,
+                val sources: List<FileSource>,
+                val md5: String?,
+                val bytes: Long?,
+            )
+
+            val ggufSources = mutableListOf<FileSource>()
+            val mmprojSources = mutableListOf<FileSource>()
+            val acousticSources = mutableListOf<FileSource>()
+
+            if (model.hasRemoteSources) {
+                // HF and MS are registered independently so a model can be
+                // served by just one of them (e.g. Qwen3-VL is ModelScope-only).
+                // A single source is passed to downloadFileMultiSource, which
+                // bypasses the race plumbing and streams directly.
+                val hfBase = model.hfRepo?.takeIf { it.isNotBlank() }
+                    ?.let { "https://huggingface.co/$it/resolve/${model.hfBranch}" }
+                val msBase = model.msRepo?.takeIf { it.isNotBlank() }
+                    ?.let { "https://www.modelscope.cn/models/$it/resolve/${model.msBranch}" }
+
+                fun addRemoteSources(target: MutableList<FileSource>, remotePath: String) {
+                    hfBase?.let { target.add(FileSource("HuggingFace", URL("$it/$remotePath"))) }
+                    msBase?.let { target.add(FileSource("ModelScope", URL("$it/$remotePath"))) }
+                }
+
+                addRemoteSources(ggufSources, model.ggufRemotePath)
+                if (model.isTts) {
+                    model.acousticRemotePath?.let { addRemoteSources(acousticSources, it) }
+                } else if (!model.isTextOnly) {
+                    model.mmprojRemotePath?.let { addRemoteSources(mmprojSources, it) }
+                }
+            }
+            if (!model.directGgufUrl.isNullOrBlank()) {
+                ggufSources.add(FileSource(context.getString(R.string.source_direct), URL(model.directGgufUrl)))
+            }
+            if (model.isTts && !model.directAcousticUrl.isNullOrBlank()) {
+                acousticSources.add(FileSource(context.getString(R.string.source_direct), URL(model.directAcousticUrl)))
+            }
+            if (!model.isTextOnly && !model.isTts && !model.directMmprojUrl.isNullOrBlank()) {
+                mmprojSources.add(FileSource(context.getString(R.string.source_direct), URL(model.directMmprojUrl)))
+            }
+
+            if (ggufSources.isEmpty()) {
+                throw RuntimeException("Model ${model.id} has no GGUF download source configured")
+            }
+            if (model.isTts && acousticSources.isEmpty()) {
+                throw RuntimeException("Model ${model.id} has no acoustic GGUF download source configured")
+            }
+            if (!model.isTextOnly && !model.isTts && mmprojSources.isEmpty()) {
+                throw RuntimeException("Model ${model.id} has no mmproj download source configured")
+            }
+
+            val files = mutableListOf(
+                FileSpec(model.ggufFileName, ggufSources, model.ggufMd5, model.ggufBytes),
+            )
+            if (model.isTts && model.acousticFileName != null) {
+                files.add(FileSpec(model.acousticFileName, acousticSources, model.acousticMd5, model.acousticBytes))
+            }
+            if (!model.isTextOnly && !model.isTts && model.mmprojFileName != null) {
+                files.add(FileSpec(model.mmprojFileName, mmprojSources, model.mmprojMd5, model.mmprojBytes))
+            }
+
+            val racedLabel = files.first().sources.joinToString("+") { it.label }
+            sink.message(context.getString(R.string.download_race_start, racedLabel))
+
+            for (file in files) {
+                downloadFileMultiSource(context, dir, file.name, file.sources, file.md5, sink, expectedBytes = file.bytes)
+            }
+
+            sink.message(context.getString(R.string.download_all_complete))
+        }
+
+        /**
+         * Multi-source racing download.
+         *
+         * Launches one HttpURLConnection GET per [sources] entry in parallel.
+         * The first connection whose response headers indicate success
+         * (HTTP 200/206 with positive Content-Length, or 416 with a valid
+         * Content-Range matching the local `.tmp`) wins; the others are
+         * disconnected immediately. The winner's body is streamed to disk
+         * exactly the same way [downloadFile] does it for the single-source
+         * path, including resume semantics, MD5 verification, and progress
+         * reporting tagged with the winning source label.
+         *
+         * If every source fails before any of them produces headers, the
+         * race surfaces a single combined RuntimeException to the caller.
+         *
+         * Mirrors iOS opt-r1's MBModelDownloadHelperV2.downloadV2 (race the
+         * URLSessionDownloadTask `didReceiveResponse` callbacks). Implementing
+         * this on Android uses `HttpURLConnection.responseCode` as the
+         * synchronous header gate — it blocks the worker dispatcher thread
+         * until the server sends the first byte of the status line, which is
+         * the exact moment we want to compare for a winner.
+         */
+        private suspend fun downloadFileMultiSource(
+            context: Context,
+            dir: File,
+            fileName: String,
+            sources: List<FileSource>,
+            expectedMd5: String?,
+            sink: ProgressSink,
+            expectedSha256: String? = null,
+            expectedBytes: Long? = null,
+        ) {
+            require(sources.isNotEmpty()) { "downloadFileMultiSource: empty sources" }
+
+            // Single source -> bypass race plumbing entirely.
+            if (sources.size == 1) {
+                val (label, url) = sources.first()
+                downloadFile(context, dir, fileName, url, label, expectedMd5, sink, expectedSha256, expectedBytes)
+                return
+            }
+
+            val targetFile = File(dir, fileName)
+            val tmpFile = File(dir, "$fileName.tmp")
+
+            // Fast path: same as downloadFile - if target already exists and
+            // matches its expectation, treat as done.
+            if (targetFile.exists() &&
+                (expectedMd5 != null || expectedSha256 != null || expectedBytes != null)
+            ) {
+                sink.message(context.getString(R.string.download_verifying_existing, fileName))
+                if (matchesExpectation(targetFile, expectedMd5, expectedSha256, expectedBytes)) {
+                    sink.fileFinished(targetFile.length())
+                    sink.message(context.getString(R.string.download_file_ready, fileName))
+                    Log.i(TAG, "$fileName already present and matches expectation, skipping download")
+                    if (tmpFile.exists()) tmpFile.delete()
+                    return
+                }
+                Log.w(TAG, "$fileName already present but does not match expectation; re-downloading")
+                targetFile.delete()
+                if (tmpFile.exists()) tmpFile.delete()
+            }
+
+            val resumeFrom = if (tmpFile.exists()) tmpFile.length() else 0L
+            if (resumeFrom > 0) {
+                sink.message(context.getString(R.string.download_resuming, fileName, (resumeFrom / (1024 * 1024)).toInt()))
+                Log.i(TAG, "Resuming $fileName from $resumeFrom bytes via ${sources.size}-way race")
+            } else {
+                sink.message(context.getString(R.string.download_race_fetching, sources.joinToString("+") { it.label }, fileName))
+                Log.i(TAG, "Race-downloading $fileName from ${sources.size} sources")
+            }
+
+            coroutineScope {
+                val winnerSlot = CompletableDeferred<RaceWinner>()
+                val failedCount = AtomicInteger(0)
+                val totalSources = sources.size
+                val openConns = ConcurrentHashMap<Int, HttpURLConnection>()
+
+                val jobs = sources.mapIndexed { idx, src ->
+                    launch(Dispatchers.IO) {
+                        var conn: HttpURLConnection? = null
+                        try {
+                            conn = (src.url.openConnection() as HttpURLConnection).apply {
+                                connectTimeout = 10_000
+                                readTimeout = 120_000
+                                requestMethod = "GET"
+                                instanceFollowRedirects = true
+                                setRequestProperty("User-Agent", "MiniCPMV-demo/1.0")
+                                if (resumeFrom > 0) {
+                                    setRequestProperty("Range", "bytes=$resumeFrom-")
+                                }
+                            }
+                            openConns[idx] = conn
+                            Log.i(TAG, "race[$idx] ${src.label} -> ${src.url} start")
+
+                            val code = conn.responseCode
+
+                            // 416 == server thinks we already have everything.
+                            // Treat as a valid winner with len=-1 so the body
+                            // loop short-circuits and just finalises .tmp.
+                            if (code == 416) {
+                                val totalLen = parseContentRangeTotal(conn.getHeaderField("Content-Range"))
+                                if (totalLen != null && tmpFile.length() == totalLen) {
+                                    if (winnerSlot.complete(RaceWinner(idx, src.label, conn!!, 416, -1L))) return@launch
+                                    conn.disconnect()
+                                    return@launch
+                                }
+                                throw RuntimeException("$src.label: HTTP 416 but local .tmp size ${tmpFile.length()} != server $totalLen")
+                            }
+
+                            if (code !in 200..206) {
+                                throw RuntimeException("${src.label}: HTTP $code")
+                            }
+                            val contentLen = conn.contentLength.toLong()
+                            if (contentLen <= 0L) {
+                                // Some mirrors return chunked-encoded responses
+                                // without Content-Length. Still acceptable, the
+                                // streaming loop just won't show a percentage.
+                                Log.w(TAG, "race[$idx] ${src.label}: headers OK but no Content-Length")
+                            }
+                            Log.i(TAG, "race[$idx] ${src.label} headers OK: code=$code len=$contentLen")
+
+                            if (!winnerSlot.complete(RaceWinner(idx, src.label, conn!!, code, contentLen))) {
+                                // Lost the race - drop the connection so the
+                                // server-side socket is closed promptly.
+                                conn.disconnect()
+                            }
+                        } catch (e: CancellationException) {
+                            conn?.disconnect()
+                            throw e
+                        } catch (e: Throwable) {
+                            try { conn?.disconnect() } catch (_: Throwable) {}
+                            val fc = failedCount.incrementAndGet()
+                            Log.w(TAG, "race[$idx] ${src.label} failed (${fc}/${totalSources}): ${e.message}")
+                            if (fc >= totalSources && !winnerSlot.isCompleted) {
+                                winnerSlot.completeExceptionally(
+                                    RuntimeException("$fileName: all $totalSources sources failed")
+                                )
+                            }
+                        }
+                    }
+                }
+
+                val winner = winnerSlot.await()
+                sink.message(context.getString(R.string.download_race_winner, winner.source, fileName))
+                Log.i(TAG, "race winner for $fileName: idx=${winner.index} source=${winner.source} code=${winner.responseCode}")
+
+                // Cancel everyone else first so their sockets stop pulling
+                // bytes before we start streaming the winner.
+                jobs.forEachIndexed { idx, job ->
+                    if (idx != winner.index) {
+                        openConns[idx]?.disconnect()
+                        job.cancel()
+                    }
+                }
+
+                streamWinnerToDisk(context, winner, tmpFile, targetFile, fileName, expectedMd5, resumeFrom, sink, expectedSha256)
+            }
+        }
+
+        /**
+         * Streams a successful [winner] connection body into [tmpFile], then
+         * promotes to [targetFile] and verifies MD5. Carries the resume
+         * semantics from [downloadFile] (206 -> append, 200 -> truncate, 416
+         * -> finalise as-is) so race winners are observationally equivalent
+         * to single-source downloads.
+         */
+        private fun streamWinnerToDisk(
+            context: Context,
+            winner: RaceWinner,
+            tmpFile: File,
+            targetFile: File,
+            fileName: String,
+            expectedMd5: String?,
+            resumeFrom: Long,
+            sink: ProgressSink,
+            expectedSha256: String? = null,
+        ) {
+            val source = winner.source
+            val conn = winner.conn
+            try {
+                if (winner.responseCode == 416) {
+                    Log.i(TAG, "$fileName: server reports complete (HTTP 416 via race)")
+                } else {
+                    val acceptedResume = winner.responseCode == HttpURLConnection.HTTP_PARTIAL // 206
+                    val effectiveStart = if (acceptedResume) resumeFrom else 0L
+                    val totalSize = if (winner.contentLength > 0) winner.contentLength + effectiveStart else -1L
+
+                    if (winner.responseCode == HttpURLConnection.HTTP_OK && resumeFrom > 0) {
+                        Log.w(TAG, "$fileName: server returned 200 instead of 206; restarting from 0")
+                        if (tmpFile.exists()) tmpFile.delete()
+                    }
+
+                    conn.inputStream.use { input ->
+                        FileOutputStream(tmpFile, acceptedResume && resumeFrom > 0).use { output ->
+                            val buffer = ByteArray(64 * 1024)
+                            var totalRead = effectiveStart
+                            var lastProgressTime = 0L
+                            while (true) {
+                                val read = input.read(buffer)
+                                if (read == -1) break
+                                output.write(buffer, 0, read)
+                                totalRead += read
+                                val now = System.currentTimeMillis()
+                                if (now - lastProgressTime > 500) {
+                                    lastProgressTime = now
+                                    if (totalSize > 0) {
+                                        Log.i(TAG, "$fileName: ${totalRead * 100 / totalSize}% ($source)")
+                                    }
+                                    sink.overall(totalRead)
+                                }
+                            }
+                            output.flush()
+                            try {
+                                output.fd.sync()
+                            } catch (e: Throwable) {
+                                Log.w(TAG, "fsync failed for $fileName (continuing): ${e.message}")
+                            }
+                        }
+                    }
+                }
+
+                if (targetFile.exists()) targetFile.delete()
+                if (!tmpFile.renameTo(targetFile)) {
+                    tmpFile.copyTo(targetFile, overwrite = true)
+                    tmpFile.delete()
+                }
+
+                verifyOrThrow(context, targetFile, source, expectedMd5, expectedSha256, sink, tmpFile)
+
+                sink.fileFinished(targetFile.length())
+                sink.message(context.getString(R.string.download_file_complete, fileName, (targetFile.length() / (1024 * 1024)).toInt()))
+                Log.i(TAG, "$fileName saved to ${targetFile.absolutePath} (winner=$source)")
+            } finally {
+                try { conn.disconnect() } catch (_: Throwable) {}
+            }
+        }
+
+        // Downloads a single file with HTTP Range-based resume. The on-disk
+        // staging file is `<fileName>.tmp`; if it already exists from a prior
+        // (interrupted) attempt we re-issue the request with `Range: bytes=N-`
+        // so the server only sends the missing tail. The .tmp file is
+        // deliberately preserved across cancellations / process death so the
+        // user can resume seamlessly the next time `downloadModels` runs.
+        //
+        // Server response handling:
+        //   - 200 OK  : server ignored Range (or .tmp was empty) -> overwrite from 0
+        //   - 206 Partial Content : append missing tail to existing .tmp
+        //   - 416 Range Not Satisfiable : .tmp is already the full file -> finalize
+        private fun downloadFile(
+            context: Context,
+            dir: File,
+            fileName: String,
+            url: URL,
+            source: String,
+            expectedMd5: String?,
+            sink: ProgressSink,
+            expectedSha256: String? = null,
+            expectedBytes: Long? = null,
+        ) {
+            val targetFile = File(dir, fileName)
+            val tmpFile = File(dir, "$fileName.tmp")
+
+            // Fast path: if the file is already on disk and matches its
+            // expectation (hash preferred, size otherwise), skip re-downloading.
+            // Saves 500MB-1GB on app reinstall / dev iteration, and prevents a
+            // partial re-download from re-fetching files that are already
+            // complete (e.g. Qwen3-VL has no pinned hash, only a size).
+            if (targetFile.exists() &&
+                (expectedMd5 != null || expectedSha256 != null || expectedBytes != null)
+            ) {
+                sink.message(context.getString(R.string.download_verifying_existing_src, source, fileName))
+                if (matchesExpectation(targetFile, expectedMd5, expectedSha256, expectedBytes)) {
+                    sink.fileFinished(targetFile.length())
+                    sink.message(context.getString(R.string.download_file_ready, fileName))
+                    Log.i(TAG, "$fileName already present and matches expectation, skipping download")
+                    // Stale .tmp from an even older interrupted attempt - drop it.
+                    if (tmpFile.exists()) tmpFile.delete()
+                    return
+                }
+                Log.w(TAG, "$fileName already present but does not match expectation; re-downloading")
+                targetFile.delete()
+                // The cached .tmp (if any) belonged to a previous, mismatching
+                // version; better to start clean.
+                if (tmpFile.exists()) tmpFile.delete()
+            }
+
+            val resumeFrom = if (tmpFile.exists()) tmpFile.length() else 0L
+            if (resumeFrom > 0) {
+                val mb = resumeFrom / (1024 * 1024)
+                sink.message(context.getString(R.string.download_resuming_src, source, fileName, mb.toInt()))
+                Log.i(TAG, "Resuming $fileName from $resumeFrom bytes ($source: $url)")
+            } else {
+                sink.message(context.getString(R.string.download_fetching_file, source, fileName))
+                Log.i(TAG, "Downloading $fileName from $source: $url")
+            }
+
+            val conn = (url.openConnection() as HttpURLConnection).apply {
+                connectTimeout = 10000
+                readTimeout = 120000
+                requestMethod = "GET"
+                instanceFollowRedirects = true
+                setRequestProperty("User-Agent", "MiniCPMV-demo/1.0")
+                if (resumeFrom > 0) {
+                    setRequestProperty("Range", "bytes=$resumeFrom-")
+                }
+            }
+
+            try {
+                val responseCode = conn.responseCode
+
+                // 416: server thinks we already have everything. Verify size
+                // matches Content-Range total before treating .tmp as complete.
+                if (responseCode == 416 /* RANGE_NOT_SATISFIABLE */) {
+                    val totalLen = parseContentRangeTotal(conn.getHeaderField("Content-Range"))
+                    if (totalLen != null && tmpFile.length() == totalLen) {
+                        Log.i(TAG, "$fileName: server reports complete (HTTP 416, size=$totalLen)")
+                    } else {
+                        // .tmp is somehow larger than server's file (different
+                        // mirror? truncated download earlier?). Reset.
+                        Log.w(TAG, "$fileName: HTTP 416 but local size ${tmpFile.length()} != server $totalLen; restarting")
+                        tmpFile.delete()
+                        throw RuntimeException(context.getString(R.string.download_416_mismatch, source))
+                    }
+                } else {
+                    val acceptedResume = responseCode == HttpURLConnection.HTTP_PARTIAL // 206
+                    val isOk = responseCode == HttpURLConnection.HTTP_OK // 200
+                    if (!acceptedResume && !isOk) {
+                        throw RuntimeException("$source returned $responseCode for $fileName")
+                    }
+
+                    // 200 means the server didn't honor Range - either we asked
+                    // for bytes=0- (then 200/206 are equivalent), or the server
+                    // doesn't support ranges. Either way, restart from 0.
+                    if (isOk && resumeFrom > 0) {
+                        Log.w(TAG, "$fileName: server returned 200 instead of 206; restarting from 0")
+                        if (tmpFile.exists()) tmpFile.delete()
+                    }
+
+                    val effectiveStart = if (acceptedResume) resumeFrom else 0L
+                    val remaining = conn.contentLength.toLong() // -1 if unknown
+                    val totalSize = if (remaining > 0) remaining + effectiveStart else -1L
+
+                    conn.inputStream.use { input ->
+                        // append=true only when we actually got 206 and are
+                        // continuing the existing .tmp; otherwise truncate.
+                        FileOutputStream(tmpFile, acceptedResume && resumeFrom > 0).use { output ->
+                            val buffer = ByteArray(64 * 1024)
+                            var totalRead = effectiveStart
+                            var lastProgressTime = 0L
+
+                            while (true) {
+                                val read = input.read(buffer)
+                                if (read == -1) break
+                                output.write(buffer, 0, read)
+                                totalRead += read
+
+                                val now = System.currentTimeMillis()
+                                if (now - lastProgressTime > 500) {
+                                    lastProgressTime = now
+                                    if (totalSize > 0) {
+                                        Log.i(TAG, "$fileName: ${totalRead * 100 / totalSize}%")
+                                    }
+                                    sink.overall(totalRead)
+                                }
+                            }
+                            output.flush()
+                            // fd.sync() ensures bytes hit the storage device
+                            // before we trust the .tmp size for the next
+                            // resume attempt. It's cheap relative to a 1GB
+                            // download but, on some Android devices/FS
+                            // combinations, can throw SyncFailedException -
+                            // wrap it so a fsync hiccup doesn't fail an
+                            // otherwise-fine download.
+                            try {
+                                output.fd.sync()
+                            } catch (e: Throwable) {
+                                Log.w(TAG, "fsync failed for $fileName (continuing): ${e.message}")
+                            }
+                        }
+                    }
+                }
+
+                // Promote .tmp -> final.
+                if (targetFile.exists()) targetFile.delete()
+                if (!tmpFile.renameTo(targetFile)) {
+                    tmpFile.copyTo(targetFile, overwrite = true)
+                    tmpFile.delete()
+                }
+
+                verifyOrThrow(context, targetFile, source, expectedMd5, expectedSha256, sink, tmpFile)
+
+                sink.fileFinished(targetFile.length())
+                sink.message(context.getString(R.string.download_file_complete, fileName, (targetFile.length() / (1024 * 1024)).toInt()))
+                Log.i(TAG, "$fileName saved to ${targetFile.absolutePath}")
+            } finally {
+                conn.disconnect()
+                // Note: we deliberately do NOT delete tmpFile in catch-all -
+                // a transient network error / process kill should leave the
+                // partial bytes on disk so the next call can resume.
+            }
+        }
+
+        // Parse the "*/<total>" suffix out of a Content-Range header.
+        // Returns null if header is missing or malformed.
+        private fun parseContentRangeTotal(header: String?): Long? {
+            if (header.isNullOrEmpty()) return null
+            val slash = header.lastIndexOf('/')
+            if (slash < 0 || slash == header.length - 1) return null
+            return header.substring(slash + 1).trim().toLongOrNull()
+        }
+
+        // Streaming MD5 over a file. Buffer size kept small enough to avoid
+        // memory pressure on cheaper devices while still being decently fast
+        // (~150MB/s on the test phone for the 1GB mmproj).
+        private fun computeDigest(file: File, algorithm: String): String {
+            val md = MessageDigest.getInstance(algorithm)
+            FileInputStream(file).use { input ->
+                val buffer = ByteArray(64 * 1024)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    md.update(buffer, 0, read)
+                }
+            }
+            return md.digest().joinToString("") { "%02x".format(it) }
+        }
+
+        private fun computeMd5(file: File): String = computeDigest(file, "MD5")
+
+        // Whether [file] matches the first non-null expectation. Callers only
+        // invoke this with at least one expectation set. Hash beats size:
+        // SHA-256 > MD5 > exact byte length.
+        private fun matchesExpectation(
+            file: File,
+            expectedMd5: String?,
+            expectedSha256: String?,
+            expectedBytes: Long?,
+        ): Boolean = when {
+            expectedSha256 != null -> computeDigest(file, "SHA-256").equals(expectedSha256, ignoreCase = true)
+            expectedMd5 != null -> computeMd5(file).equals(expectedMd5, ignoreCase = true)
+            expectedBytes != null -> file.length() == expectedBytes
+            else -> true
+        }
+
+        // Verifies [file] against whichever hash is pinned (SHA-256 preferred,
+        // MD5 fallback). Deletes the file and throws on mismatch. A no-op when
+        // neither hash is set.
+        private fun verifyOrThrow(
+            context: Context,
+            file: File,
+            source: String,
+            expectedMd5: String?,
+            expectedSha256: String?,
+            sink: ProgressSink,
+            tmpFile: File? = null,
+        ) {
+            when {
+                expectedSha256 != null -> {
+                    sink.message(context.getString(R.string.download_verifying_sha256, source, file.name))
+                    val actual = computeDigest(file, "SHA-256")
+                    if (!actual.equals(expectedSha256, ignoreCase = true)) {
+                        Log.e(TAG, "${file.name} SHA-256 mismatch: expected $expectedSha256, got $actual")
+                        file.delete()
+                        tmpFile?.let { if (it.exists()) it.delete() }
+                        throw RuntimeException(
+                            context.getString(R.string.download_sha256_failed, file.name, expectedSha256, actual)
+                        )
+                    }
+                    Log.i(TAG, "${file.name} SHA-256 OK ($actual)")
+                }
+                expectedMd5 != null -> {
+                    sink.message(context.getString(R.string.download_verifying_md5, source, file.name))
+                    val actual = computeMd5(file)
+                    if (!actual.equals(expectedMd5, ignoreCase = true)) {
+                        Log.e(TAG, "${file.name} MD5 mismatch: expected $expectedMd5, got $actual")
+                        file.delete()
+                        tmpFile?.let { if (it.exists()) it.delete() }
+                        throw RuntimeException(
+                            context.getString(R.string.download_md5_failed, file.name, expectedMd5, actual)
+                        )
+                    }
+                    Log.i(TAG, "${file.name} MD5 OK ($actual)")
+                }
+            }
+        }
+
+        // Downloads every file listed by a `sha256  <relative-path>` manifest
+        // served from a ModelScope repo into the model directory, verifying
+        // each entry. Used for multi-file bundles (see
+        // [ModelInfo.bundleManifestFile]).
+        private suspend fun downloadBundle(
+            context: Context,
+            dir: File,
+            msBase: String,
+            manifestName: String,
+            sink: ProgressSink,
+        ) {
+            val manifestUrl = URL("$msBase/$manifestName")
+            Log.i(TAG, "Fetching bundle manifest: $manifestUrl")
+            val entries = fetchChecksumManifest(manifestUrl)
+            if (entries.isEmpty()) throw RuntimeException("Empty bundle manifest: $manifestName")
+            sink.message(context.getString(R.string.download_bundle_start, entries.size, manifestName))
+            entries.forEachIndexed { index, (sha256, relativePath) ->
+                val target = File(dir, relativePath)
+                require(target.canonicalPath.startsWith(dir.canonicalPath + File.separator)) {
+                    "Invalid bundle path: $relativePath"
+                }
+                target.parentFile?.let { if (!it.exists()) it.mkdirs() }
+                sink.message(context.getString(R.string.download_bundle_progress, index + 1, entries.size, relativePath))
+                downloadFileMultiSource(
+                    context,
+                    target.parentFile ?: dir,
+                    target.name,
+                    listOf(FileSource("ModelScope", URL("$msBase/$relativePath"))),
+                    null,
+                    sink,
+                    sha256,
+                )
+            }
+        }
+
+        // Fetches and parses a `sha256  <path>` checksum manifest. Blank lines
+        // are skipped; the hash field must be 64 hex chars so a path containing
+        // spaces is preserved. Returns (lowercased-hash, path) pairs.
+        private fun fetchChecksumManifest(url: URL): List<Pair<String, String>> {
+            val conn = (url.openConnection() as HttpURLConnection).apply {
+                connectTimeout = 10_000
+                readTimeout = 30_000
+                requestMethod = "GET"
+                instanceFollowRedirects = true
+                setRequestProperty("User-Agent", "MiniCPMV-demo/1.0")
+            }
+            try {
+                val code = conn.responseCode
+                if (code != HttpURLConnection.HTTP_OK) {
+                    throw RuntimeException("Checksum manifest HTTP $code: $url")
+                }
+                val entries = mutableListOf<Pair<String, String>>()
+                conn.inputStream.bufferedReader().useLines { lines ->
+                    lines.forEach { raw ->
+                        val line = raw.trim()
+                        if (line.isEmpty()) return@forEach
+                        val parts = line.split(Regex("""\s+"""), limit = 2)
+                        require(parts.size == 2 && parts[0].matches(Regex("[0-9a-fA-F]{64}"))) {
+                            "Invalid checksum manifest entry"
+                        }
+                        val relativePath = parts[1].removePrefix("*")
+                        require(relativePath.isNotBlank() && !File(relativePath).isAbsolute) {
+                            "Invalid bundle path: $relativePath"
+                        }
+                        entries.add(parts[0].lowercase() to relativePath)
+                    }
+                }
+                return entries
+            } finally {
+                conn.disconnect()
+            }
+        }
+    }
+
+    @Volatile
+    private var _mmprojLoaded = false
+
+    @ExperimentalCoroutinesApi
+    private val llamaDispatcher = Dispatchers.IO.limitedParallelism(1)
+    private val llamaScope = CoroutineScope(llamaDispatcher + SupervisorJob())
+
+    private val _state = MutableStateFlow<LlamaState>(LlamaState.Uninitialized)
+    val state: StateFlow<LlamaState> = _state.asStateFlow()
+
+    @Volatile
+    private var _cancelGeneration = false
+
+    @Volatile
+    private var _readyForSystemPrompt = false
+
+    private external fun init(nativeLibDir: String)
+    private external fun load(modelPath: String, expertsPath: String?, memoryBudgetMb: Int): Int
+    // image_max_slice_nums: 1..9 (or -1 for model default).  See JNI for
+    // the semantics; the upper layer should pass MIN_IMAGE_SLICE..MAX_IMAGE_SLICE.
+    private external fun loadMmproj(mmprojPath: String, imageMaxSliceNums: Int): Int
+    // Native counterpart of [setImageMaxSliceNums].  Renamed in JNI as
+    // setImageMaxSliceNumsNative to avoid the name collision with the
+    // public suspend wrapper above.
+    private external fun setImageMaxSliceNumsNative(n: Int)
+    // Pushes the MiniCPM-V family version (5 / 46 / 100045 / ...) down to
+    // native so prepare()'s n_ctx selection and the assistant-turn prefix
+    // logic see the right value.  Required since upstream master mtmd
+    // dropped mtmd_get_minicpmv_version().  See LlamaEngine.loadModel.
+    private external fun setMinicpmvVersionNative(version: Int)
+    // MiniCPM5 / V-4.6 thinking toggle. Default off.
+    private external fun setEnableThinkingNative(enable: Boolean)
+    // 0 if no mmproj is loaded.  46 / 460 / 461 = MiniCPM-V-4.6 family.
+    // Used by [isVideoUnderstandingSupported] to gate the video path.
+    private external fun getMinicpmvVersionNative(): Int
+    private external fun prepare(): Int
+    private external fun systemInfo(): String
+    private external fun processSystemPrompt(systemPrompt: String): Int
+    private external fun processUserPrompt(userPrompt: String, predictLength: Int): Int
+    private external fun generateNextToken(): String?
+    private external fun prefillImage(imageData: ByteArray, imageSize: Int): Int
+    private external fun resetPerformanceStatsNative()
+    private external fun readPerformanceStatsNative(): DoubleArray
+    private external fun fullReset()
+    private external fun nativeCancelGeneration()
+    private external fun unload()
+    private external fun shutdown()
+
+    init {
+        llamaScope.launch {
+            try {
+                check(_state.value is LlamaState.Uninitialized) {
+                    "Cannot load native library in ${_state.value.javaClass.simpleName}!"
+                }
+                _state.value = LlamaState.Initializing
+                Log.i(TAG, "Loading native library...")
+                Log.i(TAG, CpuFeatures.summary())
+
+                val variant = CpuFeatures.bestGgmlCpuVariant()
+                if (variant != null) {
+                    try {
+                        Log.i(TAG, "Pre-loading optimised ggml-cpu ($variant)")
+                        System.loadLibrary("ggml-cpu-$variant")
+                        Log.i(TAG, "Optimised ggml-cpu ($variant) loaded successfully")
+                    } catch (e: UnsatisfiedLinkError) {
+                        Log.w(TAG, "Optimised ggml-cpu-$variant not available, using baseline", e)
+                    }
+                }
+
+                System.loadLibrary("mobiinfer")
+                init(nativeLibDir)
+                _state.value = LlamaState.Initialized
+                Log.i(TAG, "Native library loaded! System info: \n${systemInfo()}")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to load native library", e)
+                _state.value = LlamaState.Error(e)
+                throw e
+            }
+        }
+    }
+
+    suspend fun loadModel(pathToModel: String, pathToMmproj: String? = null) =
+        withContext(llamaDispatcher) {
+            check(_state.value is LlamaState.Initialized) {
+                "Cannot load model in ${_state.value.javaClass.simpleName}!"
+            }
+            try {
+                Log.i(TAG, "Checking access to model file... \n$pathToModel")
+                File(pathToModel).let {
+                    require(it.exists()) { "File not found: $pathToModel" }
+                    require(it.isFile) { "Not a valid file: $pathToModel" }
+                    require(it.canRead()) { "Cannot read file: $pathToModel" }
+                }
+
+                Log.i(TAG, "Loading model... \n$pathToModel")
+                _readyForSystemPrompt = false
+                _state.value = LlamaState.LoadingModel
+                val modelInfo = getSelectedModel(context)
+                val missingExpert = missingExpertFile(context, modelInfo)
+                require(missingExpert == null) { "Missing or unreadable expert file: $missingExpert" }
+                val expertsPath = modelInfo.expertsDirectory?.let {
+                    File(File(pathToModel).parentFile, it).absolutePath
+                }
+                if (expertsPath != null) {
+                    require(pathToMmproj != null && File(pathToMmproj).canRead()) {
+                        "MiniCPM-V 4.7 vision weights are missing or unreadable"
+                    }
+                }
+                load(pathToModel, expertsPath, getMemoryBudgetMb(context)).let {
+                    if (it != 0) throw RuntimeException("Failed to load model (code: $it)")
+                }
+
+                if (pathToMmproj != null) {
+                    Log.i(TAG, "Checking access to mmproj file... \n$pathToMmproj")
+                    File(pathToMmproj).let {
+                        require(it.exists()) { "mmproj file not found: $pathToMmproj" }
+                        require(it.isFile) { "Not a valid mmproj file: $pathToMmproj" }
+                        require(it.canRead()) { "Cannot read mmproj file: $pathToMmproj" }
+                    }
+
+                    val sliceCap = getImageMaxSliceNums(context)
+                    Log.i(TAG, "Loading mmproj (image_max_slice_nums=$sliceCap)... \n$pathToMmproj")
+                    loadMmproj(pathToMmproj, sliceCap).let {
+                        if (it != 0) {
+                            if (expertsPath != null) throw RuntimeException("Failed to load MiniCPM-V 4.7 vision weights (code: $it)")
+                            Log.w(TAG, "Failed to load mmproj (code: $it), continuing without vision support")
+                        } else {
+                            _mmprojLoaded = true
+                            // Upstream master mtmd dropped mtmd_get_minicpmv_version, so the
+                            // native side can no longer auto-detect which MiniCPM-V family
+                            // an mmproj belongs to.  Push the version down from Kotlin based
+                            // on the selected ModelInfo id; native uses this to (a) flip
+                            // n_ctx to V46_CONTEXT_SIZE on prepare() and (b) pick the right
+                            // assistant-turn prefix.  Mirrors iOS opt-r1, which routes the
+                            // same hint through the MBMtmd bridge / MTMDParams.
+                            val mv = inferMinicpmvVersion(getSelectedModel(context))
+                            setMinicpmvVersionNative(mv)
+                            Log.i(TAG, "mmproj loaded successfully! minicpmv_version=$mv")
+                        }
+                    }
+                }
+
+                prepare().let {
+                    if (it != 0) throw RuntimeException("Failed to prepare resources (code: $it)")
+                }
+                Log.i(TAG, "Model loaded!")
+                _readyForSystemPrompt = true
+                _cancelGeneration = false
+                setEnableThinkingNative(getEnableThinking(context))
+                _state.value = LlamaState.ModelReady
+            } catch (e: Exception) {
+                Log.e(TAG, (e.message ?: "Error loading model") + "\n" + pathToModel, e)
+                unload()
+                _mmprojLoaded = false
+                _state.value = LlamaState.Error(e)
+                throw e
+            }
+        }
+
+    val isVisionSupported: Boolean get() = _mmprojLoaded
+
+    // Live update of the per-image slice cap.  Persists the new value to
+    // SharedPreferences so the next mmproj reload picks it up too, and
+    // (if mmproj is currently loaded) immediately patches the in-memory
+    // clip context so the *next* image picked uses the new cap without
+    // needing a model reload.  Cheap (no allocation, no warmup) - safe to
+    // wire to a continuous slider.
+    suspend fun setImageMaxSliceNums(n: Int) = withContext(llamaDispatcher) {
+        val clamped = n.coerceIn(MIN_IMAGE_SLICE, MAX_IMAGE_SLICE)
+        setImageMaxSliceNumsPref(context, clamped)
+        if (_mmprojLoaded) {
+            Log.i(TAG, "Live-updating image_max_slice_nums = $clamped")
+            setImageMaxSliceNumsNative(clamped)
+        } else {
+            Log.i(TAG, "image_max_slice_nums = $clamped persisted; will apply on next mmproj load")
+        }
+    }
+
+    fun setEnableThinking(enable: Boolean) {
+        setEnableThinkingPref(context, enable)
+        setEnableThinkingNative(enable)
+        Log.i(TAG, "enable_thinking=$enable")
+    }
+
+    suspend fun setSystemPrompt(prompt: String) =
+        withContext(llamaDispatcher) {
+            require(prompt.isNotBlank()) { "Cannot process empty system prompt!" }
+            check(_readyForSystemPrompt) { "System prompt must be set RIGHT AFTER model loaded!" }
+            check(_state.value is LlamaState.ModelReady) {
+                "Cannot process system prompt in ${_state.value.javaClass.simpleName}!"
+            }
+
+            Log.i(TAG, "Sending system prompt...")
+            _readyForSystemPrompt = false
+            _state.value = LlamaState.ProcessingSystemPrompt
+            processSystemPrompt(prompt).let { result ->
+                if (result != 0) {
+                    RuntimeException("Failed to process system prompt: $result").also {
+                        _state.value = LlamaState.Error(it)
+                        throw it
+                    }
+                }
+            }
+            Log.i(TAG, "System prompt processed! Awaiting user prompt...")
+            _state.value = LlamaState.ModelReady
+        }
+
+    suspend fun prefillImage(imageData: ByteArray) =
+        withContext(llamaDispatcher) {
+            check(_mmprojLoaded) { "Vision model not loaded!" }
+            check(_state.value is LlamaState.ModelReady) {
+                "Cannot prefill image in ${_state.value.javaClass.simpleName}!"
+            }
+
+            Log.i(TAG, "Prefilling image...")
+            _state.value = LlamaState.PrefillingImage
+            val result = prefillImage(imageData, imageData.size)
+            if (result != 0) {
+                _state.value = LlamaState.ModelReady
+                throw RuntimeException("Failed to prefill image (code: $result)")
+            }
+            Log.i(TAG, "Image prefilled!")
+            _state.value = LlamaState.ModelReady
+        }
+
+    suspend fun resetPerformanceStats() = withContext(llamaDispatcher) {
+        resetPerformanceStatsNative()
+    }
+
+    suspend fun readVisionEncodingMs(): Long? = withContext(llamaDispatcher) {
+        val values = readPerformanceStatsNative()
+        values.getOrNull(4)?.takeIf { it.isFinite() && it >= 0.0 }?.toLong()
+    }
+
+    suspend fun readPerformanceRates(): Pair<Double?, Double?> = withContext(llamaDispatcher) {
+        val values = readPerformanceStatsNative()
+        if (values.size < 4) return@withContext null to null
+        val prefillMs = values[0]
+        val prefillTokens = values[1]
+        val decodeMs = values[2]
+        val decodeTokens = values[3]
+        val prefillRate = if (prefillMs > 0.0 && prefillTokens > 0.0) prefillTokens * 1000.0 / prefillMs else null
+        val decodeRate = if (decodeMs > 0.0 && decodeTokens > 0.0) decodeTokens * 1000.0 / decodeMs else null
+        prefillRate to decodeRate
+    }
+
+    /**
+     * True iff the currently loaded mmproj advertises a MiniCPM-V-4.6
+     * family clip (46 / 460 / 461).  Earlier models share the same image
+     * code path but the iOS demo also restricts video understanding to
+     * V-4.6 because the perceiver token count + extended `n_ctx=8192`
+     * combine to make multi-frame prefill cheap enough to be usable.
+     * The Android backend mirrors that gate by reading
+     * mtmd_get_minicpmv_version() back through getMinicpmvVersionNative.
+     */
+    val isVideoUnderstandingSupported: Boolean
+        get() {
+            if (!_mmprojLoaded) return false
+            val v = try { getMinicpmvVersionNative() } catch (_: Throwable) { 0 }
+            return v == 46 || v == 460 || v == 461
+        }
+
+    /**
+     * Prefills a sequence of video frames into the model.  Iterates over
+     * [frames] and feeds each one through the same native path as
+     * [prefillImage] (which is exactly what iOS does via repeated
+     * `mtmd_ios_prefill_frame`: the C++ implementation of `prefill_frame`
+     * and `prefill_image` in `mtmd-ios.cpp` are byte-for-byte identical
+     * apart from the error-log prefix).
+     *
+     * Side effects to match iOS [MBHomeViewController+CaptureVideo]:
+     *  - Slice cap is temporarily forced to 1 for the duration of the
+     *    video so the per-frame ViT cost stays manageable; the user's
+     *    chat-page slider value is restored on exit (also on failure).
+     *    The persisted SharedPreference is NOT touched - the slider
+     *    keeps showing the user's chosen value.
+     *  - State is parked in [LlamaState.PrefillingImage] across all
+     *    frames so the UI shows a single "prefilling" badge rather
+     *    than flickering between frames.
+     *
+     * @param onProgress invoked on this engine's serial dispatcher
+     * after each successfully-prefilled frame.  Caller should
+     * `withContext(Dispatchers.Main)` before touching UI.
+     */
+    suspend fun prefillVideoFrames(
+        frames: List<ByteArray>,
+        onProgress: suspend (current: Int, total: Int) -> Unit = { _, _ -> }
+    ) = withContext(llamaDispatcher) {
+        check(_mmprojLoaded) { "Vision model not loaded!" }
+        check(isVideoUnderstandingSupported) {
+            "Video understanding only supported on MiniCPM-V-4.6 (current version=" +
+                "${getMinicpmvVersionNative()})"
+        }
+        check(_state.value is LlamaState.ModelReady) {
+            "Cannot prefill video in ${_state.value.javaClass.simpleName}!"
+        }
+        require(frames.isNotEmpty()) { "No frames to prefill" }
+
+        val savedSliceCap = getImageMaxSliceNums(context)
+        val needSliceOverride = savedSliceCap > 1
+
+        Log.i(TAG, "Prefilling ${frames.size} video frames (savedSlice=$savedSliceCap, override=$needSliceOverride)")
+        _state.value = LlamaState.PrefillingImage
+        try {
+            if (needSliceOverride) {
+                Log.i(TAG, "Temporarily forcing image_max_slice_nums=1 for video frames")
+                setImageMaxSliceNumsNative(1)
+            }
+            for ((idx, frame) in frames.withIndex()) {
+                val rc = prefillImage(frame, frame.size)
+                if (rc != 0) {
+                    throw RuntimeException(
+                        "Failed to prefill video frame ${idx + 1}/${frames.size} (code: $rc)"
+                    )
+                }
+                onProgress(idx + 1, frames.size)
+            }
+            Log.i(TAG, "Video frames prefilled successfully")
+        } finally {
+            if (needSliceOverride) {
+                Log.i(TAG, "Restoring image_max_slice_nums=$savedSliceCap after video")
+                setImageMaxSliceNumsNative(savedSliceCap)
+            }
+            _state.value = LlamaState.ModelReady
+        }
+    }
+
+    suspend fun clearContext() =
+        withContext(llamaDispatcher) {
+            check(_state.value is LlamaState.ModelReady) {
+                "Cannot clear context in ${_state.value.javaClass.simpleName}"
+            }
+            fullReset()
+            _readyForSystemPrompt = true
+            Log.i(TAG, "Context fully reset - context recreated, ready for new conversation")
+        }
+
+    fun sendUserPrompt(
+        message: String,
+        predictLength: Int = DEFAULT_PREDICT_LENGTH
+    ): Flow<String> = flow {
+        require(message.isNotEmpty()) { "User prompt must not be empty!" }
+        check(_state.value is LlamaState.ModelReady) {
+            "User prompt discarded due to: ${_state.value.javaClass.simpleName}"
+        }
+
+        try {
+            _cancelGeneration = false
+            Log.i(TAG, "Sending user prompt...")
+            _readyForSystemPrompt = false
+            _state.value = LlamaState.ProcessingUserPrompt
+
+            processUserPrompt(message, predictLength).let { result ->
+                if (result != 0) {
+                    Log.e(TAG, "Failed to process user prompt: $result")
+                    throw IllegalStateException("Failed to process user prompt (code: $result)")
+                }
+            }
+
+            Log.i(TAG, "User prompt processed. Generating assistant prompt...")
+            _state.value = LlamaState.Generating
+            while (!_cancelGeneration) {
+                generateNextToken()?.let { utf8token ->
+                    if (utf8token.isNotEmpty()) emit(utf8token)
+                } ?: break
+            }
+            if (_cancelGeneration) {
+                Log.i(TAG, "Assistant generation aborted per requested.")
+                throw CancellationException("Generation cancelled")
+            } else {
+                Log.i(TAG, "Assistant generation complete. Awaiting user prompt...")
+            }
+            _state.value = LlamaState.ModelReady
+        } catch (e: CancellationException) {
+            Log.i(TAG, "Assistant generation's flow collection cancelled.")
+            nativeCancelGeneration()
+            _state.value = LlamaState.ModelReady
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "Error during generation!", e)
+            runCatching { nativeCancelGeneration() }
+            _state.value = LlamaState.Error(e)
+            throw e
+        }
+    }.flowOn(llamaDispatcher)
+
+    fun cancelGeneration() {
+        _cancelGeneration = true
+    }
+
+    suspend fun unloadModel() = withContext(llamaDispatcher) {
+        if (_state.value is LlamaState.ModelReady || _state.value is LlamaState.Error) {
+            Log.i(TAG, "Unloading model...")
+            _readyForSystemPrompt = false
+            _mmprojLoaded = false
+            _state.value = LlamaState.UnloadingModel
+            unload()
+            _state.value = LlamaState.Initialized
+            Log.i(TAG, "Model unloaded")
+        }
+    }
+
+    fun resetToInitialized() {
+        _mmprojLoaded = false
+        _readyForSystemPrompt = false
+        _cancelGeneration = false
+        _state.value = LlamaState.Initialized
+    }
+
+    fun cleanUp() {
+        _cancelGeneration = true
+        runBlocking(llamaDispatcher) {
+            when (val state = _state.value) {
+                is LlamaState.ModelReady -> {
+                    Log.i(TAG, "Unloading model and free resources...")
+                    _readyForSystemPrompt = false
+                    _mmprojLoaded = false
+                    _state.value = LlamaState.UnloadingModel
+                    unload()
+                    _state.value = LlamaState.Initialized
+                    Log.i(TAG, "Model unloaded!")
+                }
+                is LlamaState.Error -> {
+                    Log.i(TAG, "Resetting error states...")
+                    unload()
+                    _mmprojLoaded = false
+                    _state.value = LlamaState.Initialized
+                }
+                else -> throw IllegalStateException("Cannot unload model in ${state.javaClass.simpleName}")
+            }
+        }
+    }
+
+    fun destroy() {
+        _cancelGeneration = true
+        runBlocking(llamaDispatcher) {
+            _readyForSystemPrompt = false
+            _mmprojLoaded = false
+            when (_state.value) {
+                is LlamaState.Uninitialized -> {}
+                is LlamaState.Initialized -> shutdown()
+                else -> { unload(); shutdown() }
+            }
+        }
+        llamaScope.cancel()
+    }
+
+}
