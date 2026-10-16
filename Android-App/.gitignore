@@ -1,0 +1,114 @@
+# Xcode
+#
+# gitignore contributors: remember to update Global/Xcode.gitignore, Objective-C.gitignore & Swift.gitignore
+
+## User settings
+xcuserdata/
+
+## compatibility with Xcode 8 and earlier (ignoring not required starting Xcode 9)
+*.xcscmblueprint
+*.xccheckout
+
+## compatibility with Xcode 3 and earlier (ignoring not required starting Xcode 4)
+build/
+DerivedData/
+build-device/
+build-*/
+*.moved-aside
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+
+## Obj-C/Swift specific
+*.hmap
+
+## App packaging
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# CocoaPods
+#
+# We recommend against adding the Pods directory to your .gitignore. However
+# you should judge for yourself, the pros and cons are mentioned at:
+# https://guides.cocoapods.org/using/using-cocoapods.html#should-i-check-the-pods-directory-into-source-control
+#
+Pods/
+#
+# Add this line if you want to avoid checking in source code from the Xcode workspace
+# *.xcworkspace
+
+# Carthage
+#
+# Add this line if you want to avoid checking in source code from Carthage dependencies.
+# Carthage/Checkouts
+
+Carthage/Build/
+
+# fastlane
+#
+# It is recommended to not store the screenshots in the git repo.
+# Instead, use fastlane to re-generate the screenshots whenever they are needed.
+# For more information about the recommended setup visit:
+# https://docs.fastlane.tools/best-practices/source-control/#source-control
+
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output
+
+# Code Injection
+#
+# After new code Injection tools there's a generated folder /iOSInjectionProject
+# https://github.com/johnno1962/injectionforxcode
+
+iOSInjectionProject/
+
+
+# MacOS Folder Cache
+.DS_Store
+__MACOSX
+
+# Xcode build cache (xcodebuild -derivedDataPath)
+build_tmp/
+build-derived/
+
+# AI agent local notes (Claude / Cursor / Codex 等本地协作笔记，不入库)
+CLAUDE.md
+.claude/
+.cursor/
+
+# Prebuilt llama.xcframework: 必须从仓库根的推理引擎构建出来再放到这里，
+# 仓库不再追踪二进制本身 (~189 MB)，详见 README "构建 llama.xcframework" 一节
+MobiInfer-demo/thirdparty/llama.xcframework/
+MobiInfer-demo/thirdparty/llama.xcframework.bak/
+
+# Android Studio 个人/项目级 IDE 配置 (compiler.xml / misc.xml / vcs.xml 等会随 AS 版本漂移)
+MobiInfer-Android/.idea/
+
+# HarmonyOS 模块依赖目录 (相当于 node_modules，构建产物，不入库)
+MobiInfer-HarmonyOS/entry/oh_modules/
+MobiInfer-HarmonyOS/oh_modules/
+
+# HarmonyOS 调试签名配置：build-profile.json5 由 DevEco Studio
+# "Automatically generate signature" 写入本机 ~/.ohos/config/ 下的 .p12
+# 路径 + 加密 password，每台机器都不一样且属于本地凭据，不入库。
+# 见 build-profile.json5.example 与 README 鸿蒙端 "环境要求 / 签名" 一节。
+MobiInfer-HarmonyOS/build-profile.json5
+
+# HarmonyOS hvigor 本地构建 state / cache / outputs（相当于 Gradle 的 .gradle/）。
+.hvigor/
+
+# Local release artefacts (APK / HAP copies). Never commit binaries.
+dist/
+
+# Prebuilt llama.xcframework variants (numbered copies)
+MobiInfer-demo/thirdparty/*_llama.xcframework/
+
+# VSCode per-user / local absolute paths
+.vscode/

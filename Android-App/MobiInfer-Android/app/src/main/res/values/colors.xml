@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- MobiInfer palette sampled from ClawMate's Android design tokens. -->
+    <!-- Slightly deepened from ClawMate's #8066FF so white button labels pass AA. -->
+    <color name="primary">#FF7B59FB</color>
+    <color name="on_primary">#FFFFFFFF</color>
+    <color name="primary_container">#FFF0ECFF</color>
+    <color name="on_primary_container">#FF2C205F</color>
+    <color name="secondary">#FF4D66FF</color>
+    <color name="on_secondary">#FFFFFFFF</color>
+    <color name="secondary_container">#FFEAF1FF</color>
+    <color name="on_secondary_container">#FF182B63</color>
+    <color name="background">#FFF4F8FF</color>
+    <color name="surface">#FFFFFFFF</color>
+    <color name="on_surface">#FF151A28</color>
+    <color name="surface_variant">#FFF8FAFE</color>
+    <color name="on_surface_variant">#FF6B7280</color>
+    <color name="outline">#FF808A9A</color>
+    <color name="window_background">#FFF4F8FF</color>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+
+    <!-- Keep the existing icon canvas until the MobiInfer launcher mark is updated. -->
+    <color name="ic_launcher_background">#FFFFFFFF</color>
+</resources>

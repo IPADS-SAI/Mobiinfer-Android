@@ -1,0 +1,253 @@
+#include "minicpm47_runtime.h"
+#include "minicpm47_memory.h"
+#include "logging.h"
+#include "server-context.h"
+#include "chat.h"
+#include "log.h"
+#include <nlohmann/json.hpp>
+#include <fstream>
+#include <thread>
+#include <stdexcept>
+
+struct MiniCPM47Runtime::Impl {
+    common_params params;
+    std::unique_ptr<server_context> server;
+    std::unique_ptr<server_response_reader> reader;
+    std::thread worker;
+    std::vector<common_chat_msg> messages;
+    std::vector<raw_buffer> files;
+    std::string pending_media;
+    std::string response;
+    bool thinking = false;
+    bool vision_htp = true;
+    bool dspark = true;
+    bool cache_prompt = false;
+    int64_t request_start = 0;
+    int64_t first_token = 0;
+    std::string directory;
+    std::string label;
+    int benchmark_max_tokens = 0;
+    int memory_budget_mb = 6000;
+    int cache_slots = 0;
+    std::array<double, 5> last_performance_stats = {0.0, 0.0, 0.0, 0.0, 0.0};
+
+    void finish() {
+        if (!response.empty()) {
+            common_chat_msg msg;
+            msg.role = "assistant";
+            msg.content = response;
+            messages.push_back(std::move(msg));
+        }
+        response.clear();
+        reader.reset();
+    }
+};
+
+MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string & experts, int memory_budget_mb)
+    : impl(std::make_unique<Impl>()) {
+    auto & p = impl->params;
+    const auto memory = minicpm47_memory_config(memory_budget_mb);
+    impl->memory_budget_mb = memory.budget_mb;
+    impl->cache_slots = memory.cache_slots;
+    const auto dir = model.substr(0, model.find_last_of('/'));
+    impl->directory = dir;
+    // Optional local benchmark overrides. Normal use defaults to HTP + DSpark.
+    std::ifstream config_file(dir + "/runtime.json");
+    if (config_file) {
+        const auto config = nlohmann::json::parse(config_file);
+        impl->vision_htp = config.value("vision_htp", true);
+        impl->dspark = config.value("dspark", true);
+        impl->label = config.value("label", std::string());
+        impl->benchmark_max_tokens = config.value("max_tokens", 0);
+    }
+    p.model.path = model;
+    p.moe_experts = experts;
+    p.moe_slot_bank = memory.bank;
+    p.n_ctx = 2048;
+    p.n_batch = memory.batch;
+    p.n_ubatch = memory.batch;
+    p.n_ctx_checkpoints = 1;
+    p.n_parallel = 1;
+    p.n_gpu_layers = 99;
+    p.devices = {ggml_backend_dev_by_name("HTP0"), ggml_backend_dev_by_name("HTP1"), nullptr};
+    if (!p.devices[0] || !p.devices[1]) throw std::runtime_error("MiniCPM-V 4.7 requires HTP0 and HTP1");
+    p.split_mode = LLAMA_SPLIT_MODE_LAYER;
+    p.tensor_split[0] = p.tensor_split[1] = 1.0f;
+    p.fit_params = false;
+    p.warmup = false;
+    p.ctx_shift = false;
+    p.cpuparams.n_threads = p.cpuparams_batch.n_threads = 4;
+    p.mmproj_use_gpu = impl->vision_htp;
+    p.image_max_tokens = 64;
+    p.enable_reasoning = 0;
+    p.sampling.temp = 0.0f;
+    p.sampling.seed = 42;
+    p.sampling.no_perf = false;
+    if (impl->dspark) {
+        p.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK};
+        p.speculative.draft.mparams.path = dir + "/dspark-MiniCPM-V-4_7-q8_0.gguf";
+        p.speculative.draft.n_gpu_layers = 99;
+        p.speculative.draft.devices = p.devices;
+        p.speculative.draft.n_max = memory.draft;
+        p.speculative.draft.cpuparams.n_threads = p.speculative.draft.cpuparams_batch.n_threads = 4;
+        std::ifstream draft(p.speculative.draft.mparams.path, std::ios::binary);
+        if (!draft) throw std::runtime_error("Missing Q8_0 DSpark draft: " + p.speculative.draft.mparams.path);
+    }
+    setenv("LLAMA_MOE_DECODE_WINDOW", std::to_string(memory.cache_slots).c_str(), 1);
+    unsetenv("LLAMA_MOE_LAYER_WINDOWS");
+    setenv("LLAMA_MOE_IO_THREADS", "8", 1);
+    setenv("LLAMA_MOE_PREFILL_WARM_ROWS", "32", 1);
+    setenv("LLAMA_MOE_PREFETCH_MAX_ROWS", "8", 1);
+    setenv("LLAMA_MOE_PREFILL_SORT_READS", "1", 1);
+    setenv("MB_MEDIA_EMBD_BATCH", "1", 1);
+    setenv("LLAMA_DSPARK_MEDIA_FEATURES", "1", 1);
+    setenv("LLAMA_DSPARK_TARGET_POSITIONS", "1", 1);
+}
+
+MiniCPM47Runtime::~MiniCPM47Runtime() {
+    impl->reader.reset();
+    if (impl->server) impl->server->terminate();
+    if (impl->worker.joinable()) impl->worker.join();
+}
+
+void MiniCPM47Runtime::setVisionPath(const std::string & path) { impl->params.mmproj.path = path; }
+
+bool MiniCPM47Runtime::start() {
+    common_log_set_file(common_log_main(), (impl->directory + "/runtime.log").c_str());
+    common_log_set_timestamps(common_log_main(), true);
+    impl->server = std::make_unique<server_context>();
+    LOGi("MiniCPM47 runtime: vision=%s dspark=%d bank=%d batch=%d n_max=%d budget=%dMB cache=%d temp=0 seed=42",
+         impl->vision_htp ? "HTP" : "CPU", impl->dspark, impl->params.moe_slot_bank,
+         impl->params.n_batch, impl->params.speculative.draft.n_max,
+         impl->memory_budget_mb, impl->cache_slots);
+    if (!impl->server->load_model(impl->params)) return false;
+    impl->worker = std::thread([this] { impl->server->start_loop(); });
+    return true;
+}
+
+void MiniCPM47Runtime::setThinking(bool enabled) { impl->thinking = enabled; }
+
+void MiniCPM47Runtime::setSystemPrompt(const std::string & text) {
+    common_chat_msg msg;
+    msg.role = "system";
+    msg.content = text;
+    impl->messages.push_back(std::move(msg));
+}
+
+void MiniCPM47Runtime::addImage(const uint8_t * data, size_t size) {
+    if (impl->reader) throw std::runtime_error("Cannot attach an image during generation");
+    impl->files.emplace_back(data, data + size);
+    impl->pending_media += get_media_marker();
+}
+
+void MiniCPM47Runtime::submit(const std::string & text, int n_predict) {
+    if (impl->reader) throw std::runtime_error("A completion is already active");
+    common_chat_msg msg;
+    msg.role = "user";
+    msg.content = impl->pending_media + text;
+    impl->pending_media.clear();
+    impl->last_performance_stats = {0.0, 0.0, 0.0, 0.0, 0.0};
+    impl->messages.push_back(std::move(msg));
+    const auto meta = impl->server->get_meta();
+    common_chat_templates_inputs inputs;
+    inputs.messages = impl->messages;
+    inputs.use_jinja = meta.chat_params.use_jinja;
+    inputs.add_generation_prompt = true;
+    inputs.enable_thinking = impl->thinking;
+    inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+    auto formatted = common_chat_templates_apply(meta.chat_params.tmpls.get(), inputs);
+    impl->reader = std::make_unique<server_response_reader>(impl->server->get_response_reader());
+    server_task task(SERVER_TASK_TYPE_COMPLETION);
+    task.id = impl->reader->get_new_id();
+    task.cli = true;
+    task.cli_prompt = formatted.prompt;
+    task.cli_files = impl->files;
+    task.params.n_predict = impl->benchmark_max_tokens > 0 ? impl->benchmark_max_tokens : n_predict;
+    task.params.stream = true;
+    task.params.cache_prompt = impl->cache_prompt;
+    impl->cache_prompt = true;
+    task.params.timings_per_token = true;
+    task.params.sampling = impl->params.sampling;
+    task.params.speculative = impl->params.speculative;
+    task.params.chat_parser_params = common_chat_parser_params(formatted);
+    if (!formatted.parser.empty()) task.params.chat_parser_params.parser.load(formatted.parser);
+    impl->request_start = ggml_time_ms();
+    impl->first_token = 0;
+    LOGi("MiniCPM47 request: vision=%s dspark=%d images=%zu max_tokens=%d",
+         impl->vision_htp ? "HTP" : "CPU", impl->dspark, impl->files.size(), n_predict);
+    impl->reader->post_task(std::move(task));
+}
+
+std::string MiniCPM47Runtime::next(bool & done) {
+    done = false;
+    if (!impl->reader) { done = true; return {}; }
+    while (auto result = impl->reader->next([] { return false; })) {
+        if (result->is_error()) {
+            const auto error = result->to_json().dump();
+            impl->finish();
+            throw std::runtime_error(error);
+        }
+        if (auto * partial = dynamic_cast<server_task_result_cmpl_partial *>(result.get())) {
+            std::string chunk;
+            for (const auto & diff : partial->oaicompat_msg_diffs) chunk += diff.content_delta;
+            if (!chunk.empty()) {
+                if (!impl->first_token) {
+                    impl->first_token = ggml_time_ms();
+                    LOGi("MiniCPM47 first_token_ms=%lld", (long long)(impl->first_token - impl->request_start));
+                }
+                impl->response += chunk;
+                return chunk;
+            }
+        }
+        if (auto * final = dynamic_cast<server_task_result_cmpl_final *>(result.get())) {
+            impl->last_performance_stats = {
+                final->timings.prompt_ms,
+                static_cast<double>(final->timings.prompt_n),
+                final->timings.predicted_ms,
+                static_cast<double>(final->timings.predicted_n),
+                final->timings.vision_encode_ms
+            };
+            const int64_t wall = ggml_time_ms() - impl->request_start;
+            const int64_t ttft = impl->first_token ? impl->first_token - impl->request_start : -1;
+            json record = {
+                {"vision_htp", impl->vision_htp}, {"dspark", impl->dspark},
+                {"label", impl->label}, {"images", impl->files.size()},
+                {"wall_ms", wall}, {"ttft_ms", ttft},
+                {"timings", final->timings.to_json()}, {"response", impl->response}
+            };
+            std::ofstream(impl->directory + "/benchmark.jsonl", std::ios::app) << record.dump() << '\n';
+            common_log_flush(common_log_main());
+            LOGi("MiniCPM47 BENCH vision=%s dspark=%d wall_ms=%lld ttft_ms=%lld timings=%s",
+                 impl->vision_htp ? "HTP" : "CPU", impl->dspark,
+                 (long long)(ggml_time_ms() - impl->request_start),
+                 (long long)(impl->first_token ? impl->first_token - impl->request_start : -1),
+                 final->timings.to_json().dump().c_str());
+            impl->finish();
+            done = true;
+            return {};
+        }
+    }
+    impl->finish();
+    done = true;
+    return {};
+}
+
+void MiniCPM47Runtime::cancel() { impl->finish(); }
+
+void MiniCPM47Runtime::reset() {
+    cancel();
+    impl->messages.clear();
+    impl->files.clear();
+    impl->pending_media.clear();
+    // SLOT_ERASE rejects multimodal contexts. The next completion instead starts
+    // with n_past=0, which clears both target and draft state on the server thread.
+    impl->cache_prompt = false;
+}
+
+void MiniCPM47Runtime::resetPerformanceStats() {
+    impl->last_performance_stats = {0.0, 0.0, 0.0, 0.0, 0.0};
+}
+
+std::array<double, 5> MiniCPM47Runtime::performanceStats() const {
+    return impl->last_performance_stats;
+}

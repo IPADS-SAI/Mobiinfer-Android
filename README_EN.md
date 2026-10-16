@@ -2,9 +2,8 @@
 
 # MobiInfer · Android
 
-### On-device Large-Model Inference on Snapdragon NPU
 
-**Running large models on the Qualcomm Hexagon NPU: fitting a 35B-class MoE into a phone**
+**Running a 35B-class MoE locally on a phone**
 
 [![Platform](https://img.shields.io/badge/platform-Android%20%7C%20Snapdragon-3DDC84)](#)
 [![Backend](https://img.shields.io/badge/backend-Hexagon%20NPU%20(HTP)-blue)](#)
@@ -17,35 +16,35 @@
 
 ---
 
-## What we did
+## Introduction
 
-MobiInfer-Android ports the full **Qualcomm Hexagon NPU (HTP/HTA DSP) backend** into [llama.cpp-omni](https://github.com/tc-mb/llama.cpp-omni) and builds a complete on-device path for **large sparse MoE models**: experts stay in flash, stream into the NPU on demand, I/O latency is hidden by lookahead scheduling, and an adapted **DSpark speculative sampler** pushes decode speed further.
+> **A Snapdragon phone running a 35B-A3B-class MoE on the NPU**
 
-In one line:
+MobiInfer-Android ports the full **Qualcomm Hexagon NPU (HTP/HTA DSP) backend** into [llama.cpp-omni](https://github.com/OpenBMB/llama.cpp-omni) and builds a complete on-device path for **large sparse MoE models**: expert weights stay resident in flash, are streamed into the NPU on demand, lookahead scheduling masks the I/O latency, and an adapted **DSpark speculative sampler** pushes decode speed further.
 
-> **A single Snapdragon phone running a 35B-A3B-class MoE on the NPU, with no capability loss.**
+The Android app ([`Android-App/`](Android-App/README.md), based on [OpenBMB/MiniCPM-V-Apps](https://github.com/OpenBMB/MiniCPM-V-Apps)) ships with this repo — install it and run directly on the phone.
 
 ---
 
 ## Highlights
 
 - 🚀 **Native Hexagon NPU backend**
-  A complete `ggml-hexagon` implementation ported from upstream llama.cpp: HVX/HMX tensor kernels, Flash-Attention, Gated Delta Net, DMA queues, and multi-device partitioning (single device, virtual-session layer split, physical-core tensor split, core-group row split). Models offload to the HTP with "GPU" semantics.
+  HVX/HMX tensor cores, Flash-Attention, Gated Delta Net, DMA queues and multi-device split
 
-- 🧠 **On-device MoE expert offload**
-  Expert weights live in flash; an `--moe-experts` manifest plus resident `--moe-slot-bank` slots stream routed experts into the HTP. Supports cross-device TopK and tiled expert allocation/upload, pooled expert I/O, bounded multi-row prefetch, and optional prefill cache warming.
+- 🧠 **On-device large-MoE expert offload**
+  Expert weights in external flash, streamed into the HTP on demand
 
 - ⚡ **LES (Lookahead Expert Scheduling)**
-  Cross-layer routing prediction prefetches the next layer's likely experts; loaded ones compute first while the rest load in parallel. Prediction is used only for **prefetch and scheduling** — compute still strictly follows the model's own token-level routing, missed experts are loaded normally, and **no extra training or capability loss** is involved.
+  Cross-layer prediction prefetches the next layer's experts; hits compute first, misses load in parallel
 
 - 🎯 **DSpark speculative sampling**
-  DFlash (multi-layer hidden-state extraction, multi-token single-step prediction) plus a semi-autoregressive Markov head and a confidence head, adapted into the on-device pipeline (`speculative.type = dspark`) and working together with expert scheduling.
+  DFlash + a semi-autoregressive Markov head and a confidence head, adapted on-device and coordinated with expert scheduling
 
 - 📦 **Expert packing toolchain**
-  `experts.py` (extract/verify) → `strip_experts.py` (strip duplicated experts from the GGUF) → `pack_hexagon.py` (convert to the HTP tiled `hexagon-tiled-v1` layout). Packing calls the backend's `ggml_backend_pack_moe_expert` directly, guaranteeing the layout matches at runtime.
+  Packs expert weights and emits the HTP tiled layout.
 
 - 💾 **Weight access optimization**
-  Layer-wise mixed-precision quantization plus contiguous expert repacking to reduce scattered flash reads, improve sequential read efficiency, and lower the storage bandwidth required for expert loading.
+  Layer-wise mixed-precision quantization + contiguous expert repacking to reduce scattered flash reads.
 
 ---
 
@@ -54,61 +53,25 @@ In one line:
 | Model | Scale | Notes |
 |---|---|---|
 | **MiniCPM-V 4.7 35B-A3B** | 35B total / 3B active | Primary on-device MoE target, multimodal (vision + text) |
-| Qwen3.5 / 3.6 MoE | 35B-A3B / 122B-A10B / 397B-A17B | `qwen35moe`, linear attention + gated delta net |
+| **Qwen3-0.6B** | 0.6B (dense) | `qwen3`, text |
+| **Qwen3-1.7B** | 1.7B (dense) | `qwen3`, text |
+| **Qwen3-4B** | 4B (dense) | `qwen3`, text |
+| **Qwen3-VL-2B** | 2B (dense) | `qwen3vl`, vision + text |
+| **Qwen3-VL-4B** | 4B (dense) | `qwen3vl`, vision + text |
 | DFlash / DSpark draft models | — | Speculative sampling (`dflash` / `dspark`) |
 
-Architecture coverage includes `qwen35moe`, `dflash`, `minicpm` families, and the rest of the common architectures within the llama.cpp ecosystem.
-
----
-
-## Architecture
-
-```
-                  ┌──────────────────────────────────────────────┐
-                  │                llama.cpp-omni                │
-                  │   (CLI / Server / multimodal / TTS pipeline) │
-                  └───────────────┬──────────────────────────────┘
-                                  │  -ngl / --device / --split-mode
-            ┌─────────────────────┼─────────────────────┐
-            ▼                     ▼                     ▼
-      ┌───────────┐        ┌───────────┐         ┌───────────┐
-      │  CPU/ARM  │        │  Adreno   │         │  Hexagon  │  ← this repo
-      │  (NEON)   │        │  (OpenCL) │         │  NPU/HTP  │
-      └───────────┘        └───────────┘         └─────┬─────┘
-                                                       │
-                          ┌────────────────────────────┼───────────────────────────┐
-                          ▼                            ▼                           ▼
-                   ┌─────────────┐            ┌───────────────┐           ┌───────────────┐
-                   │  HVX / HMX  │            │  Expert       │           │  DSpark draft │
-                   │  tensor     │            │  streaming    │           │  speculative  │
-                   │  kernels    │            │  + LES sched  │           │  sampling     │
-                   └─────────────┘            └───────┬───────┘           └───────────────┘
-                                                      │ pread (tiled, contiguous layout)
-                                                      ▼
-                                              ┌───────────────┐
-                                              │  UFS / SDD    │
-                                              │  external     │
-                                              │  expert weights│
-                                              └───────────────┘
-```
-
-At inference, dense weights (attention, shared experts, embeddings) stay resident on the NPU; routed expert weights remain in flash, are predicted by LES and streamed into resident slots (slot bank), and expert matvec runs on the HTP. The DSpark draft model shares this expert scheduling path with the main model.
+Architecture coverage includes `qwen3`/`qwen3moe`/`qwen3next`, `qwen3vl`/`qwen3vlmoe`, `qwen35moe`, `dflash`, `minicpm` families, and the rest of the common architectures within the llama.cpp ecosystem.
 
 ---
 
 ## Performance
 
-> 📱 Measured on OnePlus 13 (HTP0 + HTP1), 512-token input / 128-token output, text-only CLI.
+> 📱 Measured on OnePlus 13 (Snapdragon 8 Elite, HTP0 + HTP1), text-only CLI, 128-token output.
 
-Best current config: **LES prefetch cap 8 + DSpark draft3** (Q3 main model + HTP tiled experts).
-
-| Metric | Value |
-|---|---:|
-| Prefill throughput | **66.22 token/s** |
-| Decode throughput | **14.64 token/s** |
-| Total inference (prefill + decode) | **16.47 s** |
-
-> 512/128, ctx2048, draft3, fixed 512-token Chinese input; three runs produced identical output SHA256. Raising the prefetch cap from 8 to 14/16 actually lowered decode, so 8 is used. Full conditions, raw logs, and reproduction commands are in [`docs/benchmark-prefill512-decode128.md`](docs/benchmark-prefill512-decode128.md) and the [on-device reproduction notes](docs/on-device-decode-reproduction.md).
+| Model | SoC | Prefill (token/s) | Decode (token/s) |
+|---|---|---:|---:|
+| MiniCPM-V 4.7 35B-A3B (Q3, MoE + LES + DSpark) | Snapdragon 8 Elite | 66.22 | 14.64 |
+| Qwen3-VL-4B-Instruct (Q4_K_M) | Snapdragon 8 Elite | 1013.74 | 18.13 |
 
 ---
 
@@ -132,8 +95,6 @@ Open the app → **Model Manager** → select **MiniCPM-V 4.7 35B-A3B (Q3, NPU)*
 
 Once the download completes, select the model in **Model Manager** and start chatting — text or image.
 
-> Need manual sideloading, CLI usage, building from source, multi-device split, or troubleshooting? See **[DEPLOY.md](DEPLOY.md)** and [`docs/backend/snapdragon/README.md`](docs/backend/snapdragon/README.md).
-
 ---
 
 ## Key flags
@@ -156,6 +117,7 @@ Hexagon environment variables (`GGML_HEXAGON_DEVICES` / `GGML_HEXAGON_POWER_MODE
 ## Layout
 
 ```
+Android-App/               Android app source
 ggml/src/ggml-hexagon/     Hexagon backend host side (scheduling, multi-device, DMA) + htp/ (DSP-side HVX/HMX kernels)
 src/llama-moe-slot.*       MoE expert slot runtime: prefetch, scheduling, I/O thread pool, diagnostic counters
 src/llama-moe-experts.*    External expert manifest and loading
@@ -169,33 +131,11 @@ docs/les/                  LES lookahead expert scheduling docs (CN/EN)
 
 ---
 
-## Relation to upstream
-
-MobiInfer-Android is built on [llama.cpp-omni](https://github.com/tc-mb/llama.cpp-omni) (itself built on [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)). The Hexagon backend and supporting op/API changes are ported from upstream llama.cpp; MoE expert offload, LES scheduling, and DSpark integration are this project's on-device extensions. The Android App (`Android-App/`) is based on [OpenBMB/MiniCPM-V-Apps](https://github.com/OpenBMB/MiniCPM-V-Apps).
-
----
-
 ## Credits & License
 
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) and [llama.cpp-omni](https://github.com/tc-mb/llama.cpp-omni)
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) and [llama.cpp-omni](https://github.com/OpenBMB/llama.cpp-omni)
 - [MiniCPM-V-Apps](https://github.com/OpenBMB/MiniCPM-V-Apps) — Android app upstream
 - [Qualcomm Snapdragon Toolchain](https://github.com/snapdragon-toolchain)
 - MiniCPM-V model family
 
 Licensed under MIT — see [LICENSE](LICENSE).
-
----
-
-## Build & run on Snapdragon
-
-```sh
-./scripts/snapdragon/build.py --target adb --push        # build + deploy to a connected device
-
-export LLAMA_MOE_HTP_PACKED_DIR=/models/experts-htp-tiled
-./bin/llama-cli -m /models/model-les.gguf \
-    --moe-experts /models/experts-htp-tiled --moe-slot-bank 32 \
-    --device HTP0,HTP1 --split-mode layer --tensor-split 1,1 -ngl 99 \
-    -fit off -c 2048 -b 4 -ub 4 -p 'Hello'
-```
-
-See [`tools/moe/HEXAGON.md`](tools/moe/HEXAGON.md) for the expert preparation pipeline and [`docs/backend/snapdragon/README.md`](docs/backend/snapdragon/README.md) for all build/run/multi-device options.
