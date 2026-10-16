@@ -82,6 +82,7 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
         return (int64_t) layer_c[(size_t) moe_idx] + k_pf;
     };
     const int64_t prefill_cap = moe_slot_bank_size();
+    const bool phase_reuse = moe_phase_reuse();
 
     const llm_tensor fam_ids[4] = {
         LLM_TENSOR_FFN_GATE_UP_EXPS, LLM_TENSOR_FFN_GATE_EXPS,
@@ -111,7 +112,8 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
                 group_total += width_of(il);
             }
             group_slots[tn(fam_ids[fi], "weight", kv.second.front()).str()] =
-                dec_enabled ? (prefill_cap + group_total) : prefill_cap;
+                dec_enabled ? (phase_reuse ? std::max(prefill_cap, group_total)
+                                          : prefill_cap + group_total) : prefill_cap;
         }
     }
     auto slots_for = [&](const LLM_TN_IMPL & name) -> int64_t {
@@ -367,7 +369,7 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
                         // 偏移 = prefill 段之后 + 组内**前面各层**宽度之和
                         // （各层宽度可能不同）。prefill 段固定占 [0, prefill_cap)，
                         // 与 decode 段物理隔离，见上面布局说明。
-                        int64_t off = prefill_cap;
+                        int64_t off = phase_reuse ? 0 : prefill_cap;
                         for (size_t k2 = 0; k2 < j; ++k2) {
                             off += width_of(members[k2]);
                         }
@@ -379,6 +381,9 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
             }
         }
 
+        if (phase_reuse && dec_enabled) {
+            LLAMA_LOG_INFO("%s: phase-reuse enabled: prefill/decode storage overlaps; prefill warming disabled\n", __func__);
+        }
         LLAMA_LOG_INFO(
             "%s: MoE bank %d groups (family x quant), %.2f MiB resident; %d prefill windows%s\n",
             __func__, n_grp, resident / 1024.0 / 1024.0, n_win,

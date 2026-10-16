@@ -644,6 +644,10 @@ json result_timings::to_json() const {
         base["draft_n_accepted"] = draft_n_accepted;
     }
 
+    if (vision_encode_ms > 0.0) {
+        base["vision_encode_ms"] = vision_encode_ms;
+    }
+
     return base;
 }
 

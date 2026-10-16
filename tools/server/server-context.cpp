@@ -188,6 +188,7 @@ struct server_slot {
     int64_t t_start_generation;
 
     double t_prompt_processing = 0.0; // ms
+    double t_vision_encode = 0.0; // ms, actual encoder work within this request
     double t_token_generation = 0.0;  // ms
 
     std::function<void(int /* id_slot */)> callback_on_release;
@@ -200,6 +201,7 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         n_prompt_tokens_cache = 0;
+        t_vision_encode = 0.0;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -398,6 +400,7 @@ struct server_slot {
 
         timings.prompt_n            = n_prompt_tokens_processed;
         timings.prompt_ms           = t_prompt_processing;
+        timings.vision_encode_ms    = t_vision_encode;
         timings.prompt_per_token_ms = t_prompt_processing / n_prompt_tokens_processed;
         timings.prompt_per_second   = 1e3 / t_prompt_processing * n_prompt_tokens_processed;
 
@@ -562,6 +565,7 @@ struct server_slot {
 
         other.t_start_process_prompt    = t_start_process_prompt;
         other.t_prompt_processing       = t_prompt_processing;
+        other.t_vision_encode           = t_vision_encode;
         other.n_prompt_tokens_cache     = n_prompt_tokens_cache;
         other.n_prompt_tokens_processed = n_prompt_tokens_processed;
 
@@ -2409,7 +2413,8 @@ private:
 
         // 上限取 n_batch：保证整段能落在**一次** llama_decode 里 —— embedding 路径的位置是
         // section-major（步长 = 总 token 数），跨切片就没法按偏移切了。
-        const size_t cap = std::min<size_t>((size_t) batch_cap, (size_t) n_batch_max);
+        const size_t cap = std::min<size_t>((size_t) batch_cap,
+                (size_t) prefill_batch_limit(slot, n_batch_max));
         std::vector<llama_pos> pos_t(cap, 0), pos_y(cap, 0), pos_x(cap, 0), pos_z(cap, 0);
         // 注意：seq_id 必须写进 **batch 自己分配** 的数组（llama_batch_init 里 malloc 的），
         // 不能让 batch.seq_id[i] 指向本函数的局部缓冲 —— 解码发生在本函数返回之后，
@@ -2432,7 +2437,10 @@ private:
                 if (n_tok <= 0 || n_added + (size_t) n_tok > cap) {
                     break; // 装不下就留给下一批
                 }
-                if (mtmd_encode_chunk(mctx, chunk) != 0) {
+                const int64_t vision_start = mtmd_get_vision_encode_time_us(mctx);
+                const int32_t encode_result = mtmd_encode_chunk(mctx, chunk);
+                slot.t_vision_encode += (mtmd_get_vision_encode_time_us(mctx) - vision_start) / 1e3;
+                if (encode_result != 0) {
                     SRV_ERR("%s", "media-embd-batch: vision encode failed\n");
                     return 0;
                 }
@@ -2517,6 +2525,23 @@ private:
         SLT_INF(slot, "media-embd-batch: %zu tokens as one embedding batch (%s)\n",
                 n_added, n_pos > 1 ? "M-RoPE" : "1D");
         return (int32_t) n_added;
+    }
+
+    int32_t prefill_warm_tail() const {
+        const char * value = std::getenv("LLAMA_MOE_PREFILL_WARM_ROWS");
+        if (params_base.moe_experts.empty() || !value) return 0;
+        return std::min({256, std::max(0, std::atoi(value)),
+                         params_base.n_batch, params_base.n_ubatch});
+    }
+
+    int32_t prefill_batch_limit(const server_slot & slot, int32_t capacity) const {
+        const int32_t remaining = slot.task->n_tokens() - slot.prompt.n_tokens();
+        const int32_t tail = prefill_warm_tail();
+        if (tail > 0) capacity = std::min(capacity, params_base.n_ubatch);
+        if (tail > 0 && remaining > capacity && remaining - capacity < tail) {
+            return remaining - tail;
+        }
+        return capacity;
     }
 
     void update_slots() {
@@ -3145,7 +3170,9 @@ private:
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
                         // process the image
                         size_t n_tokens_out = 0;
+                        int64_t vision_start = mtmd_get_vision_encode_time_us(mctx);
                         int32_t res = input_tokens.process_chunk(ctx_tgt, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
+                        slot.t_vision_encode += (mtmd_get_vision_encode_time_us(mctx) - vision_start) / 1e3;
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process image, res = %d\n", res);
                             send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
@@ -3157,7 +3184,9 @@ private:
                             // TODO: in the future, figure out how to infuse target embeddings to the images
                             //       for now, we skip this for simplicity
                             //       maybe we simply need to call `common_speculative_process()` on the mtmd batches in the `process_chunk` above?
+                            vision_start = mtmd_get_vision_encode_time_us(mctx);
                             res = input_tokens.process_chunk(ctx_dft.get(), mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
+                            slot.t_vision_encode += (mtmd_get_vision_encode_time_us(mctx) - vision_start) / 1e3;
                             if (res != 0) {
                                 GGML_ABORT("failed to process multi-modal data on draft context\n");
                             }
@@ -3175,7 +3204,9 @@ private:
                     }
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.n_tokens < n_batch) {
+                    const int32_t prompt_batch_end = batch.n_tokens +
+                        prefill_batch_limit(slot, n_batch - batch.n_tokens);
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.n_tokens < prompt_batch_end) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -3215,7 +3246,8 @@ private:
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            const int tail = std::max(4, prefill_warm_tail());
+                            const int checkpoint_offsets[] = {tail + n_ubatch, tail};
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
@@ -3366,7 +3398,26 @@ private:
                 batch.logits   + i,
             };
 
+            // Prompt completion is owned here, not inferred from token count or
+            // logits by the expert cache. Mixed-sequence batches skip prewarming.
+            bool final_prefill = false;
+            if (prefill_warm_tail() > 0 && batch_view.n_tokens > 0) {
+                for (const auto & slot : slots) {
+                    if (slot.state != SLOT_STATE_DONE_PROMPT || slot.i_batch < i ||
+                        slot.i_batch >= i + n_tokens) continue;
+                    final_prefill = true;
+                    for (int32_t row = 0; row < batch_view.n_tokens; ++row) {
+                        if (batch_view.n_seq_id[row] != 1 || batch_view.seq_id[row][0] != slot.id) {
+                            final_prefill = false;
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+            llama_set_moe_prefill_final(ctx_tgt, final_prefill);
             const int ret = llama_decode(ctx_tgt, batch_view);
+            llama_set_moe_prefill_final(ctx_tgt, false);
 
             metrics.on_decoded(slots);
 

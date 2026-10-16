@@ -1203,6 +1203,15 @@ void llama_context::park_moe_expert_memory() {
     moe_slots->park_expert_memory();
 }
 
+void llama_context::set_moe_prefill_final(bool value) {
+    if (!moe_slots) return;
+    if (!value && moe_prefill_final) {
+        synchronize();
+        moe_slots->set_prefill_warm_enabled(false);
+    }
+    moe_prefill_final = value;
+}
+
 void llama_context::prewarm_moe_experts() {
     if (!moe_slots) {
         return;
@@ -1973,6 +1982,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
+        if (moe_slots && moe_prefill_final && n_tokens_prev + ubatch.n_tokens == n_tokens_all) {
+            synchronize();
+            moe_slots->set_prefill_warm_enabled(true);
+        }
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {
@@ -3796,6 +3809,10 @@ int32_t llama_n_threads_batch(llama_context * ctx) {
 
 void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void * data), void * abort_callback_data) {
     ctx->set_abort_callback(abort_callback, abort_callback_data);
+}
+
+void llama_set_moe_prefill_final(llama_context * ctx, bool value) {
+    ctx->set_moe_prefill_final(value);
 }
 
 void llama_set_moe_lookahead_prefetch_depth(llama_context * ctx, int32_t depth) {

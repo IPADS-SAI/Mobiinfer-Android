@@ -263,6 +263,7 @@ struct result_timings {
 
     int32_t prompt_n = -1;
     double prompt_ms = 0.0;
+    double vision_encode_ms = 0.0;
     double prompt_per_token_ms = 0.0;
     double prompt_per_second = 0.0;
 

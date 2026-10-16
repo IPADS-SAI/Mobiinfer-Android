@@ -256,6 +256,10 @@ MTMD_API int32_t mtmd_encode(mtmd_context * ctx,
                              const mtmd_image_tokens * image_tokens);
 
 // returns 0 on success
+// Cumulative vision encoder wall time. Read on the same serialized execution
+// thread as encode calls; callers can take deltas around a request or chunk.
+MTMD_API int64_t mtmd_get_vision_encode_time_us(const mtmd_context * ctx);
+
 MTMD_API int32_t mtmd_encode_chunk(mtmd_context * ctx,
                                    const mtmd_input_chunk * chunk);
 

@@ -162,6 +162,7 @@ struct mtmd_context {
     std::vector<float> image_embd_v; // image embedding vector
 
     bool print_timings;
+    int64_t vision_encode_time_us = 0;
     int n_threads;
     std::string media_marker;
     const int n_embd_text = -1; // -1 means llm context not provided, skip checking this
@@ -1253,6 +1254,10 @@ int32_t mtmd_tokenize(mtmd_context * ctx,
     return tokenizer.tokenize(output);
 }
 
+int64_t mtmd_get_vision_encode_time_us(const mtmd_context * ctx) {
+    return ctx->vision_encode_time_us;
+}
+
 int32_t mtmd_encode_chunk(mtmd_context * ctx, const mtmd_input_chunk * chunk) {
     if (chunk->type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
         LOG_WRN("mtmd_encode_chunk has no effect for text chunks\n");
@@ -1289,6 +1294,11 @@ int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens) 
         return 1;
     }
     auto proj_type = clip_get_projector_type(ctx_clip);
+    struct encode_timer {
+        int64_t & elapsed;
+        int64_t start = ggml_time_us();
+        ~encode_timer() { elapsed += ggml_time_us() - start; }
+    } timer{ctx->vision_encode_time_us};
     int n_mmproj_embd = clip_n_mmproj_embd(ctx_clip);
     ctx->image_embd_v.resize(image_tokens->n_tokens() * n_mmproj_embd);
     bool ok = false;

@@ -1015,6 +1015,10 @@ extern "C" {
     // Must be called while no decode is in flight (e.g. after the vision encoder is unloaded).
     LLAMA_API void llama_moe_prewarm_experts(struct llama_context * ctx);
 
+    // Bracket the final prompt batch with true/false. Only its last microbatch
+    // may copy trailing prompt experts into the decode window. Synchronizes on reset.
+    LLAMA_API void llama_set_moe_prefill_final(struct llama_context * ctx, bool value);
+
     // Set whether the context outputs embeddings or not
     // TODO: rename to avoid confusion with llama_get_embeddings()
     LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);

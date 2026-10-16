@@ -633,6 +633,9 @@ int llama_cli(int argc, char ** argv) {
             console::set_display(DISPLAY_TYPE_INFO);
             console::log("\n");
             console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s ]\n", timings.prompt_per_second, timings.predicted_per_second);
+            if (timings.vision_encode_ms > 0.0) {
+                console::log("[ Vision encoder: %.1f ms ]\n", timings.vision_encode_ms);
+            }
             console::set_display(DISPLAY_TYPE_RESET);
         }
 
