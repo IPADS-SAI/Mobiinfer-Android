@@ -3,6 +3,7 @@ package com.mobiinfer.demo
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.widget.ImageView
 import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.button.MaterialButton
@@ -13,7 +14,9 @@ enum class ModelRowState { NOT_DOWNLOADED, DOWNLOADING, PAUSED, READY }
 data class ModelRowUi(
     val state: ModelRowState = ModelRowState.NOT_DOWNLOADED,
     val fraction: Float = 0f,
-    val message: String? = null
+    val message: String? = null,
+    /** True when this model is the one currently loaded in the engine. */
+    val running: Boolean = false
 )
 
 class ModelAdapter(
@@ -35,7 +38,8 @@ class ModelAdapter(
         val tvName: TextView = itemView.findViewById(R.id.tv_model_name)
         val tvDesc: TextView = itemView.findViewById(R.id.tv_model_desc)
         val tvState: TextView = itemView.findViewById(R.id.tv_model_state)
-        val tvSelected: TextView = itemView.findViewById(R.id.iv_selected)
+        val ivSelected: ImageView = itemView.findViewById(R.id.iv_selected)
+        val tvRunning: TextView = itemView.findViewById(R.id.tv_running)
         val progress: LinearProgressIndicator = itemView.findViewById(R.id.progress_model)
         val btnDownload: MaterialButton = itemView.findViewById(R.id.btn_model_download)
         val btnPause: MaterialButton = itemView.findViewById(R.id.btn_model_pause)
@@ -58,12 +62,10 @@ class ModelAdapter(
         holder.tvDesc.text = model.getDescription(ctx)
 
         val isSelected = model.id == currentSelectedId
-        holder.tvSelected.text = if (isSelected) "●" else "○"
-        holder.tvSelected.alpha = if (isSelected) 1.0f else 0.4f
-        holder.tvSelected.setTextColor(
-            if (isSelected) ctx.getColor(R.color.primary)
-            else ctx.getColor(R.color.on_surface)
+        holder.ivSelected.setImageResource(
+            if (isSelected) R.drawable.ic_radio_on else R.drawable.ic_radio_off
         )
+        holder.tvRunning.visibility = if (ui.running) View.VISIBLE else View.GONE
 
         val showProgress = ui.state == ModelRowState.DOWNLOADING || ui.state == ModelRowState.PAUSED
         holder.progress.visibility = if (showProgress) View.VISIBLE else View.GONE

@@ -217,4 +217,5 @@
     <string name="advanced_settings">Advanced settings</string>
     <string name="model_switched_lazy">Selected %1$s; it will load when you send a message</string>
     <string name="download_paused">Paused</string>
+    <string name="model_running">Running</string>
 </resources>

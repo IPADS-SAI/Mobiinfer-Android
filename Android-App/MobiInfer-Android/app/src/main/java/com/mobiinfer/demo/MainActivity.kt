@@ -9,6 +9,7 @@ import android.os.SystemClock
 import android.util.Log
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
 import android.view.inputmethod.InputMethodManager
 import android.widget.ArrayAdapter
 import android.widget.ImageButton
@@ -52,6 +53,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnModelManager: ImageButton
     private lateinit var cardInputBar: View
     private lateinit var appBarLayout: AppBarLayout
+    private lateinit var tvTitleModel: TextView
     private lateinit var tvTitle: TextView
     private lateinit var loadingOverlay: View
     private lateinit var tvLoadingText: TextView
@@ -141,6 +143,8 @@ class MainActivity : AppCompatActivity() {
         cardInputBar = findViewById(R.id.card_input_bar)
         appBarLayout = findViewById(R.id.appBarLayout)
         tvTitle = findViewById(R.id.tv_title)
+        tvTitleModel = findViewById(R.id.tv_title_model)
+        syncSelectedModelUi()
         loadingOverlay = findViewById(R.id.loading_overlay)
         tvLoadingText = findViewById(R.id.tv_loading_text)
         drawerLayout = findViewById(R.id.drawer_layout)
@@ -538,6 +542,7 @@ class MainActivity : AppCompatActivity() {
         val isVision = engine.isVisionSupported
 
         tvTitle.setText(if (isVision) R.string.app_title else R.string.app_title_text)
+        syncSelectedModelUi()
         btnImage.visibility = if (isVision) View.VISIBLE else View.GONE
         btnImage.isEnabled = isVision
         btnThink.visibility = if (model.supportsThinking) View.VISIBLE else View.GONE
@@ -548,14 +553,28 @@ class MainActivity : AppCompatActivity() {
         refreshWelcomeCard(model.isTextOnly)
     }
 
+    private fun syncSelectedModelUi() {
+        tvTitleModel.text = LlamaEngine.getSelectedModel(applicationContext).displayName
+    }
+
     /** Toolbar dropdown that changes [selectedModelId] only (lazy loading). */
     private fun showModelSelector() {
         val models = ModelInfo.AVAILABLE_MODELS
         val selectedId = LlamaEngine.getSelectedModel(this).id
-        val labels = models.map { m -> (if (m.id == selectedId) "✓ " else "    ") + m.displayName }
+        val labels = models.map { it.displayName }
         val popup = ListPopupWindow(this)
         popup.anchorView = findViewById<View>(R.id.btn_model_select)
-        popup.setAdapter(ArrayAdapter(this, android.R.layout.simple_list_item_1, labels))
+        val popupAdapter = object : ArrayAdapter<String>(
+            this, R.layout.item_model_option, R.id.tv_option_text, labels
+        ) {
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                val view = super.getView(position, convertView, parent)
+                view.findViewById<View>(R.id.iv_option_check).visibility =
+                    if (models[position].id == selectedId) View.VISIBLE else View.INVISIBLE
+                return view
+            }
+        }
+        popup.setAdapter(popupAdapter)
         popup.isModal = true
         popup.width = (resources.displayMetrics.widthPixels * 0.8f).toInt()
         popup.setOnItemClickListener { _, _, position, _ ->
@@ -563,6 +582,7 @@ class MainActivity : AppCompatActivity() {
             val model = models[position]
             if (model.id == LlamaEngine.getSelectedModel(this).id) return@setOnItemClickListener
             LlamaEngine.setSelectedModel(this, model.id)
+            syncSelectedModelUi()
             if (!LlamaEngine.modelsExist(this, model)) {
                 Toast.makeText(this, R.string.model_not_downloaded_hint, Toast.LENGTH_SHORT).show()
             } else if (isModelReady && loadedModelId != model.id) {

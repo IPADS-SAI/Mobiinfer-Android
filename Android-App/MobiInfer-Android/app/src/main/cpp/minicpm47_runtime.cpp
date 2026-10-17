@@ -50,7 +50,7 @@ struct MiniCPM47Runtime::Impl {
     std::string directory;
     std::string vision_path;
     bool vision_loaded = false;
-    bool benchmark_eager_mmproj = false;
+    bool benchmark_eager_mmproj = true;
     std::string label;
     int benchmark_max_tokens = 0;
     int memory_budget_mb = 6000;
@@ -89,7 +89,7 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
         impl->dspark = config.value("dspark", true);
         impl->label = config.value("label", std::string());
         impl->benchmark_max_tokens = config.value("max_tokens", 0);
-        impl->benchmark_eager_mmproj = config.value("eager_mmproj", false);
+        impl->benchmark_eager_mmproj = config.value("eager_mmproj", true);
         prefetch = config.value("prefetch", prefetch);
         io_threads = config.value("io_threads", io_threads);
         benchmark_cache_slots = config.value("cache_slots", -1);

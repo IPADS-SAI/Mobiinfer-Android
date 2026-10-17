@@ -70,11 +70,11 @@ Architecture coverage includes `qwen3`/`qwen3moe`/`qwen3next`, `qwen3vl`/`qwen3v
 
 | Model | SoC | Prefill (token/s) | Decode (token/s) |
 |---|---|---:|---:|
-| MiniCPM-V 4.7 35B-A3B (Q3, MoE + LES + DSpark) | Snapdragon 8 Elite | 66.22 | 14.64 |
+| MiniCPM-V 4.7 35B-A3B (Q3, MoE + LES + DSpark) | Snapdragon 8 Elite | 94.28 | 13.65 |
 | MiniCPM-V 4.7 35B-A3B (same, app, short prompt, 41 tokens) | Snapdragon 8 Elite | 22.02 | 17.98 |
 | Qwen3-VL-4B-Instruct (Q4_K_M) | Snapdragon 8 Elite | 1013.74 | 18.13 |
 
-The short prompt uses the Python Fibonacci example without mmproj loaded; other rows are CLI measurements.
+MiniCPM rows are app measurements: the short prompt uses the Python Fibonacci example without mmproj; the 512-token result is the median of five runs with mmproj loaded. Qwen3 is measured with the CLI.
 
 ---
 
