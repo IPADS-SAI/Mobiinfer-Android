@@ -108,6 +108,7 @@ class LlamaEngine private constructor(
 
         fun getInstance(context: Context): LlamaEngine =
             instance ?: synchronized(this) {
+                instance?.let { return@synchronized it }
                 val nativeLibDir = context.applicationInfo.nativeLibraryDir
                 require(nativeLibDir.isNotBlank()) { "Expected a valid native library path!" }
                 LlamaEngine(context, nativeLibDir).also { instance = it }
@@ -1659,6 +1660,10 @@ class LlamaEngine private constructor(
             }
         }
         llamaScope.cancel()
+        _state.value = LlamaState.Uninitialized
+        synchronized(Companion) {
+            if (instance === this) instance = null
+        }
     }
 
 }

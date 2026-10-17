@@ -9,7 +9,7 @@ struct MiniCPM47MemoryConfig {
     static constexpr int min_mb = 5500;
     static constexpr int max_mb = 8000;
     static constexpr int bank = 256; // one shared prefill bank per HTP device
-    static constexpr int batch = 128;
+    static constexpr int batch = 512;
     static constexpr int draft = 3;
     static constexpr int prefetch = 4;
     // Actual packaged App libraries have higher fixed memory than standalone CLI.

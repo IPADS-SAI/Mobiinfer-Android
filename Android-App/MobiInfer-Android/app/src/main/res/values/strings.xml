@@ -7,7 +7,8 @@
     <string name="welcome_title_text">你好，我是 MobiInfer</string>
     <string name="welcome_desc">让我协助你了解知识、获得灵感、提升效率，我可以进行多轮对话互动、根据图片给出信息并进一步解读。</string>
     <string name="welcome_desc_text">让我协助你了解知识、获得灵感、提升效率，我可以进行多轮对话互动，回答你的各种问题。</string>
-    <string name="suggestion_1">请介绍一下上海交大</string>
+    <string name="suggestion_1">python写斐波那契数列</string>
+    <string name="suggestion_1_prompt">请编写一个 Python 函数，返回斐波那契数列的前 n 项。请包含清晰的注释，并给出一个调用示例。</string>
     <string name="suggestion_2">这张图片里有什么</string>
     <string name="suggestion_1_text">人工智能是什么？</string>
     <string name="suggestion_2_text">写一首春天主题的小诗。</string>

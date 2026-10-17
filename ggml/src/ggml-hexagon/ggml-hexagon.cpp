@@ -4331,6 +4331,9 @@ void ggml_hexagon_session::flush_pending(bool all) {
         }
     }
 
+    int64_t read_us = 0;
+    uint64_t read_calls = 0;
+    uint64_t empty_reads = 0;
     while (this->batch_rsp_seq < this->batch_req_seq) {
         struct htp_opbatch_rsp rsp;
         uint32_t               rsp_size;
@@ -4342,8 +4345,14 @@ void ggml_hexagon_session::flush_pending(bool all) {
         // Read response packet from queue
         const uint32_t timeo = opt_oppoll ? 0 : DSPQUEUE_TIMEOUT;
 
+        const int64_t read_start = opt_profile ? ggml_time_us() : 0;
         int err = dspqueue_read(this->queue, &flags, 1, &n_dbufs, &dbuf, sizeof(rsp), &rsp_size, (uint8_t *) &rsp, timeo);
+        if (opt_profile) {
+            read_us += ggml_time_us() - read_start;
+            ++read_calls;
+        }
         if (err == AEE_EEXPIRED || err == AEE_EWOULDBLOCK) {
+            if (opt_profile) ++empty_reads;
             continue;
         }
 
@@ -4370,6 +4379,11 @@ void ggml_hexagon_session::flush_pending(bool all) {
         this->batch_rsp_seq = rsp.seq;
 
         if (!all) break;
+    }
+    if (opt_profile && read_calls) {
+        GGML_LOG_DEBUG("ggml-hex: %s profile-wait read_us %lld calls %llu empty %llu\n",
+                this->c_name(), (long long) read_us,
+                (unsigned long long) read_calls, (unsigned long long) empty_reads);
     }
 }
 

@@ -149,6 +149,11 @@ dependencies {
 
     // Markdown rendering for AI streaming responses (headings, bold, lists, code, etc.)
     implementation("io.noties.markwon:core:4.6.2")
+    implementation("io.noties.markwon:syntax-highlight:4.6.2") {
+        // Kotlin already supplies these annotations under the newer artifact.
+        exclude(group = "org.jetbrains", module = "annotations-java5")
+    }
+    annotationProcessor("io.noties:prism4j-bundler:2.0.0")
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
