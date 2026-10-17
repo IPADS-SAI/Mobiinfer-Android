@@ -5,11 +5,14 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.Log
 import android.view.MotionEvent
 import android.view.View
 import android.view.inputmethod.InputMethodManager
+import android.widget.ArrayAdapter
 import android.widget.ImageButton
+import android.widget.ListPopupWindow
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -19,6 +22,7 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updatePadding
+import androidx.drawerlayout.widget.DrawerLayout
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -45,12 +49,23 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnSend: ImageButton
     private lateinit var btnImage: ImageButton
     private lateinit var btnThink: MaterialButton
-    private lateinit var btnClearChat: ImageButton
     private lateinit var btnModelManager: ImageButton
     private lateinit var btnImageSlice: ImageButton
     private lateinit var cardInputBar: View
     private lateinit var appBarLayout: AppBarLayout
     private lateinit var tvTitle: TextView
+    private lateinit var loadingOverlay: View
+    private lateinit var tvLoadingText: TextView
+    private lateinit var drawerLayout: DrawerLayout
+    private lateinit var recyclerConversations: RecyclerView
+    private lateinit var conversationAdapter: ConversationAdapter
+
+    private var currentConversationId: String? = null
+    // Set when the UI is showing a conversation whose history still needs to be
+    // pushed into the engine (cold start, model reload, or conversation switch).
+    private var pendingRestore = false
+    // Throttle for the in-flight streaming checkpoint (see [persistDuringStreaming]).
+    private var lastStreamPersistAt = 0L
 
     private lateinit var engine: LlamaEngine
     private var generationJob: Job? = null
@@ -61,6 +76,13 @@ class MainActivity : AppCompatActivity() {
     private var isProcessingVideo = false
     private var hasAutoLoaded = false
     private var loadedModelId: String? = null
+    private var pendingPrompt: String? = null
+    private var pendingImageAfterLoad = false
+    private var downloadPromptId: Long = -1L
+    private var downloadModelId: String? = null
+    private var isInlineDownloading = false
+    private var isInlineModelLoad = false
+    private var lastDownloadUiAt = 0L
     private var messageIdCounter = 1L
     private val messages = mutableListOf<ChatMessage>()
     private var createdWithLocale: String? = null
@@ -69,6 +91,10 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         createdWithLocale = LocaleManager.currentLanguage(this).tag
+
+        // Roll an outdated stored selection forward to the shipped default
+        // (MiniCPM). Must run before anything reads getSelectedModel().
+        LlamaEngine.applyDefaultModelIfNeeded(applicationContext)
 
         // If the selected model is a TTS model, redirect to TtsActivity immediately.
         // The chat interface is only meaningful for LLM/VLM models.
@@ -112,12 +138,24 @@ class MainActivity : AppCompatActivity() {
         btnSend = findViewById(R.id.btn_send)
         btnImage = findViewById(R.id.btn_image)
         btnThink = findViewById(R.id.btn_think)
-        btnClearChat = findViewById(R.id.btn_clear_chat)
         btnModelManager = findViewById(R.id.btn_model_manager)
         btnImageSlice = findViewById(R.id.btn_image_slice)
         cardInputBar = findViewById(R.id.card_input_bar)
         appBarLayout = findViewById(R.id.appBarLayout)
         tvTitle = findViewById(R.id.tv_title)
+        loadingOverlay = findViewById(R.id.loading_overlay)
+        tvLoadingText = findViewById(R.id.tv_loading_text)
+        drawerLayout = findViewById(R.id.drawer_layout)
+        recyclerConversations = findViewById(R.id.recycler_conversations)
+    }
+
+    private fun showLoading(show: Boolean, textRes: Int = R.string.status_loading) {
+        if (show) {
+            tvLoadingText.setText(textRes)
+            loadingOverlay.visibility = View.VISIBLE
+        } else {
+            loadingOverlay.visibility = View.GONE
+        }
     }
 
     private fun setupRecyclerView() {
@@ -125,24 +163,35 @@ class MainActivity : AppCompatActivity() {
         chatAdapter.setOnStopClick {
             engine.cancelGeneration()
         }
+        chatAdapter.setOnDownloadConfirm {
+            startInlineDownload()
+        }
+        chatAdapter.setOnDownloadCancel {
+            cancelDownloadPrompt()
+        }
+        chatAdapter.setOnDownloadPause {
+            ModelDownloadService.pause(this)
+        }
+        chatAdapter.setOnDownloadResume {
+            resumeInlineDownload()
+        }
         chatAdapter.setOnSuggestionClick { suggestion ->
-            if (isModelReady && !isProcessingVideo) {
+            if (isProcessingVideo) {
+                Toast.makeText(this, R.string.toast_wait_video, Toast.LENGTH_SHORT).show()
+            } else {
                 etInput.setText(suggestion)
                 handleUserInput()
-            } else if (!isModelReady) {
-                Toast.makeText(this, R.string.toast_load_model_first, Toast.LENGTH_SHORT).show()
-            } else {
-                Toast.makeText(this, R.string.toast_wait_video, Toast.LENGTH_SHORT).show()
             }
         }
         chatAdapter.setOnSuggestionImageClick {
-            if (isModelReady && !isProcessingVideo) {
-                pendingImageQuestion = getString(R.string.suggestion_2)
-                getMedia.launch(arrayOf("image/*"))
-            } else if (!isModelReady) {
-                Toast.makeText(this, R.string.toast_load_model_first, Toast.LENGTH_SHORT).show()
-            } else {
-                Toast.makeText(this, R.string.toast_wait_video, Toast.LENGTH_SHORT).show()
+            when {
+                isProcessingVideo ->
+                    Toast.makeText(this, R.string.toast_wait_video, Toast.LENGTH_SHORT).show()
+                isModelReady -> {
+                    pendingImageQuestion = getString(R.string.suggestion_2)
+                    getMedia.launch(arrayOf("image/*"))
+                }
+                else -> requestImagePickAfterModel()
             }
         }
 
@@ -158,9 +207,144 @@ class MainActivity : AppCompatActivity() {
             )
         }
 
+        setupConversationDrawer()
+        openConversation(ConversationStore.ensureCurrent(applicationContext).id, restoreContext = true)
+    }
+
+    // -------------------------------------------------------- conversation drawer
+
+    private fun setupConversationDrawer() {
+        conversationAdapter = ConversationAdapter(
+            onOpen = { meta -> if (meta.id != currentConversationId) openConversation(meta.id, restoreContext = true) },
+            onDelete = { meta -> confirmDeleteConversation(meta) },
+            onRename = { meta -> showRenameDialog(meta) }
+        )
+        recyclerConversations.layoutManager = LinearLayoutManager(this)
+        recyclerConversations.adapter = conversationAdapter
+    }
+
+    private fun refreshConversationList() {
+        conversationAdapter.submit(
+            ConversationStore.list(applicationContext),
+            currentConversationId
+        )
+    }
+
+    /**
+     * Shows [id] in the chat and, when [restoreContext] is set, replays its
+     * history into the engine so follow-up turns keep their context.
+     */
+    private fun openConversation(id: String, restoreContext: Boolean) {
+        persistCurrentConversation()
+        currentConversationId = id
+        ConversationStore.setCurrentId(applicationContext, id)
+
+        messages.clear()
+        val loaded = ConversationStore.load(applicationContext, id)
         val selectedModel = LlamaEngine.getSelectedModel(applicationContext)
         messages.add(ChatMessage.WelcomeCard(isTextOnly = selectedModel.isTextOnly))
+        messages.addAll(loaded)
+        messageIdCounter = (loaded.maxOfOrNull { it.id } ?: 0L) + 1L
+        isImagePrefilled = false
+        pendingImageProcessingMs = null
         chatAdapter.submitList(messages.toList())
+        refreshConversationList()
+
+        pendingRestore = restoreContext && loaded.isNotEmpty()
+        if (pendingRestore && ::engine.isInitialized && engine.state.value is LlamaState.ModelReady) {
+            restoreCurrentConversationHistory()
+        }
+    }
+
+    private fun persistCurrentConversation() {
+        val id = currentConversationId ?: return
+        val snapshot = messages.toList()
+        lifecycleScope.launch(Dispatchers.IO) {
+            ConversationStore.save(applicationContext, id, snapshot)
+        }
+    }
+
+    /**
+     * Checkpoints the conversation while the assistant answer is still
+     * streaming, throttled to [STREAM_PERSIST_INTERVAL_MS]. Without this a
+     * process kill mid-generation would leave the saved assistant bubble empty;
+     * now at most ~1s of tokens are lost.
+     */
+    private fun persistDuringStreaming() {
+        val now = System.currentTimeMillis()
+        if (now - lastStreamPersistAt < STREAM_PERSIST_INTERVAL_MS) return
+        lastStreamPersistAt = now
+        persistCurrentConversation()
+    }
+
+    private fun restoreCurrentConversationHistory() {
+        val id = currentConversationId ?: return
+        pendingRestore = false
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val turns = ConversationStore.toHistoryTurns(ConversationStore.load(applicationContext, id))
+                if (turns.isEmpty()) return@launch
+                engine.clearContext()
+                engine.restoreConversation(turns)
+                withContext(Dispatchers.Main) { refreshConversationList() }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to restore conversation history", e)
+            }
+        }
+    }
+
+    private fun startNewConversation() {
+        persistCurrentConversation()
+        val meta = ConversationStore.create(applicationContext)
+        openConversation(meta.id, restoreContext = false)
+        clearEngineContext()
+        drawerLayout.closeDrawers()
+    }
+
+    private fun clearEngineContext() {
+        if (!::engine.isInitialized || engine.state.value !is LlamaState.ModelReady) return
+        lifecycleScope.launch(Dispatchers.IO) {
+            try { engine.clearContext() } catch (e: Exception) { Log.w(TAG, "clearContext failed", e) }
+        }
+    }
+
+    private fun confirmDeleteConversation(meta: ConversationMeta) {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.delete_conversation_title)
+            .setMessage(R.string.delete_conversation_confirm)
+            .setPositiveButton(R.string.delete) { _, _ ->
+                val deletingCurrent = meta.id == currentConversationId
+                ConversationStore.delete(applicationContext, meta.id)
+                if (deletingCurrent) {
+                    val next = ConversationStore.list(applicationContext).firstOrNull()
+                        ?: ConversationStore.create(applicationContext)
+                    openConversation(next.id, restoreContext = true)
+                } else {
+                    refreshConversationList()
+                }
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    private fun showRenameDialog(meta: ConversationMeta) {
+        val input = android.widget.EditText(this).apply {
+            setText(meta.title)
+            setHint(R.string.rename_conversation_hint)
+            setSelection(text.length)
+        }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.rename_conversation)
+            .setView(input)
+            .setPositiveButton(R.string.confirm) { _, _ ->
+                val name = input.text.toString().trim()
+                if (name.isNotEmpty()) {
+                    ConversationStore.rename(applicationContext, meta.id, name)
+                    refreshConversationList()
+                }
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
     }
 
     private fun setupClickListeners() {
@@ -177,10 +361,16 @@ class MainActivity : AppCompatActivity() {
             refreshThinkButton()
         }
         btnSend.setOnClickListener { handleUserInput() }
-        btnClearChat.setOnClickListener { showClearChatDialog() }
+        findViewById<ImageButton>(R.id.btn_model_select).setOnClickListener { showModelSelector() }
         btnModelManager.setOnClickListener {
             startActivity(Intent(this, ModelManagerActivity::class.java))
         }
+        findViewById<ImageButton>(R.id.btn_menu).setOnClickListener {
+            refreshConversationList()
+            drawerLayout.openDrawer(androidx.core.view.GravityCompat.START)
+        }
+        findViewById<com.google.android.material.button.MaterialButton>(R.id.btn_new_conversation)
+            .setOnClickListener { startNewConversation() }
         btnImageSlice.setOnClickListener { showImageSliceDialog() }
 
         etInput.setOnFocusChangeListener { _, hasFocus ->
@@ -269,12 +459,21 @@ class MainActivity : AppCompatActivity() {
         chatAdapter.submitList(messages.toList())
     }
 
+    private fun takePersistableReadPermission(uri: Uri) {
+        try {
+            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Provider offers no persistable grant for $uri", e)
+        }
+    }
+
     private fun clearChat() {
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 engine.clearContext()
                 withContext(Dispatchers.Main) {
                     clearChatUI()
+                    persistCurrentConversation()
                     Toast.makeText(this@MainActivity, R.string.clear_chat_toast, Toast.LENGTH_SHORT).show()
                 }
             } catch (e: Exception) {
@@ -291,6 +490,7 @@ class MainActivity : AppCompatActivity() {
             engine = LlamaEngine.getInstance(applicationContext)
             withContext(Dispatchers.Main) {
                 observeEngineState()
+                observeDownloads()
             }
         }
     }
@@ -304,20 +504,20 @@ class MainActivity : AppCompatActivity() {
                         enableInput(false)
                     }
                     is LlamaState.Initialized -> {
-                        enableInput(false)
-                        if (!hasAutoLoaded) {
-                            hasAutoLoaded = true
-                            loadDefaultModel()
-                        }
+                        showLoading(false)
+                        if (!isModelReady) enableTextInput()
                     }
                     is LlamaState.LoadingModel -> {
                         enableInput(false)
+                        if (!isInlineModelLoad) showLoading(true)
                     }
                     is LlamaState.ModelReady -> {
                         isModelReady = true
                         loadedModelId = LlamaEngine.getSelectedModel(applicationContext).id
+                        showLoading(false)
                         enableInput(true)
                         updateUIForModelType()
+                        if (pendingRestore) restoreCurrentConversationHistory()
                     }
                     is LlamaState.ProcessingSystemPrompt,
                     is LlamaState.ProcessingUserPrompt,
@@ -334,7 +534,9 @@ class MainActivity : AppCompatActivity() {
                         enableInput(false)
                     }
                     is LlamaState.Error -> {
-                        enableInput(false)
+                        isModelReady = false
+                        showLoading(false)
+                        enableTextInput()
                     }
                 }
             }
@@ -349,6 +551,20 @@ class MainActivity : AppCompatActivity() {
         } else {
             btnImage.isEnabled = engine.isVisionSupported
         }
+    }
+
+    /**
+     * Before any model is loaded we still want the user to type and send, so the
+     * request itself can trigger the download/load flow.  Vision/thinking
+     * affordances stay hidden until a model is ready.
+     */
+    private fun enableTextInput() {
+        etInput.isEnabled = true
+        btnSend.isEnabled = true
+        btnImage.isEnabled = false
+        btnImage.visibility = View.GONE
+        btnImageSlice.visibility = View.GONE
+        btnThink.visibility = View.GONE
     }
 
     private fun shouldRedirectToTts(): Boolean {
@@ -370,6 +586,34 @@ class MainActivity : AppCompatActivity() {
         }
 
         refreshWelcomeCard(model.isTextOnly)
+    }
+
+    /** Toolbar dropdown that changes [selectedModelId] only (lazy loading). */
+    private fun showModelSelector() {
+        val models = ModelInfo.AVAILABLE_MODELS
+        val selectedId = LlamaEngine.getSelectedModel(this).id
+        val labels = models.map { m -> (if (m.id == selectedId) "✓ " else "    ") + m.displayName }
+        val popup = ListPopupWindow(this)
+        popup.anchorView = findViewById<View>(R.id.btn_model_select)
+        popup.setAdapter(ArrayAdapter(this, android.R.layout.simple_list_item_1, labels))
+        popup.isModal = true
+        popup.width = (resources.displayMetrics.widthPixels * 0.8f).toInt()
+        popup.setOnItemClickListener { _, _, position, _ ->
+            popup.dismiss()
+            val model = models[position]
+            if (model.id == LlamaEngine.getSelectedModel(this).id) return@setOnItemClickListener
+            LlamaEngine.setSelectedModel(this, model.id)
+            if (!LlamaEngine.modelsExist(this, model)) {
+                Toast.makeText(this, R.string.model_not_downloaded_hint, Toast.LENGTH_SHORT).show()
+            } else if (isModelReady && loadedModelId != model.id) {
+                Toast.makeText(
+                    this,
+                    getString(R.string.model_switched_lazy, model.displayName),
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+        popup.show()
     }
 
     private fun refreshThinkButton() {
@@ -396,7 +640,11 @@ class MainActivity : AppCompatActivity() {
         val ggufMissing = !ggufFile.exists()
         val mmprojMissing = !model.isTextOnly && (mmprojFile == null || !mmprojFile.exists())
 
-        if (ggufMissing || mmprojMissing) {
+        // modelsExist() also validates bundle payloads (expert layers + draft),
+        // so a partially-downloaded flow-through model is treated as "not
+        // downloaded" and routed to the download prompt instead of a load
+        // that would fail.
+        if (!LlamaEngine.modelsExist(ctx)) {
             promptDownloadModels(
                 ggufMissing = ggufMissing,
                 mmprojMissing = mmprojMissing
@@ -404,6 +652,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        showLoading(true)
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 val mmprojArg = if (mmprojFile != null && mmprojFile.exists()) mmprojFile.absolutePath else null
@@ -472,6 +721,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handleSelectedImage(uri: Uri) {
+        takePersistableReadPermission(uri)
         lifecycleScope.launch(Dispatchers.IO) {
             val startNs = System.nanoTime()
             try {
@@ -517,7 +767,8 @@ class MainActivity : AppCompatActivity() {
                         text = "",
                         imageBitmap = bitmap,
                         imageInfo = imageInfo,
-                        isPrefilling = true
+                        isPrefilling = true,
+                        imageUri = uri.toString()
                     )
                     messages.add(imageMessage)
                     chatAdapter.submitList(messages.toList()) {
@@ -540,6 +791,7 @@ class MainActivity : AppCompatActivity() {
                         chatAdapter.submitList(messages.toList())
                     }
                 }
+                persistCurrentConversation()
 
                 val pending = pendingImageQuestion
                 if (pending != null) {
@@ -581,6 +833,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         isProcessingVideo = true
+        takePersistableReadPermission(uri)
         lifecycleScope.launch(Dispatchers.IO) {
             val msgId = messageIdCounter++
             val startNs = System.nanoTime()
@@ -597,7 +850,8 @@ class MainActivity : AppCompatActivity() {
                         imageBitmap = extracted.thumbnail,
                         imageInfo = info,
                         isPrefilling = true,
-                        isVideo = true
+                        isVideo = true,
+                        imageUri = uri.toString()
                     )
                     messages.add(videoMessage)
                     chatAdapter.submitList(messages.toList()) {
@@ -635,6 +889,7 @@ class MainActivity : AppCompatActivity() {
                         chatAdapter.submitList(messages.toList())
                     }
                 }
+                persistCurrentConversation()
             } catch (e: Exception) {
                 pendingImageProcessingMs = null
                 Log.e(TAG, "Error processing video", e)
@@ -671,6 +926,297 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        val selected = LlamaEngine.getSelectedModel(applicationContext)
+        if (isModelReady && loadedModelId == selected.id) {
+            sendPrompt(userMsg)
+            return
+        }
+
+        beginModelFlow(userMsg)
+    }
+
+    /**
+     * First request before any model is loaded: make sure the files are present
+     * (download inline in the chat stream if not) and then load the model, all
+     * without leaving the home screen and without any dialog.
+     */
+    private fun beginModelFlow(userMsg: String) {
+        if (isInlineDownloading || isInlineModelLoad) return
+        pendingPrompt = userMsg
+        pendingImageAfterLoad = false
+        etInput.text = null
+        etInput.clearFocus()
+        (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
+            .hideSoftInputFromWindow(etInput.windowToken, 0)
+        collapseAppBar()
+
+        val model = LlamaEngine.getSelectedModel(applicationContext)
+        if (!LlamaEngine.modelsExist(applicationContext, model)) {
+            showDownloadPrompt()
+        } else {
+            loadModelThenSend()
+        }
+    }
+
+    /**
+     * Like [beginModelFlow] but for the "attach an image" suggestion: once the
+     * model is available, open the picker instead of sending a text prompt.
+     */
+    private fun requestImagePickAfterModel() {
+        if (isInlineDownloading || isInlineModelLoad) return
+        pendingPrompt = null
+        pendingImageAfterLoad = true
+        collapseAppBar()
+
+        val model = LlamaEngine.getSelectedModel(applicationContext)
+        if (!LlamaEngine.modelsExist(applicationContext, model)) {
+            showDownloadPrompt()
+        } else {
+            loadModelThenSend()
+        }
+    }
+
+    private fun showDownloadPrompt() {
+        removeDownloadPrompt()
+        val model = LlamaEngine.getSelectedModel(applicationContext)
+        val id = messageIdCounter++
+        downloadPromptId = id
+        downloadModelId = model.id
+        messages.add(ChatMessage.ModelDownloadPrompt(id = id, modelName = model.displayName))
+        chatAdapter.submitList(messages.toList()) {
+            scrollToBottom()
+        }
+    }
+
+    private fun updateDownloadPrompt(
+        downloading: Boolean,
+        fraction: Float = 0f,
+        status: String? = null,
+        paused: Boolean = false
+    ) {
+        val index = messages.indexOfFirst { it.id == downloadPromptId }
+        if (index < 0) return
+        val current = messages[index] as? ChatMessage.ModelDownloadPrompt ?: return
+        messages[index] = current.copy(
+            downloading = downloading,
+            paused = paused,
+            fraction = fraction,
+            status = status
+        )
+        chatAdapter.submitList(messages.toList()) {
+            scrollToBottom()
+        }
+    }
+
+    private fun removeDownloadPrompt() {
+        if (downloadPromptId < 0) return
+        chatAdapter.clearActiveDownload()
+        removeMessage(downloadPromptId)
+        downloadPromptId = -1L
+        downloadModelId = null
+    }
+
+    private fun cancelDownloadPrompt() {
+        if (isInlineDownloading) return
+        removeDownloadPrompt()
+        pendingPrompt?.let { etInput.setText(it) }
+        pendingPrompt = null
+        pendingImageAfterLoad = false
+        etInput.requestFocus()
+    }
+
+    private fun startInlineDownload() {
+        if (downloadPromptId < 0) return
+        val modelId = downloadModelId ?: LlamaEngine.getSelectedModel(applicationContext).id
+        if (ModelDownloadController.isRunning && ModelDownloadController.runningModelId() != modelId) {
+            Toast.makeText(this, R.string.toast_downloading, Toast.LENGTH_SHORT).show()
+            return
+        }
+        isInlineDownloading = true
+        updateDownloadPrompt(
+            downloading = true,
+            fraction = 0f,
+            status = getString(R.string.download_preparing),
+            paused = false
+        )
+        chatAdapter.setActiveDownload(downloadPromptId)
+        enableInput(false)
+        ModelDownloadService.start(this, modelId)
+    }
+
+    private fun resumeInlineDownload() {
+        val modelId = downloadModelId ?: return
+        if (ModelDownloadController.isRunning) return
+        isInlineDownloading = true
+        updateDownloadPrompt(
+            downloading = true,
+            fraction = 0f,
+            status = getString(R.string.download_preparing),
+            paused = false
+        )
+        chatAdapter.setActiveDownload(downloadPromptId)
+        enableInput(false)
+        ModelDownloadService.start(this, modelId)
+    }
+
+    /**
+     * Mirrors the shared [ModelDownloadController] into the inline chat card.
+     * Downloads started elsewhere (model manager) are ignored here because
+     * [downloadPromptId] is only set while a card exists.
+     */
+    private fun observeDownloads() {
+        lifecycleScope.launch {
+            ModelDownloadController.status.collect { status ->
+                if (downloadPromptId < 0) return@collect
+                val modelId = downloadModelId ?: return@collect
+                when (status) {
+                    is ModelDownloadController.Status.Idle -> Unit
+                    is ModelDownloadController.Status.Running -> {
+                        if (status.modelId == modelId) {
+                            if (!isInlineDownloading) {
+                                isInlineDownloading = true
+                                chatAdapter.setActiveDownload(downloadPromptId)
+                            }
+                            chatAdapter.updateDownloadProgress(
+                                downloadPromptId,
+                                status.fraction,
+                                status.message
+                            )
+                        }
+                    }
+                    is ModelDownloadController.Status.Paused -> {
+                        if (status.modelId == modelId) {
+                            isInlineDownloading = false
+                            updateDownloadPrompt(
+                                downloading = true,
+                                paused = true,
+                                fraction = status.fraction,
+                                status = getString(
+                                    R.string.model_paused_progress,
+                                    (status.fraction * 100f).toInt().coerceIn(0, 100)
+                                )
+                            )
+                            Toast.makeText(this@MainActivity, R.string.download_paused, Toast.LENGTH_SHORT).show()
+                            ModelDownloadController.acknowledge()
+                        }
+                    }
+                    is ModelDownloadController.Status.Completed -> {
+                        if (status.modelId == modelId) {
+                            isInlineDownloading = false
+                            removeDownloadPrompt()
+                            ModelDownloadController.acknowledge()
+                            loadModelThenSend()
+                        }
+                    }
+                    is ModelDownloadController.Status.Failed -> {
+                        if (status.modelId == modelId) {
+                            isInlineDownloading = false
+                            updateDownloadPrompt(downloading = false)
+                            Toast.makeText(
+                                this@MainActivity,
+                                getString(R.string.download_failed, status.message),
+                                Toast.LENGTH_LONG
+                            ).show()
+                            pendingPrompt?.let { etInput.setText(it) }
+                            pendingPrompt = null
+                            pendingImageAfterLoad = false
+                            enableInput(true)
+                            ModelDownloadController.acknowledge()
+                        }
+                    }
+                    is ModelDownloadController.Status.Cancelled -> {
+                        if (status.modelId == modelId) {
+                            isInlineDownloading = false
+                            updateDownloadPrompt(downloading = false)
+                            ModelDownloadController.acknowledge()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun loadModelThenSend() {
+        val pendingText = pendingPrompt
+        val pickImage = pendingImageAfterLoad
+        if (pendingText == null && !pickImage) return
+        if (isInlineModelLoad) return
+        isInlineModelLoad = true
+        enableInput(false)
+        (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
+            .hideSoftInputFromWindow(etInput.windowToken, 0)
+
+        // Reuse the regular "thinking" animation as the model-load indicator:
+        // an assistant placeholder with empty text shows the prefill spinner.
+        val placeholderId = messageIdCounter++
+        messages.add(ChatMessage.AiMessage(id = placeholderId, text = "", isGenerating = true, isLoadingPlaceholder = true))
+        chatAdapter.setActiveAiMessage(placeholderId)
+        chatAdapter.submitList(messages.toList()) {
+            scrollToBottom()
+        }
+
+        val ggufFile = File(LlamaEngine.modelPath(applicationContext))
+        val mmprojFile = LlamaEngine.mmprojPath(applicationContext)?.let { File(it) }
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                // A different model may still be loaded (selection is lazy), so
+                // drop it before loading the newly selected one.
+                if (isModelReady) {
+                    runCatching { engine.unloadModel() }
+                    isModelReady = false
+                    loadedModelId = null
+                }
+                val mmprojArg = mmprojFile?.takeIf { it.exists() }?.absolutePath
+                engine.loadModel(ggufFile.absolutePath, mmprojArg)
+                withContext(Dispatchers.Main) {
+                    isInlineModelLoad = false
+                    chatAdapter.clearActiveAiMessage()
+                    removeMessage(placeholderId)
+                    isModelReady = true
+                    loadedModelId = LlamaEngine.getSelectedModel(applicationContext).id
+                    updateUIForModelType()
+                    pendingPrompt = null
+                    pendingImageAfterLoad = false
+                    enableInput(true)
+                    if (pickImage) {
+                        pendingImageQuestion = getString(R.string.suggestion_2)
+                        getMedia.launch(arrayOf("image/*"))
+                    } else if (pendingText != null) {
+                        sendPrompt(pendingText)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Inline model load failed", e)
+                withContext(Dispatchers.Main) {
+                    isInlineModelLoad = false
+                    chatAdapter.clearActiveAiMessage()
+                    removeMessage(placeholderId)
+                    runCatching { engine.resetToInitialized() }
+                    isModelReady = false
+                    pendingPrompt?.let { etInput.setText(it) }
+                    pendingPrompt = null
+                    pendingImageAfterLoad = false
+                    enableInput(true)
+                    Toast.makeText(
+                        this@MainActivity,
+                        getString(R.string.toast_model_load_failed, e.message),
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }
+    }
+
+    private fun removeMessage(id: Long) {
+        val index = messages.indexOfFirst { it.id == id }
+        if (index >= 0) {
+            messages.removeAt(index)
+            chatAdapter.submitList(messages.toList())
+        }
+    }
+
+    private fun sendPrompt(userMsg: String) {
         etInput.clearFocus()
         (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
             .hideSoftInputFromWindow(etInput.windowToken, 0)
@@ -704,6 +1250,7 @@ class MainActivity : AppCompatActivity() {
         chatAdapter.submitList(messages.toList()) {
             scrollToBottom()
         }
+        persistCurrentConversation()
 
         generationJob = lifecycleScope.launch(Dispatchers.Default) {
             val inferenceStartNs = System.nanoTime()
@@ -741,6 +1288,8 @@ class MainActivity : AppCompatActivity() {
                             enableInput(true)
                             scrollToBottom()
                         }
+                        persistCurrentConversation()
+                        withContext(Dispatchers.Main) { refreshConversationList() }
                     }
                 }
                 .catch { error ->
@@ -763,6 +1312,7 @@ class MainActivity : AppCompatActivity() {
                         chatAdapter.updateStreamingText(aiMsgId, currentText)
                         scrollToBottom()
                     }
+                    persistDuringStreaming()
                 }
         }
     }
@@ -799,16 +1349,16 @@ class MainActivity : AppCompatActivity() {
             return
         }
         if (!::engine.isInitialized) return
-        val selectedId = LlamaEngine.getSelectedModel(applicationContext).id
-
-        if (loadedModelId != null && loadedModelId != selectedId) {
-            loadedModelId = null
-            hasAutoLoaded = false
-            reloadAfterModelSwitch()
-        } else if (LlamaEngine.consumeModelSwitched(applicationContext)) {
-            loadedModelId = selectedId
+        // Selection is lazy: a model switch (here or on the model manager page)
+        // only updates the title/selection.  The engine keeps whatever model it
+        // currently has until the next request, which then unloads + loads the
+        // selected model.
+        if (LlamaEngine.consumeModelSwitched(applicationContext)) {
+            loadedModelId = LlamaEngine.getSelectedModel(applicationContext).id
             clearChatUI()
             updateUIForModelType()
+            pendingRestore = currentConversationId != null
+            if (engine.state.value is LlamaState.ModelReady) restoreCurrentConversationHistory()
         }
     }
 
@@ -824,6 +1374,7 @@ class MainActivity : AppCompatActivity() {
             }
             withContext(Dispatchers.Main) {
                 clearChatUI()
+                pendingRestore = currentConversationId != null
                 loadDefaultModel()
             }
         }
@@ -831,6 +1382,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStop() {
         generationJob?.cancel()
+        persistCurrentConversation()
         super.onStop()
     }
 
@@ -843,5 +1395,6 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private val TAG = MainActivity::class.java.simpleName
+        private const val STREAM_PERSIST_INTERVAL_MS = 1000L
     }
 }

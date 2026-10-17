@@ -5,6 +5,16 @@
 #include <array>
 #include <memory>
 #include <string>
+#include <vector>
+
+// One restored conversation turn: role is "system" / "user" / "assistant";
+// images are raw encoded bytes (png/jpeg) attached to a user turn, in the
+// order their media markers appear in text.
+struct RestoreTurn {
+    std::string role;
+    std::string text;
+    std::vector<std::vector<uint8_t>> images;
+};
 
 // In-process CLI core: owns target/draft contexts, media history, streaming
 // requests and the worker loop. No HTTP listener or external process.
@@ -21,6 +31,11 @@ public:
     std::string next(bool & done);
     void cancel();
     void reset();
+    // Replace the in-memory chat history (used when the user switches back to
+    // a saved conversation). Does not prefill immediately: the KV prefix is
+    // rebuilt by the next submit(), which the flag below forces to start from
+    // scratch so the restored turns are actually evaluated.
+    void restore(const std::vector<RestoreTurn> & turns);
     void resetPerformanceStats();
     std::array<double, 5> performanceStats() const;
 private:

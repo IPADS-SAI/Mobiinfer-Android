@@ -1,12 +1,23 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<androidx.drawerlayout.widget.DrawerLayout xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto"
     xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/drawer_layout"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
     android:background="?android:attr/colorBackground"
     tools:context=".MainActivity">
+
+    <FrameLayout
+        android:id="@+id/chat_root"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:background="?android:attr/colorBackground">
 
     <androidx.coordinatorlayout.widget.CoordinatorLayout
         android:layout_width="match_parent"
@@ -39,12 +50,26 @@
                         android:layout_width="match_parent"
                         android:layout_height="match_parent">
 
+                        <ImageButton
+                            android:id="@+id/btn_menu"
+                            android:layout_width="40dp"
+                            android:layout_height="40dp"
+                            android:layout_gravity="start|center_vertical"
+                            android:layout_marginStart="8dp"
+                            android:background="?attr/selectableItemBackgroundBorderless"
+                            android:src="@drawable/ic_menu"
+                            android:contentDescription="@string/conversations"
+                            app:tint="?attr/colorOnSurfaceVariant" />
+
                         <TextView
                             android:id="@+id/tv_title"
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
                             android:layout_gravity="start|center_vertical"
-                            android:layout_marginStart="20dp"
+                            android:layout_marginStart="56dp"
+                            android:ellipsize="end"
+                            android:maxLines="1"
+                            android:maxWidth="210dp"
                             android:text="@string/app_title"
                             android:textSize="18sp"
                             android:textStyle="bold"
@@ -55,6 +80,16 @@
                             android:layout_height="wrap_content"
                             android:layout_gravity="end|center_vertical"
                             android:orientation="horizontal">
+
+                            <ImageButton
+                                android:id="@+id/btn_model_select"
+                                android:layout_width="40dp"
+                                android:layout_height="40dp"
+                                android:layout_marginEnd="4dp"
+                                android:background="?attr/selectableItemBackgroundBorderless"
+                                android:src="@drawable/ic_model"
+                                android:contentDescription="@string/model_management"
+                                app:tint="?attr/colorOnSurfaceVariant" />
 
                             <ImageButton
                                 android:id="@+id/btn_model_manager"
@@ -76,15 +111,6 @@
                                 android:contentDescription="@string/image_slice_settings"
                                 app:tint="?attr/colorOnSurfaceVariant" />
 
-                            <ImageButton
-                                android:id="@+id/btn_clear_chat"
-                                android:layout_width="40dp"
-                                android:layout_height="40dp"
-                                android:layout_marginEnd="8dp"
-                                android:background="?attr/selectableItemBackgroundBorderless"
-                                android:src="@drawable/ic_delete"
-                                android:contentDescription="@string/clear_chat"
-                                app:tint="?attr/colorOnSurfaceVariant" />
                         </LinearLayout>
                     </FrameLayout>
                 </androidx.appcompat.widget.Toolbar>
@@ -187,4 +213,81 @@
         </LinearLayout>
     </com.google.android.material.card.MaterialCardView>
 
-</LinearLayout>
+    </LinearLayout>
+
+    <!-- Loading overlay: shown while the selected model is being verified and
+         loaded. Blocks interaction and gives a visible progress spinner so a
+         cold start (or a return from the model manager after downloading) does
+         not look frozen. -->
+    <FrameLayout
+        android:id="@+id/loading_overlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#99000000"
+        android:clickable="true"
+        android:focusable="true"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:orientation="vertical"
+            android:gravity="center"
+            android:background="?attr/colorSurface"
+            android:padding="28dp"
+            android:elevation="8dp">
+
+            <com.google.android.material.progressindicator.CircularProgressIndicator
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:indeterminate="true" />
+
+            <TextView
+                android:id="@+id/tv_loading_text"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:text="@string/status_loading"
+                android:textColor="?attr/colorOnSurface"
+                android:textSize="15sp" />
+        </LinearLayout>
+    </FrameLayout>
+
+    </FrameLayout>
+
+    <!-- Conversation drawer: saved chats, newest first, plus a "new chat"
+         action. Opened by the toolbar hamburger only (no edge-swipe). -->
+    <LinearLayout
+        android:id="@+id/conversation_drawer"
+        android:layout_width="300dp"
+        android:layout_height="match_parent"
+        android:layout_gravity="start"
+        android:orientation="vertical"
+        android:background="?attr/colorSurface"
+        android:fitsSystemWindows="true">
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btn_new_conversation"
+            style="@style/Widget.Material3.Button.TonalButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_margin="12dp"
+            android:text="@string/new_conversation"
+            app:icon="@drawable/ic_send"
+            app:iconGravity="textStart" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="?attr/colorOutlineVariant" />
+
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/recycler_conversations"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:clipToPadding="false"
+            android:paddingBottom="12dp" />
+    </LinearLayout>
+
+</androidx.drawerlayout.widget.DrawerLayout>
