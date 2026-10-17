@@ -225,4 +225,5 @@
     <string name="advanced_settings">高级设置</string>
     <string name="model_switched_lazy">已选择 %1$s，发送消息时加载</string>
     <string name="download_paused">已暂停</string>
+    <string name="model_running">运行中</string>
 </resources>

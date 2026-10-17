@@ -48,7 +48,7 @@ Android 应用（[`Android-App/`](Android-App/README.md)，基于 [OpenBMB/MiniC
 
 ---
 
-## 支持的模型 / Supported models
+## 支持的模型
 
 | 模型 / Model | 规模 / Scale | 说明 / Notes |
 |---|---|---|
@@ -65,27 +65,27 @@ Android 应用（[`Android-App/`](Android-App/README.md)，基于 [OpenBMB/MiniC
 ---
 
 
-## 性能数据 / Performance
+## 性能数据
 
 > 📱 OnePlus 13（Snapdragon 8 Elite，HTP0 + HTP1），纯文本实测，128-token 输出。
 
-| 模型 / Model | SoC | Prefill (token/s) | Decode (token/s) |
-|---|---|---:|---:|
-| MiniCPM-V 4.7 35B-A3B（Q3，MoE + LES + DSpark） | Snapdragon 8 Elite | 66.22 | 14.64 |
-| MiniCPM-V 4.7 35B-A3B（同上，App 短 prompt，41 tokens） | Snapdragon 8 Elite | 22.02 | 17.98 |
-| Qwen3-VL-4B-Instruct（Q4_K_M） | Snapdragon 8 Elite | 1013.74 | 18.13 |
+| 模型 | 配置 | SoC | Prompt长度 | Prefill (token/s) | Decode (token/s) |
+|---|---|---|---|---:|---:|
+| MiniCPM-V 4.7 35B-A3B| Q3，LES + DSpark | 8 Elite | 41 | 22.02 | 17.98 |
+| MiniCPM-V 4.7 35B-A3B| Q3 LES + DSpark| 8 Elite | 512 | 94.28 | 13.65 |
+| Qwen3-VL-4B-Instruct | Q4_K_M | 8 Elite | 512 | 1013.74 | 18.13 |
 
-短 prompt 使用「Python 斐波那契数列」示例，未加载 mmproj；其余行为 CLI 数据。
+MiniCPM 两行为 App 数据：短 prompt 使用「Python 斐波那契数列」示例，未加载 mmproj；512-token 数据为[连续五轮的中位数](docs/app-chunk512-five-runs-20261017.md)，加载 mmproj。Qwen3 为 CLI 数据。
 
 
 ---
 
-## 快速开始 / Quick Start
+## 快速开始
 
 三步：**装 App → 下模型 → 开跑**。App 默认就是 NPU 最优配置（双 HTP 会话 + HTP 视觉 + Q8_0 DSpark 投机采样），开箱即用。
 
 
-### 1. 安装 App / Install the app
+### 1. 安装 App
 
 从 [Releases](https://github.com/IPADS-SAI/Mobiinfer-Android/releases) 下载最新 Android APK 并安装（首次需在「设置 → 应用 → 安装未知应用」中允许来源）。
 
@@ -94,19 +94,19 @@ Android 应用（[`Android-App/`](Android-App/README.md)，基于 [OpenBMB/MiniC
 adb install -r MobiInfer-Android-<version>.apk
 ```
 
-### 2. 下载模型权重 / Download the model weights (~17 GB)
+### 2. 下载模型权重 (~17 GB)
 
 打开 App → **模型管理 / Model Manager** → 选择 **MiniCPM-V 4.7 35B-A3B (Q3, NPU)** → **下载 / Download**。App 会从 ModelScope 拉取整包（主模型 + mmproj + DSpark 草稿 + 40 层 tiled 专家，约 **17 GB**），并按 `SHA256SUMS` 逐一校验。建议 Wi‑Fi，预留约 17 GB 可用空间。
 
 
-### 3. 开跑 / Run
+### 3. 开跑
 
 下载完成后，在 **模型管理** 中选中该模型进入对话，直接输入文字，或附图提问。
 
 
 ---
 
-## 常用开关 / Key flags
+## 常用开关
 
 | 开关 / Flag | 作用 / Purpose |
 |---|---|
@@ -123,7 +123,7 @@ Hexagon 环境变量（`GGML_HEXAGON_DEVICES` / `GGML_HEXAGON_POWER_MODE` / `GGM
 
 ---
 
-## 仓库结构 / Layout
+## 仓库结构
 
 ```
 Android-App/               安卓App源码
@@ -141,7 +141,7 @@ docs/les/                  LES 前瞻专家调度说明（中英）
 
 ---
 
-## 致谢与许可 / Credits & License
+## 致谢与许可
 
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) 与 [llama.cpp-omni](https://github.com/OpenBMB/llama.cpp-omni)
 - [MiniCPM-V-Apps](https://github.com/OpenBMB/MiniCPM-V-Apps) — Android App 上游 / Android app upstream
