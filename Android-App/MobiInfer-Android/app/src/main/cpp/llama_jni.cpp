@@ -1052,7 +1052,9 @@ static int generic_restore_prefill_image(const std::vector<uint8_t> & image) {
     }
 
     mtmd_input_text text;
-    const std::string image_prompt = mtmd_default_marker();
+    // Open the user turn once, before its first image; keep it open for text.
+    const std::string image_prompt =
+        std::string(!g_image_prefilled ? "<|im_start|>user\n" : "") + mtmd_default_marker();
     text.text          = image_prompt.c_str();
     text.add_special   = current_position == 0;
     text.parse_special = true;
@@ -1133,14 +1135,15 @@ static int generic_restore(const std::vector<RestoreTurn> & turns) {
             for (const auto & image : turn.images) {
                 const int ir = generic_restore_prefill_image(image);
                 if (ir != 0) {
-                    LOGw("%s: image prefill failed (%d), continuing without it", __func__, ir);
+                    LOGe("%s: image prefill failed (%d)", __func__, ir);
+                    return ir;
                 }
             }
 
             const std::string content = turn.text.empty() ? " " : turn.text;
             std::string formatted;
             if (g_ctx_vision) {
-                if (!(g_moe && g_image_prefilled)) {
+                if (!g_image_prefilled) {
                     formatted += "<|im_start|>user\n";
                 }
                 formatted += content + "<|im_end|>\n";

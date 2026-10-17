@@ -439,41 +439,30 @@ class LlamaEngine private constructor(
             private var lastSampleBytes = 0L
             private var smoothedBytesPerSec = 0.0
 
-            /**
-             * Bytes already on disk that we did NOT transfer this session
-             * (resumed `.tmp` prefixes, skipped complete files). They count
-             * toward the progress fraction but must be excluded from the
-             * throughput / ETA calculation.
-             */
-            private var networkBaseline = 0L
-
             /** Emit an informational message at the current overall offset. */
             fun message(text: String) = emit(DownloadProgress(text, completedBytes, grandTotal))
 
             /** A file was already complete on disk: add it to progress, not to network speed. */
             fun fileSkipped(bytes: Long) {
                 completedBytes += bytes
-                networkBaseline += bytes
                 lastSampleTime = 0L
                 overall(0L)
             }
 
             /** We are resuming an on-disk `.tmp`: exclude its prefix from network speed. */
             fun resuming(resumeFrom: Long) {
-                if (resumeFrom > 0L) networkBaseline += resumeFrom
                 lastSampleTime = 0L
-                overall(0L)
+                overall(resumeFrom)
             }
 
             /** Emit ongoing progress: [downloadedInFile] bytes into the current file. */
             fun overall(downloadedInFile: Long) {
                 val done = completedBytes + downloadedInFile
-                val networkDone = (done - networkBaseline).coerceAtLeast(0L)
                 val now = System.currentTimeMillis()
                 if (lastSampleTime > 0L) {
                     val dtMs = now - lastSampleTime
                     if (dtMs > 0L) {
-                        val inst = (networkDone - lastSampleBytes).toDouble() * 1000.0 / dtMs
+                        val inst = (done - lastSampleBytes).toDouble() * 1000.0 / dtMs
                         if (inst >= 0.0) {
                             smoothedBytesPerSec =
                                 if (smoothedBytesPerSec <= 0.0) inst else smoothedBytesPerSec * 0.7 + inst * 0.3
@@ -481,7 +470,7 @@ class LlamaEngine private constructor(
                     }
                 }
                 lastSampleTime = now
-                lastSampleBytes = networkDone
+                lastSampleBytes = done
 
                 val pct = if (grandTotal > 0L) {
                     ((done * 100L) / grandTotal).toInt().coerceIn(0, 100)
@@ -840,7 +829,7 @@ class LlamaEngine private constructor(
                         Log.w(TAG, "$fileName: server returned 200 instead of 206; restarting from 0")
                         if (tmpFile.exists()) tmpFile.delete()
                     }
-                    if (effectiveStart > 0L) sink.resuming(effectiveStart)
+                    sink.resuming(effectiveStart)
 
                     conn.inputStream.use { input ->
                         FileOutputStream(tmpFile, acceptedResume && resumeFrom > 0).use { output ->
@@ -989,7 +978,7 @@ class LlamaEngine private constructor(
                     }
 
                     val effectiveStart = if (acceptedResume) resumeFrom else 0L
-                    if (effectiveStart > 0L) sink.resuming(effectiveStart)
+                    sink.resuming(effectiveStart)
                     val remaining = conn.contentLength.toLong() // -1 if unknown
                     val totalSize = if (remaining > 0) remaining + effectiveStart else -1L
 
