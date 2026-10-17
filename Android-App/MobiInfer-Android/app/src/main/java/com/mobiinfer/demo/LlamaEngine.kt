@@ -55,6 +55,11 @@ class LlamaEngine private constructor(
         @Volatile
         private var instance: LlamaEngine? = null
 
+        /** Id of the model currently loaded in the engine (null when none). */
+        @Volatile
+        var loadedModelId: String? = null
+            private set
+
         // Per-turn token budget. iOS demo (MTMDParams.swift) uses 100 because
         // ANE makes generation fast enough that the cap is rarely hit; on
         // Android with CPU-only inference users complained about replies
@@ -1312,6 +1317,7 @@ class LlamaEngine private constructor(
                     if (it != 0) throw RuntimeException("Failed to prepare resources (code: $it)")
                 }
                 Log.i(TAG, "Model loaded!")
+                loadedModelId = modelInfo.id
                 _readyForSystemPrompt = true
                 _cancelGeneration = false
                 setEnableThinkingNative(getEnableThinking(context))
@@ -1319,6 +1325,7 @@ class LlamaEngine private constructor(
             } catch (e: Exception) {
                 Log.e(TAG, (e.message ?: "Error loading model") + "\n" + pathToModel, e)
                 unload()
+                loadedModelId = null
                 _mmprojLoaded = false
                 _state.value = LlamaState.Error(e)
                 throw e
@@ -1498,7 +1505,16 @@ class LlamaEngine private constructor(
             check(_state.value is LlamaState.ModelReady) {
                 "Cannot clear context in ${_state.value.javaClass.simpleName}"
             }
-            fullReset()
+            try {
+                fullReset()
+            } catch (e: Exception) {
+                // Native reset failed (e.g. context re-allocation failed). Mark
+                // the engine as Error so no prompt is sent into a half-freed
+                // native context.
+                Log.e(TAG, "fullReset failed", e)
+                _state.value = LlamaState.Error(e)
+                throw e
+            }
             _readyForSystemPrompt = true
             Log.i(TAG, "Context fully reset - context recreated, ready for new conversation")
         }
@@ -1612,12 +1628,14 @@ class LlamaEngine private constructor(
             _mmprojLoaded = false
             _state.value = LlamaState.UnloadingModel
             unload()
+            loadedModelId = null
             _state.value = LlamaState.Initialized
             Log.i(TAG, "Model unloaded")
         }
     }
 
     fun resetToInitialized() {
+        loadedModelId = null
         _mmprojLoaded = false
         _readyForSystemPrompt = false
         _cancelGeneration = false
@@ -1634,12 +1652,14 @@ class LlamaEngine private constructor(
                     _mmprojLoaded = false
                     _state.value = LlamaState.UnloadingModel
                     unload()
+                    loadedModelId = null
                     _state.value = LlamaState.Initialized
                     Log.i(TAG, "Model unloaded!")
                 }
                 is LlamaState.Error -> {
                     Log.i(TAG, "Resetting error states...")
                     unload()
+                    loadedModelId = null
                     _mmprojLoaded = false
                     _state.value = LlamaState.Initialized
                 }
@@ -1659,6 +1679,7 @@ class LlamaEngine private constructor(
                 else -> { unload(); shutdown() }
             }
         }
+        loadedModelId = null
         llamaScope.cancel()
         _state.value = LlamaState.Uninitialized
         synchronized(Companion) {

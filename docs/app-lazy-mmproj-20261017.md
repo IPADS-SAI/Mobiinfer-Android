@@ -1,5 +1,7 @@
 # MiniCPM App 按需加载 mmproj
 
+> 当前默认已改回随模型加载 mmproj。下文保留按需加载方案及其历史实验；实验可用 `runtime.json` 的 `eager_mmproj=false` 复现。
+
 MiniCPM47Runtime 默认启动文本运行时，setVisionPath 只记录文件路径，不把 mmproj 传入初次 load_model。首次 submit 检测到当前或恢复历史中的图片后，检查 mmproj 文件，停止并释放文本 server，再创建带 mmproj 的视觉 server。对话消息与图片字节保留，禁用旧 KV 前缀复用并重新 prefill。后续图片复用已加载 projector，新对话也继续复用，直到模型卸载。
 
 这是 App 层按需切换，不是 server 内热插入。视觉 slots、MRoPE、DSpark 和计算缓冲区由 server 初始化一并确定，因此首次图片需要重新加载 target/draft，产生额外等待；先释放旧运行时，避免同时驻留两份主模型。首次图片加载开销发生在请求计时开始前，现有 benchmark wall/TTFT 不包含这次切换，不能用其数字声称用户端首图等待更短。首次加载失败会记录运行时失败，要求重载模型，避免继续使用不完整 server。没有更改通用server实现。

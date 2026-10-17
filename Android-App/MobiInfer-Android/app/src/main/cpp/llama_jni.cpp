@@ -694,6 +694,11 @@ Java_com_mobiinfer_demo_LlamaEngine_processSystemPrompt(
         env->ReleaseStringUTFChars(jsystem_prompt, text);
         return 0;
     }
+    if (!g_context || !g_chat_templates) {
+        LOGe("%s: engine not ready (context=%p templates=%p); refusing system prompt",
+             __func__, (void *) g_context, (void *) g_chat_templates.get());
+        return 3;
+    }
     reset_short_term_states();
 
     const auto *system_prompt = env->GetStringUTFChars(jsystem_prompt, nullptr);
@@ -781,6 +786,10 @@ Java_com_mobiinfer_demo_LlamaEngine_prefillImage(
     }
     if (!g_ctx_vision) {
         LOGe("%s: mmproj not loaded!", __func__);
+        return 1;
+    }
+    if (!g_context) {
+        LOGe("%s: context not initialised!", __func__);
         return 1;
     }
 
@@ -1135,6 +1144,11 @@ Java_com_mobiinfer_demo_LlamaEngine_generateNextToken(
             env->ThrowNew(env->FindClass("java/lang/RuntimeException"), e.what());
             return nullptr;
         }
+    }
+    if (!g_context || !g_model || !g_sampler || !g_batch.token) {
+        LOGe("%s: engine not ready (context=%p model=%p sampler=%p); stopping",
+             __func__, (void *) g_context, (void *) g_model, (void *) g_sampler);
+        return nullptr;
     }
     if (current_position >= g_n_ctx - OVERFLOW_HEADROOM) {
         LOGw("%s: Context full! Shifting...", __func__);

@@ -171,7 +171,7 @@ class ModelManagerActivity : AppCompatActivity() {
                     ModelRowUi(ModelRowState.PAUSED, fractionOf(model))
                 else ->
                     ModelRowUi(ModelRowState.NOT_DOWNLOADED)
-            }
+            }.copy(running = LlamaEngine.loadedModelId == model.id)
             model.id to ui
         }
         modelAdapter.setStates(states)
