@@ -14,6 +14,7 @@ import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -43,6 +44,8 @@ class ModelDownloadService : Service() {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var downloadJob: Job? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var currentModelId: String? = null
+    private var lastFraction: Float = 0f
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -53,39 +56,66 @@ class ModelDownloadService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action ?: ACTION_START
-        if (action == ACTION_CANCEL) {
-            Log.i(TAG, "Cancel requested")
+
+        if (action == ACTION_PAUSE || action == ACTION_CANCEL) {
+            val modelId = currentModelId ?: ModelDownloadController.runningModelId()
+            Log.i(TAG, "Pause/cancel requested (model=$modelId)")
             downloadJob?.cancel()
-            ModelDownloadController.markCancelled()
+            if (modelId != null) {
+                if (action == ACTION_CANCEL) {
+                    ModelDownloadController.markCancelled(modelId)
+                } else {
+                    ModelDownloadController.markPaused(modelId, lastFraction)
+                }
+            }
+            releaseWakeLock()
             stopForegroundCompat()
             stopSelf()
             return START_NOT_STICKY
         }
 
-        // Only one download at a time. If a job is already running, just
-        // re-attach the foreground notification and bail.
-        if (downloadJob?.isActive == true) {
-            startForegroundWithNotification(buildNotification(getString(R.string.status_downloading)))
+        val modelId = intent?.getStringExtra(EXTRA_MODEL_ID)
+        if (modelId == null) {
+            Log.w(TAG, "No model id supplied")
+            stopSelf()
             return START_NOT_STICKY
         }
 
+        // One download at a time. Same model -> re-attach; different -> ignore.
+        if (downloadJob?.isActive == true) {
+            if (currentModelId == modelId) {
+                startForegroundWithNotification(buildNotification(getString(R.string.status_downloading)))
+            } else {
+                Log.w(TAG, "Download already running for $currentModelId, ignoring $modelId")
+            }
+            return START_NOT_STICKY
+        }
+
+        currentModelId = modelId
+        lastFraction = 0f
         startForegroundWithNotification(buildNotification(getString(R.string.download_preparing)))
         acquireWakeLock()
-        ModelDownloadController.markStarted()
+        ModelDownloadController.markStarted(modelId)
 
         downloadJob = scope.launch {
             try {
-                LlamaEngine.downloadModels(applicationContext) { progress ->
-                    ModelDownloadController.publishProgress(progress.message, progress.fraction)
+                LlamaEngine.downloadModels(applicationContext, modelId) { progress ->
+                    lastFraction = progress.fraction
+                    ModelDownloadController.publishProgress(modelId, progress.message, progress.fraction)
                     updateNotification(progress.message, progress.fraction)
                 }
-                ModelDownloadController.markCompleted()
+                ModelDownloadController.markCompleted(modelId)
                 updateNotification(getString(R.string.download_complete_short))
+            } catch (e: CancellationException) {
+                // Pause/cancel path already updated the controller; keep .tmp
+                // so the next start() resumes via HTTP Range.
+                Log.i(TAG, "Download paused/cancelled: $modelId")
             } catch (e: Exception) {
                 Log.e(TAG, "Download failed", e)
-                ModelDownloadController.markFailed(e.message ?: e::class.java.simpleName)
+                ModelDownloadController.markFailed(modelId, e.message ?: e::class.java.simpleName)
                 updateNotification(getString(R.string.download_failed, e.message))
             } finally {
+                currentModelId = null
                 releaseWakeLock()
                 stopForegroundCompat()
                 stopSelf()
@@ -204,13 +234,23 @@ class ModelDownloadService : Service() {
 
         const val ACTION_START = "com.mobiinfer.demo.action.DOWNLOAD_START"
         const val ACTION_CANCEL = "com.mobiinfer.demo.action.DOWNLOAD_CANCEL"
+        const val ACTION_PAUSE = "com.mobiinfer.demo.action.DOWNLOAD_PAUSE"
+        const val EXTRA_MODEL_ID = "model_id"
 
-        fun start(context: Context) {
+        fun start(context: Context, modelId: String) {
             ensureNotificationChannel(context)
             val intent = Intent(context, ModelDownloadService::class.java).apply {
                 action = ACTION_START
+                putExtra(EXTRA_MODEL_ID, modelId)
             }
             ContextCompat.startForegroundService(context, intent)
+        }
+
+        fun pause(context: Context) {
+            val intent = Intent(context, ModelDownloadService::class.java).apply {
+                action = ACTION_PAUSE
+            }
+            context.startService(intent)
         }
 
         fun cancel(context: Context) {
@@ -254,10 +294,11 @@ object ModelDownloadController {
 
     sealed class Status {
         object Idle : Status()
-        data class Running(val message: String, val fraction: Float) : Status()
-        object Completed : Status()
-        object Cancelled : Status()
-        data class Failed(val message: String) : Status()
+        data class Running(val modelId: String, val message: String, val fraction: Float) : Status()
+        data class Paused(val modelId: String, val fraction: Float) : Status()
+        data class Completed(val modelId: String) : Status()
+        data class Cancelled(val modelId: String) : Status()
+        data class Failed(val modelId: String, val message: String) : Status()
     }
 
     private val _status = MutableStateFlow<Status>(Status.Idle)
@@ -266,39 +307,40 @@ object ModelDownloadController {
     val isRunning: Boolean
         get() = _status.value is Status.Running
 
-    internal fun markStarted() {
-        _status.value = Status.Running("", 0f)
+    /** Id of the model currently downloading, or null when idle. */
+    fun runningModelId(): String? = (_status.value as? Status.Running)?.modelId
+
+    internal fun markStarted(modelId: String) {
+        _status.value = Status.Running(modelId, "", 0f)
     }
 
-    internal fun publishProgress(message: String, fraction: Float) {
-        // Only overwrite when we're actually in the running phase - we don't
-        // want a late tail-progress callback to clobber a Completed/Failed
-        // state.
-        if (_status.value is Status.Running) {
-            _status.value = Status.Running(message, fraction)
+    internal fun publishProgress(modelId: String, message: String, fraction: Float) {
+        val cur = _status.value
+        if (cur is Status.Running && cur.modelId == modelId) {
+            _status.value = Status.Running(modelId, message, fraction)
         }
     }
 
-    internal fun markCompleted() {
-        _status.value = Status.Completed
+    internal fun markCompleted(modelId: String) {
+        _status.value = Status.Completed(modelId)
     }
 
-    internal fun markFailed(reason: String) {
-        _status.value = Status.Failed(reason)
+    internal fun markFailed(modelId: String, reason: String) {
+        _status.value = Status.Failed(modelId, reason)
     }
 
-    internal fun markCancelled() {
-        _status.value = Status.Cancelled
+    internal fun markPaused(modelId: String, fraction: Float) {
+        _status.value = Status.Paused(modelId, fraction)
     }
 
-    /**
-     * Drop a terminal state (Completed/Cancelled/Failed) back to Idle once
-     * the UI has acknowledged it. Calling this while a download is running
-     * is a no-op.
-     */
+    internal fun markCancelled(modelId: String) {
+        _status.value = Status.Cancelled(modelId)
+    }
+
+    /** Drop a terminal state (Completed/Cancelled/Failed/Paused) back to Idle once acknowledged. */
     fun acknowledge() {
         val cur = _status.value
-        if (cur is Status.Completed || cur is Status.Cancelled || cur is Status.Failed) {
+        if (cur is Status.Completed || cur is Status.Cancelled || cur is Status.Failed || cur is Status.Paused) {
             _status.value = Status.Idle
         }
     }

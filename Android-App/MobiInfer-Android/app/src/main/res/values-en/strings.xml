@@ -89,6 +89,9 @@
     <string name="download_prompt_mmproj_missing">The vision model (mmproj) has been updated.\nPlease go to Model Management to re-download, otherwise image recognition will not work.</string>
     <string name="download_prompt_incomplete">Model files are incomplete. Please go to Model Management to re-download.</string>
     <string name="download_prompt_hint">You can tap the Model Management button at any time to download</string>
+    <string name="model_download_prompt">Model %1$s is not downloaded. Download it now?</string>
+    <string name="model_download_confirm">Download</string>
+    <string name="model_download_cancel">Cancel</string>
 
     <!-- ModelManagerActivity -->
     <string name="status_prefilling_image">Processing image…</string>
@@ -205,4 +208,13 @@
     <string name="memory_budget_title">Runtime memory budget</string>
     <string name="memory_budget_description">For MiniCPM-V 4.7; applies on the next model load. A lower budget reduces the expert cache. 1 GB = 1 billion bytes; actual usage varies with input.</string>
     <string name="memory_budget_value">%1$.1f GB</string>
+    <string name="model_pause">Pause</string>
+    <string name="model_resume">Resume</string>
+    <string name="model_delete">Delete</string>
+    <string name="model_paused_progress">Paused · %1$d%%</string>
+    <string name="model_ready_state">Downloaded</string>
+    <string name="model_not_downloaded_hint">This model is not downloaded yet; you will be prompted when sending</string>
+    <string name="advanced_settings">Advanced settings</string>
+    <string name="model_switched_lazy">Selected %1$s; it will load when you send a message</string>
+    <string name="download_paused">Paused</string>
 </resources>
