@@ -108,9 +108,11 @@ object ConversationStore {
 
     // ------------------------------------------------------------------- api
 
-    /** Conversation list, most-recently-updated first. */
+    /** Conversation list, most-recently-updated first (createdAt as tie-break). */
     fun list(context: Context): List<ConversationMeta> =
-        loadIndex(context).conversations.sortedByDescending { it.updatedAt }
+        loadIndex(context).conversations.sortedWith(
+            compareByDescending<ConversationMeta> { it.updatedAt }.thenByDescending { it.createdAt }
+        )
 
     fun currentId(context: Context): String? = loadIndex(context).currentId
 
@@ -242,7 +244,14 @@ object ConversationStore {
             }
         }
         dirFor(context, id).mkdirs()
-        messagesFile(context, id).writeText(arr.toString())
+        val file = messagesFile(context, id)
+        val newJson = arr.toString()
+        // Switching to / away from a conversation persists it without changing
+        // its content.  Don't touch updatedAt in that case, otherwise merely
+        // opening a conversation would reorder the drawer.
+        val previous = if (file.exists()) runCatching { file.readText() }.getOrNull() else null
+        if (previous == newJson) return
+        file.writeText(newJson)
 
         val index = loadIndex(context)
         val i = index.conversations.indexOfFirst { it.id == id }

@@ -20,7 +20,7 @@
         android:alpha="0.62" />
 
     <com.google.android.material.card.MaterialCardView
-        android:layout_width="wrap_content"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginEnd="48dp"
         app:cardBackgroundColor="?attr/colorSurfaceVariant"
@@ -29,7 +29,7 @@
         app:strokeWidth="0dp">
 
         <LinearLayout
-            android:layout_width="wrap_content"
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="vertical"
             android:padding="12dp">
@@ -123,7 +123,7 @@
 
             <TextView
                 android:id="@+id/tv_ai_text"
-                android:layout_width="wrap_content"
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:textColor="?attr/colorOnSurfaceVariant"
                 android:textSize="15sp"

@@ -174,12 +174,12 @@ AEEResult dspqueue_read(dspqueue_t               queue,
                         uint32_t *               message_length,
                         uint8_t *                message,
                         uint32_t                 timeout_us) {
-#ifdef _WIN32
-    if (timeout_us == 0) {
+    // Avoid the timed-read error path for empty polls where the driver offers
+    // a dedicated nonblocking read. Older drivers retain the timed-read path.
+    if (timeout_us == 0 && dspqueue_read_noblock_pfn) {
         return dspqueue_read_noblock_pfn(queue, flags, max_buffers, num_buffers, buffers, max_message_length,
                                      message_length, message);
     }
-#endif
     return dspqueue_read_pfn(queue, flags, max_buffers, num_buffers, buffers, max_message_length, message_length,
                              message, timeout_us);
 }

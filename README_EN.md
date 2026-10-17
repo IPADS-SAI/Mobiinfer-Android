@@ -66,12 +66,15 @@ Architecture coverage includes `qwen3`/`qwen3moe`/`qwen3next`, `qwen3vl`/`qwen3v
 
 ## Performance
 
-> 📱 Measured on OnePlus 13 (Snapdragon 8 Elite, HTP0 + HTP1), text-only CLI, 128-token output.
+> 📱 Measured on OnePlus 13 (Snapdragon 8 Elite, HTP0 + HTP1), text-only, 128-token output.
 
 | Model | SoC | Prefill (token/s) | Decode (token/s) |
 |---|---|---:|---:|
 | MiniCPM-V 4.7 35B-A3B (Q3, MoE + LES + DSpark) | Snapdragon 8 Elite | 66.22 | 14.64 |
+| MiniCPM-V 4.7 35B-A3B (same, app, short prompt, 41 tokens) | Snapdragon 8 Elite | 22.02 | 17.98 |
 | Qwen3-VL-4B-Instruct (Q4_K_M) | Snapdragon 8 Elite | 1013.74 | 18.13 |
+
+The short prompt uses the Python Fibonacci example without mmproj loaded; other rows are CLI measurements.
 
 ---
 
