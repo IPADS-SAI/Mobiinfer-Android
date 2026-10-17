@@ -93,9 +93,9 @@ data class ModelInfo(
     val isTts: Boolean
         get() = acousticFileName != null
 
-    /** MiniCPM5 (text) and MiniCPM-V-4.6 expose a thinking toggle. */
+    /** MiniCPM5 (text), MiniCPM-V-4.6 and Qwen3.5 expose a thinking toggle. */
     val supportsThinking: Boolean
-        get() = isTextOnly || id == "minicpm-v-4_6-instruct"
+        get() = isTextOnly || id == "minicpm-v-4_6-instruct" || id == "qwen35-35b-a3b"
 
     fun getDescription(context: Context): String {
         val resId = context.resources.getIdentifier(descriptionResName, "string", context.packageName)
@@ -161,11 +161,12 @@ data class ModelInfo(
                 displayName = "Qwen3.5-35B-A3B (Q4_K_M, NPU)",
                 descriptionResName = "model_desc_qwen35_35b",
                 ggufFileName = "models/qwen35-les-hexagon.gguf",
+                mmprojFileName = "models/mmproj-Qwen3.5-35B-A3B-Q8_0.gguf",
                 expertsDirectory = "experts-htp-tiled",
                 draftFileName = "models/Qwen3.5-35B-A3B-DFlash-Q8_0.gguf",
                 msRepo = "fengerhu1/Qwen3.5-35B-A3B-gguf-hexagon",
                 bundleManifestFile = "SHA256SUMS",
-                totalBytes = 24_450_507_243L
+                totalBytes = 25_064_701_899L
             ),
             ModelInfo(
                 id = "minicpm-v-4_7",
