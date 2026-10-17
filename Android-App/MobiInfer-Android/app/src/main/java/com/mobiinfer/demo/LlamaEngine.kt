@@ -1320,12 +1320,16 @@ class LlamaEngine private constructor(
                 val modelInfo = getSelectedModel(context)
                 val missingExpert = missingExpertFile(context, modelInfo)
                 require(missingExpert == null) { "Missing or unreadable expert file: $missingExpert" }
+                // Experts live under the per-model root (not necessarily next to
+                // the GGUF, which may be in a `models/` subdirectory), and only
+                // vision models require an mmproj; text-only MoE bundles (e.g.
+                // Qwen3.5) must not be forced to have one.
                 val expertsPath = modelInfo.expertsDirectory?.let {
-                    File(File(pathToModel).parentFile, it).absolutePath
+                    File(modelDirFor(context, modelInfo), it).absolutePath
                 }
-                if (expertsPath != null) {
+                if (modelInfo.mmprojFileName != null) {
                     require(pathToMmproj != null && File(pathToMmproj).canRead()) {
-                        "MiniCPM-V 4.7 vision weights are missing or unreadable"
+                        "${modelInfo.displayName} vision weights are missing or unreadable"
                     }
                 }
                 load(pathToModel, expertsPath, getMemoryBudgetMb(context)).let {
@@ -1344,7 +1348,7 @@ class LlamaEngine private constructor(
                     Log.i(TAG, "Loading mmproj (image_max_slice_nums=$sliceCap)... \n$pathToMmproj")
                     loadMmproj(pathToMmproj, sliceCap).let {
                         if (it != 0) {
-                            if (expertsPath != null) throw RuntimeException("Failed to load MiniCPM-V 4.7 vision weights (code: $it)")
+                            if (modelInfo.mmprojFileName != null) throw RuntimeException("Failed to load ${modelInfo.displayName} vision weights (code: $it)")
                             Log.w(TAG, "Failed to load mmproj (code: $it), continuing without vision support")
                         } else {
                             _mmprojLoaded = true
