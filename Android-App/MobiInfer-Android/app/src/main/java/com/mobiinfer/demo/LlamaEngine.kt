@@ -439,29 +439,76 @@ class LlamaEngine private constructor(
             private var lastSampleBytes = 0L
             private var smoothedBytesPerSec = 0.0
 
+            /**
+             * Bytes already on disk that we did NOT transfer this session
+             * (resumed `.tmp` prefixes, skipped complete files). They count
+             * toward the progress fraction but must be excluded from the
+             * throughput / ETA calculation.
+             */
+            private var networkBaseline = 0L
+
             /** Emit an informational message at the current overall offset. */
             fun message(text: String) = emit(DownloadProgress(text, completedBytes, grandTotal))
+
+            /** A file was already complete on disk: add it to progress, not to network speed. */
+            fun fileSkipped(bytes: Long) {
+                completedBytes += bytes
+                networkBaseline += bytes
+                lastSampleTime = 0L
+                overall(0L)
+            }
+
+            /** We are resuming an on-disk `.tmp`: exclude its prefix from network speed. */
+            fun resuming(resumeFrom: Long) {
+                if (resumeFrom > 0L) networkBaseline += resumeFrom
+                lastSampleTime = 0L
+                overall(0L)
+            }
 
             /** Emit ongoing progress: [downloadedInFile] bytes into the current file. */
             fun overall(downloadedInFile: Long) {
                 val done = completedBytes + downloadedInFile
+                val networkDone = (done - networkBaseline).coerceAtLeast(0L)
                 val now = System.currentTimeMillis()
                 if (lastSampleTime > 0L) {
                     val dtMs = now - lastSampleTime
                     if (dtMs > 0L) {
-                        val inst = (done - lastSampleBytes).toDouble() * 1000.0 / dtMs
-                        smoothedBytesPerSec =
-                            if (smoothedBytesPerSec <= 0.0) inst else smoothedBytesPerSec * 0.7 + inst * 0.3
+                        val inst = (networkDone - lastSampleBytes).toDouble() * 1000.0 / dtMs
+                        if (inst >= 0.0) {
+                            smoothedBytesPerSec =
+                                if (smoothedBytesPerSec <= 0.0) inst else smoothedBytesPerSec * 0.7 + inst * 0.3
+                        }
                     }
                 }
                 lastSampleTime = now
-                lastSampleBytes = done
+                lastSampleBytes = networkDone
 
                 val pct = if (grandTotal > 0L) {
                     ((done * 100L) / grandTotal).toInt().coerceIn(0, 100)
                 } else 0
                 val mbPerSec = smoothedBytesPerSec / (1024.0 * 1024.0)
-                emit(DownloadProgress(context.getString(R.string.download_overall_progress, pct, mbPerSec), done, grandTotal))
+                val remaining = (grandTotal - done).coerceAtLeast(0L)
+                val etaText = if (smoothedBytesPerSec > 1024.0) {
+                    formatEta((remaining / smoothedBytesPerSec).toLong())
+                } else {
+                    context.getString(R.string.eta_unknown)
+                }
+                emit(DownloadProgress(
+                    context.getString(R.string.download_overall_progress, pct, mbPerSec, etaText),
+                    done,
+                    grandTotal
+                ))
+            }
+
+            private fun formatEta(totalSec: Long): String {
+                val h = totalSec / 3600
+                val m = (totalSec % 3600) / 60
+                val sec = totalSec % 60
+                return when {
+                    h > 0 -> context.getString(R.string.eta_hours_minutes, h, m)
+                    m > 0 -> context.getString(R.string.eta_minutes_seconds, m, sec)
+                    else -> context.getString(R.string.eta_seconds, sec)
+                }
             }
 
             /** Record a file that finished (or was already present) on disk. */
@@ -653,7 +700,7 @@ class LlamaEngine private constructor(
             ) {
                 sink.message(context.getString(R.string.download_verifying_existing, fileName))
                 if (matchesExpectation(targetFile, expectedMd5, expectedSha256, expectedBytes)) {
-                    sink.fileFinished(targetFile.length())
+                    sink.fileSkipped(targetFile.length())
                     sink.message(context.getString(R.string.download_file_ready, fileName))
                     Log.i(TAG, "$fileName already present and matches expectation, skipping download")
                     if (tmpFile.exists()) tmpFile.delete()
@@ -793,6 +840,7 @@ class LlamaEngine private constructor(
                         Log.w(TAG, "$fileName: server returned 200 instead of 206; restarting from 0")
                         if (tmpFile.exists()) tmpFile.delete()
                     }
+                    if (effectiveStart > 0L) sink.resuming(effectiveStart)
 
                     conn.inputStream.use { input ->
                         FileOutputStream(tmpFile, acceptedResume && resumeFrom > 0).use { output ->
@@ -874,7 +922,7 @@ class LlamaEngine private constructor(
             ) {
                 sink.message(context.getString(R.string.download_verifying_existing_src, source, fileName))
                 if (matchesExpectation(targetFile, expectedMd5, expectedSha256, expectedBytes)) {
-                    sink.fileFinished(targetFile.length())
+                    sink.fileSkipped(targetFile.length())
                     sink.message(context.getString(R.string.download_file_ready, fileName))
                     Log.i(TAG, "$fileName already present and matches expectation, skipping download")
                     // Stale .tmp from an even older interrupted attempt - drop it.
@@ -941,6 +989,7 @@ class LlamaEngine private constructor(
                     }
 
                     val effectiveStart = if (acceptedResume) resumeFrom else 0L
+                    if (effectiveStart > 0L) sink.resuming(effectiveStart)
                     val remaining = conn.contentLength.toLong() // -1 if unknown
                     val totalSize = if (remaining > 0) remaining + effectiveStart else -1L
 

@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import android.view.MotionEvent
@@ -53,8 +54,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnModelManager: ImageButton
     private lateinit var cardInputBar: View
     private lateinit var appBarLayout: AppBarLayout
-    private lateinit var tvTitleModel: TextView
     private lateinit var tvTitle: TextView
+    private lateinit var tvTitleModel: TextView
     private lateinit var loadingOverlay: View
     private lateinit var tvLoadingText: TextView
     private lateinit var drawerLayout: DrawerLayout
@@ -128,7 +129,19 @@ class MainActivity : AppCompatActivity() {
         LlamaEngine.migrateLegacyLayoutIfNeeded(applicationContext)
 
         initViews()
+        syncSelectedModelUi()
         setupRecyclerView()
+
+        val restoredConversation = savedInstanceState?.getString(STATE_CURRENT_CONVERSATION)
+        if (restoredConversation != null) {
+            // Activity recreation (rotation / process restore): keep the chat.
+            openConversation(restoredConversation, restoreContext = true)
+        } else {
+            // Fresh launch: always begin a new conversation.  It stays a draft
+            // (not in the history list) until the user actually sends something.
+            openConversation(ConversationStore.create(applicationContext).id, restoreContext = false)
+        }
+
         setupClickListeners()
         initEngine()
     }
@@ -210,7 +223,6 @@ class MainActivity : AppCompatActivity() {
         }
 
         setupConversationDrawer()
-        openConversation(ConversationStore.ensureCurrent(applicationContext).id, restoreContext = true)
     }
 
     // -------------------------------------------------------- conversation drawer
@@ -239,7 +251,22 @@ class MainActivity : AppCompatActivity() {
      * Shows [id] in the chat and, when [restoreContext] is set, replays its
      * history into the engine so follow-up turns keep their context.
      */
+    private fun cancelActiveGeneration() {
+        val job = generationJob
+        if (job != null && job.isActive) {
+            if (::engine.isInitialized) {
+                runCatching { engine.cancelGeneration() }
+            }
+            job.cancel()
+        }
+        generationJob = null
+    }
+
     private fun openConversation(id: String, restoreContext: Boolean) {
+        // Switching conversations must abort the in-flight generation; otherwise
+        // it keeps running against a cleared message list (wasted compute, and
+        // the new chat's input stays disabled until it finishes).
+        cancelActiveGeneration()
         persistCurrentConversation()
         currentConversationId = id
         ConversationStore.setCurrentId(applicationContext, id)
@@ -247,7 +274,9 @@ class MainActivity : AppCompatActivity() {
         messages.clear()
         val loaded = ConversationStore.load(applicationContext, id)
         val selectedModel = LlamaEngine.getSelectedModel(applicationContext)
-        messages.add(ChatMessage.WelcomeCard(isTextOnly = selectedModel.isTextOnly))
+        if (loaded.isEmpty()) {
+            messages.add(ChatMessage.WelcomeCard(isTextOnly = selectedModel.isTextOnly))
+        }
         messages.addAll(loaded)
         messageIdCounter = (loaded.maxOfOrNull { it.id } ?: 0L) + 1L
         isImagePrefilled = false
@@ -263,7 +292,14 @@ class MainActivity : AppCompatActivity() {
 
     private fun persistCurrentConversation() {
         val id = currentConversationId ?: return
-        val snapshot = messages.toList()
+        // `messages` is only mutated on the main thread; snapshotting from an
+        // IO/Default coroutine could race (ConcurrentModificationException or a
+        // torn list), so marshal the snapshot to the main thread.
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnUiThread { persistCurrentConversation() }
+            return
+        }
+        val snapshot = ArrayList<ChatMessage>(messages.size).apply { addAll(messages) }
         lifecycleScope.launch(Dispatchers.IO) {
             ConversationStore.save(applicationContext, id, snapshot)
         }
@@ -921,7 +957,10 @@ class MainActivity : AppCompatActivity() {
      * without leaving the home screen and without any dialog.
      */
     private fun beginModelFlow(userMsg: String) {
-        if (isInlineDownloading || isInlineModelLoad) return
+        if (isInlineDownloading || isInlineModelLoad) {
+            Toast.makeText(this, R.string.toast_please_wait_model, Toast.LENGTH_SHORT).show()
+            return
+        }
         pendingPrompt = userMsg
         pendingImageAfterLoad = false
         etInput.text = null
@@ -1002,6 +1041,7 @@ class MainActivity : AppCompatActivity() {
         pendingPrompt?.let { etInput.setText(it) }
         pendingPrompt = null
         pendingImageAfterLoad = false
+        enableInput(true)
         etInput.requestFocus()
     }
 
@@ -1108,6 +1148,7 @@ class MainActivity : AppCompatActivity() {
                         if (status.modelId == modelId) {
                             isInlineDownloading = false
                             updateDownloadPrompt(downloading = false)
+                            enableInput(true)
                             ModelDownloadController.acknowledge()
                         }
                     }
@@ -1152,6 +1193,14 @@ class MainActivity : AppCompatActivity() {
                 }
                 val mmprojArg = mmprojFile?.takeIf { it.exists() }?.absolutePath
                 engine.loadModel(ggufFile.absolutePath, mmprojArg)
+
+                // The lazy (re)load starts from an empty context. Replay the
+                // saved turns so follow-up messages keep the conversation
+                // context instead of silently forgetting it.
+                if (!pickImage && pendingText != null) {
+                    restoreHistoryForCurrentConversation()
+                }
+
                 withContext(Dispatchers.Main) {
                     isInlineModelLoad = false
                     chatAdapter.clearActiveAiMessage()
@@ -1191,6 +1240,18 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private suspend fun restoreHistoryForCurrentConversation() {
+        val id = currentConversationId ?: return
+        try {
+            val turns = ConversationStore.toHistoryTurns(ConversationStore.load(applicationContext, id))
+            if (turns.isEmpty()) return
+            engine.clearContext()
+            engine.restoreConversation(turns)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to replay conversation history", e)
+        }
+    }
+
     private fun removeMessage(id: Long) {
         val index = messages.indexOfFirst { it.id == id }
         if (index >= 0) {
@@ -1222,6 +1283,9 @@ class MainActivity : AppCompatActivity() {
                 scrollToBottom()
             }
         }
+        // Persist immediately so the new conversation enters the history list
+        // (and the user's turn survives an interruption).
+        persistCurrentConversation()
 
         val imageProcessingMs = if (isImagePrefilled) pendingImageProcessingMs else null
         val resetStatsForTextOnlyTurn = !isImagePrefilled
@@ -1365,6 +1429,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        currentConversationId?.let { outState.putString(STATE_CURRENT_CONVERSATION, it) }
+        super.onSaveInstanceState(outState)
+    }
+
     override fun onStop() {
         generationJob?.cancel()
         persistCurrentConversation()
@@ -1381,5 +1450,6 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private val TAG = MainActivity::class.java.simpleName
         private const val STREAM_PERSIST_INTERVAL_MS = 1000L
+        private const val STATE_CURRENT_CONVERSATION = "state_current_conversation"
     }
 }

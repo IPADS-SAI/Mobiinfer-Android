@@ -67,7 +67,7 @@ object ConversationStore {
         if (file.exists()) {
             try {
                 val json = JSONObject(file.readText())
-                currentId = json.optString("current", null)
+                currentId = json.optString("current", null)?.takeIf { it.isNotBlank() }
                 val arr = json.optJSONArray("conversations") ?: JSONArray()
                 for (i in 0 until arr.length()) {
                     val o = arr.getJSONObject(i)
@@ -109,29 +109,53 @@ object ConversationStore {
     // ------------------------------------------------------------------- api
 
     /** Conversation list, most-recently-updated first (createdAt as tie-break). */
+    @Synchronized
     fun list(context: Context): List<ConversationMeta> =
         loadIndex(context).conversations.sortedWith(
             compareByDescending<ConversationMeta> { it.updatedAt }.thenByDescending { it.createdAt }
         )
 
+    @Synchronized
     fun currentId(context: Context): String? = loadIndex(context).currentId
 
+    @Synchronized
     fun setCurrentId(context: Context, id: String) {
         val index = loadIndex(context)
         index.currentId = id
         saveIndex(context, index)
     }
 
-    /** Returns the current conversation, creating a fresh one if none exists. */
+    /**
+     * Returns the conversation to show on launch, creating a fresh one only when
+     * there is nothing to resume.  If the saved `current` id is missing/stale we
+     * fall back to the most recently updated conversation instead of silently
+     * starting a new one on every restart.
+     */
+    @Synchronized
     fun ensureCurrent(context: Context): ConversationMeta {
         val index = loadIndex(context)
-        val existing = index.currentId?.let { id -> index.conversations.find { it.id == id } }
+        val existing = index.currentId
+            ?.takeIf { it.isNotBlank() }
+            ?.let { id -> index.conversations.find { it.id == id } }
         if (existing != null) return existing
+
+        val latest = index.conversations.maxByOrNull { it.updatedAt }
+        if (latest != null) {
+            index.currentId = latest.id
+            saveIndex(context, index)
+            return latest
+        }
         return create(context)
     }
 
+    /**
+     * Creates a transient "new conversation" draft.  It is intentionally NOT
+     * added to the index yet: an empty conversation should never show up in
+     * the history list.  It is promoted into the index by [save] once it has
+     * real content.
+     */
+    @Synchronized
     fun create(context: Context): ConversationMeta {
-        val index = loadIndex(context)
         val now = System.currentTimeMillis()
         val meta = ConversationMeta(
             id = UUID.randomUUID().toString(),
@@ -139,13 +163,11 @@ object ConversationStore {
             createdAt = now,
             updatedAt = now
         )
-        index.conversations.add(meta)
-        index.currentId = meta.id
-        saveIndex(context, index)
         dirFor(context, meta.id).mkdirs()
         return meta
     }
 
+    @Synchronized
     fun rename(context: Context, id: String, title: String) {
         val index = loadIndex(context)
         val i = index.conversations.indexOfFirst { it.id == id }
@@ -155,6 +177,7 @@ object ConversationStore {
         saveIndex(context, index)
     }
 
+    @Synchronized
     fun delete(context: Context, id: String) {
         val index = loadIndex(context)
         index.conversations.removeAll { it.id == id }
@@ -163,6 +186,7 @@ object ConversationStore {
         dirFor(context, id).deleteRecursively()
     }
 
+    @Synchronized
     fun load(context: Context, id: String): MutableList<ChatMessage> {
         val file = messagesFile(context, id)
         val out = mutableListOf<ChatMessage>()
@@ -211,6 +235,7 @@ object ConversationStore {
     }
 
     /** Persists the conversation (UI-only cards are skipped) and rolls the title forward. */
+    @Synchronized
     fun save(context: Context, id: String, messages: List<ChatMessage>) {
         val arr = JSONArray()
         for (m in messages) {
@@ -225,42 +250,62 @@ object ConversationStore {
                         m.imageUri?.let { put("imageUri", it) }
                     }
                 )
-                is ChatMessage.AiMessage -> arr.put(
-                    JSONObject().apply {
-                        put("type", "ai")
-                        put("id", m.id)
-                        put("text", m.text)
-                        m.metrics?.let { mt ->
-                            put("metrics", JSONObject().apply {
-                                mt.imageProcessingMs?.let { put("imgMs", it) }
-                                mt.prefillTokensPerSecond?.let { put("prefillTps", it) }
-                                mt.decodeTokensPerSecond?.let { put("decodeTps", it) }
-                                put("totalMs", mt.totalMs)
-                            })
-                        }
+                is ChatMessage.AiMessage -> {
+                    // Never persist the transient "model loading" placeholder:
+                    // it would reappear as an empty assistant bubble on restart.
+                    if (!m.isLoadingPlaceholder) {
+                        arr.put(
+                            JSONObject().apply {
+                                put("type", "ai")
+                                put("id", m.id)
+                                put("text", m.text)
+                                m.metrics?.let { mt ->
+                                    put("metrics", JSONObject().apply {
+                                        mt.imageProcessingMs?.let { put("imgMs", it) }
+                                        mt.prefillTokensPerSecond?.let { put("prefillTps", it) }
+                                        mt.decodeTokensPerSecond?.let { put("decodeTps", it) }
+                                        put("totalMs", mt.totalMs)
+                                    })
+                                }
+                            }
+                        )
                     }
-                )
+                }
                 else -> Unit
             }
         }
+        // A brand-new conversation is a transient draft until it actually has
+        // content (a user turn or a real assistant reply).  Empty "new chat"
+        // entries must never appear in the history list.
+        val hasContent = messages.any { m ->
+            (m is ChatMessage.UserMessage && (m.text.isNotBlank() || m.imageUri != null)) ||
+            (m is ChatMessage.AiMessage && !m.isLoadingPlaceholder && m.text.isNotBlank())
+        }
+        if (!hasContent) return
+
         dirFor(context, id).mkdirs()
         val file = messagesFile(context, id)
         val newJson = arr.toString()
-        // Switching to / away from a conversation persists it without changing
-        // its content.  Don't touch updatedAt in that case, otherwise merely
-        // opening a conversation would reorder the drawer.
-        val previous = if (file.exists()) runCatching { file.readText() }.getOrNull() else null
-        if (previous == newJson) return
-        file.writeText(newJson)
-
         val index = loadIndex(context)
         val i = index.conversations.indexOfFirst { it.id == id }
+
+        // Merely switching / opening a conversation persists it without any
+        // content change.  Don't rewrite or bump updatedAt then.
+        val previous = if (file.exists()) runCatching { file.readText() }.getOrNull() else null
+        if (previous == newJson && i >= 0) return
+        file.writeText(newJson)
+
+        val title = autoTitle(messages) ?: index.conversations.getOrNull(i)?.title ?: DEFAULT_TITLE
+        val now = System.currentTimeMillis()
         if (i >= 0) {
-            val old = index.conversations[i]
-            val title = autoTitle(messages) ?: old.title
-            index.conversations[i] = old.copy(title = title, updatedAt = System.currentTimeMillis())
-            saveIndex(context, index)
+            index.conversations[i] = index.conversations[i].copy(title = title, updatedAt = now)
+        } else {
+            index.conversations.add(
+                ConversationMeta(id = id, title = title, createdAt = now, updatedAt = now)
+            )
         }
+        index.currentId = id
+        saveIndex(context, index)
     }
 
     /** First user line, trimmed - used as the drawer label. Null if none yet. */

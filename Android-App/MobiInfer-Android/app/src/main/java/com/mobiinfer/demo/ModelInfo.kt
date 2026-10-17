@@ -152,6 +152,21 @@ data class ModelInfo(
             // SHA256SUMS manifest so the 40 expert files stay out of the
             // client source. The repo is laid out so each entry's relative
             // path already matches the on-device per-model layout.
+            // Qwen3.5-35B-A3B (qwen35moe) Hexagon bundle: text-only, same
+            // tiled-expert layout as the MiniCPM 4.7 bundle.  Main GGUF and the
+            // DFlash draft live under `models/`, experts under
+            // `experts-htp-tiled/`; all enumerated by the SHA256SUMS manifest.
+            ModelInfo(
+                id = "qwen35-35b-a3b",
+                displayName = "Qwen3.5-35B-A3B (Q4_K_M, NPU)",
+                descriptionResName = "model_desc_qwen35_35b",
+                ggufFileName = "models/qwen35-les-hexagon.gguf",
+                expertsDirectory = "experts-htp-tiled",
+                draftFileName = "models/Qwen3.5-35B-A3B-DFlash-Q8_0.gguf",
+                msRepo = "fengerhu1/Qwen3.5-35B-A3B-gguf-hexagon",
+                bundleManifestFile = "SHA256SUMS",
+                totalBytes = 24_450_507_243L
+            ),
             ModelInfo(
                 id = "minicpm-v-4_7",
                 displayName = "MiniCPM-V-4.7 35B-A3B (Q3, NPU)",

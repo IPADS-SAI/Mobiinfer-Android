@@ -150,7 +150,7 @@
 
     <!-- LlamaEngine download progress -->
     <string name="source_direct">直链</string>
-    <string name="download_overall_progress">正在下载模型 %1$d%% · %2$.1f MB/s</string>
+    <string name="download_overall_progress">正在下载模型 %1$d%% · %2$.1f MB/s · 预计剩余 %3$s</string>
     <string name="download_race_start">%1$s 多源 race 启动…</string>
     <string name="download_all_complete">所有模型文件下载完成!</string>
     <string name="download_verifying_existing">校验已存在的 %1$s …</string>
@@ -225,5 +225,11 @@
     <string name="advanced_settings">高级设置</string>
     <string name="model_switched_lazy">已选择 %1$s，发送消息时加载</string>
     <string name="download_paused">已暂停</string>
+    <string name="toast_please_wait_model">模型正在下载/加载，请稍候</string>
     <string name="model_running">运行中</string>
+    <string name="eta_unknown">计算中…</string>
+    <string name="model_desc_qwen35_35b">Qwen3.5 35B-A3B 端侧 MoE 模型；一键下载主模型、DFlash 草稿和 40 层专家</string>
+    <string name="eta_hours_minutes">%1$d小时%2$d分钟</string>
+    <string name="eta_minutes_seconds">%1$d分%2$d秒</string>
+    <string name="eta_seconds">%1$d秒</string>
 </resources>

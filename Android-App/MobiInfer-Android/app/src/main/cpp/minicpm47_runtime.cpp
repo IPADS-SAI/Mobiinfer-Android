@@ -2,9 +2,13 @@
 #include "minicpm47_memory.h"
 #include "logging.h"
 #include "server-context.h"
+#include "speculative.h"
 #include "chat.h"
 #include "log.h"
 #include <nlohmann/json.hpp>
+#include <algorithm>
+#include <cctype>
+#include <filesystem>
 #include <fstream>
 #include <thread>
 #include <stdexcept>
@@ -149,14 +153,67 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
     p.sampling.seed = 42;
     p.sampling.no_perf = false;
     if (impl->dspark) {
-        p.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK};
-        p.speculative.draft.mparams.path = dir + "/dspark-MiniCPM-V-4_7-q8_0.gguf";
-        p.speculative.draft.n_gpu_layers = 99;
-        p.speculative.draft.devices = p.devices;
-        p.speculative.draft.n_max = memory.draft;
-        p.speculative.draft.cpuparams.n_threads = p.speculative.draft.cpuparams_batch.n_threads = 4;
-        std::ifstream draft(p.speculative.draft.mparams.path, std::ios::binary);
-        if (!draft) throw std::runtime_error("Missing Q8_0 DSpark draft: " + p.speculative.draft.mparams.path);
+        // Draft path: an explicit runtime.json "draft" wins; otherwise auto-detect
+        // a DSpark/DFlash draft sitting next to the main GGUF.  If none is found
+        // we disable speculative decoding instead of failing the whole load, so
+        // the model still runs (just slower).
+        std::string draft_path;
+        std::string spec_override;
+        std::ifstream draft_cfg(dir + "/runtime.json");
+        if (draft_cfg) {
+            const auto config = nlohmann::json::parse(draft_cfg);
+            draft_path = config.value("draft", std::string());
+            spec_override = config.value("speculative_type", std::string());
+        }
+        if (draft_path.empty()) {
+            std::error_code ec;
+            for (const auto & entry : std::filesystem::directory_iterator(dir, ec)) {
+                if (!entry.is_regular_file()) continue;
+                std::string low = entry.path().filename().string();
+                std::transform(low.begin(), low.end(), low.begin(),
+                               [](unsigned char c) { return (char) std::tolower(c); });
+                if (low.size() > 5 && low.substr(low.size() - 5) == ".gguf" &&
+                    (low.find("dspark") != std::string::npos || low.find("dflash") != std::string::npos)) {
+                    draft_path = entry.path().filename().string();
+                    break;
+                }
+            }
+        }
+        if (draft_path.empty()) {
+            LOGw("MiniCPM47 runtime: no draft GGUF found in %s; disabling speculative decoding", dir.c_str());
+            impl->dspark = false;
+        } else {
+            if (draft_path.front() != '/') draft_path = dir + "/" + draft_path;
+
+            // Pick the speculative decoder from the draft itself: MiniCPM ships
+            // a DSpark draft, Qwen3.5 ships a DFlash draft. Forcing DSpark for
+            // both is wrong. An explicit runtime.json "speculative_type"
+            // (dflash/dspark/simple/mtp/eagle3) always wins.
+            std::string spec_low = spec_override.empty() ? draft_path : spec_override;
+            std::transform(spec_low.begin(), spec_low.end(), spec_low.begin(),
+                           [](unsigned char c) { return (char) std::tolower(c); });
+            common_speculative_type spec_type = COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            if (spec_low.find("dflash") != std::string::npos) {
+                spec_type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+            } else if (spec_low.find("dspark") != std::string::npos) {
+                spec_type = COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            } else if (spec_low.find("eagle3") != std::string::npos) {
+                spec_type = COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3;
+            } else if (spec_low.find("mtp") != std::string::npos) {
+                spec_type = COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+            } else if (spec_low.find("simple") != std::string::npos) {
+                spec_type = COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE;
+            }
+            p.speculative.types = {spec_type};
+            LOGi("MiniCPM47 runtime: speculative type = %s",
+                 common_speculative_type_to_str(spec_type).c_str());
+            p.speculative.draft.mparams.path = draft_path;
+            p.speculative.draft.n_gpu_layers = 99;
+            p.speculative.draft.devices = p.devices;
+            p.speculative.draft.n_max = memory.draft;
+            p.speculative.draft.cpuparams.n_threads = p.speculative.draft.cpuparams_batch.n_threads = 4;
+            LOGi("MiniCPM47 runtime: draft = %s", draft_path.c_str());
+        }
     }
     setenv("LLAMA_MOE_DECODE_WINDOW", std::to_string(impl->cache_slots).c_str(), 1);
     unsetenv("LLAMA_MOE_LAYER_WINDOWS");
@@ -193,7 +250,18 @@ bool MiniCPM47Runtime::start() {
          impl->vision_htp ? "HTP" : "CPU", impl->dspark, impl->params.moe_slot_bank,
          impl->params.n_batch, impl->params.speculative.draft.n_max,
          impl->memory_budget_mb, impl->cache_slots);
-    if (!impl->server->load_model(impl->params)) return false;
+    if (!impl->server->load_model(impl->params)) {
+        if (impl->dspark) {
+            LOGw("MiniCPM47 runtime: load_model failed with draft; retrying without speculative decoding");
+            impl->dspark = false;
+            impl->params.speculative.types.clear();
+            impl->params.speculative.draft.mparams.path.clear();
+            impl->server = std::make_unique<server_context>();
+            if (!impl->server->load_model(impl->params)) return false;
+        } else {
+            return false;
+        }
+    }
     impl->vision_loaded = !impl->params.mmproj.path.empty();
     impl->worker = std::thread([this] {
         try {
