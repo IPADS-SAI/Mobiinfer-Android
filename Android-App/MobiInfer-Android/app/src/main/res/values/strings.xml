@@ -44,6 +44,15 @@
     <string name="clear_chat_confirm">确定要清空对话吗？</string>
     <string name="clear_chat_toast">对话已清空</string>
 
+    <!-- Conversation drawer -->
+    <string name="conversations">会话列表</string>
+    <string name="new_conversation">新对话</string>
+    <string name="rename_conversation">重命名</string>
+    <string name="rename_conversation_hint">会话名称</string>
+    <string name="delete_conversation_title">删除会话</string>
+    <string name="delete_conversation_confirm">确定要删除该会话及其记录吗？</string>
+    <string name="default_conversation_title">新对话</string>
+
     <!-- Image slicing settings (chat-page popup) -->
     <string name="image_slice_settings">图片切片数</string>
     <string name="image_slice_dialog_title">图片切片数</string>
@@ -85,6 +94,9 @@
     <string name="download_prompt_mmproj_missing">本次升级更新了图像模型（mmproj）。\n请前往"模型管理"重新下载，否则无法使用图片识别功能。</string>
     <string name="download_prompt_incomplete">模型文件不完整。请前往"模型管理"重新下载。</string>
     <string name="download_prompt_hint">可随时点击右上角"模型管理"按钮下载</string>
+    <string name="model_download_prompt">模型 %1$s 尚未下载，是否下载？</string>
+    <string name="model_download_confirm">下载</string>
+    <string name="model_download_cancel">取消</string>
 
     <!-- ModelManagerActivity -->
     <string name="status_prefilling_image">正在处理图片...</string>
@@ -113,6 +125,7 @@
 
     <!-- ChatAdapter -->
     <string name="thinking_in_progress">思考中…</string>
+    <string name="model_loading_in_progress">加载模型中…</string>
     <string name="thinking_process">思考过程</string>
 
     <!-- ModelInfo descriptions -->
@@ -202,4 +215,13 @@
     <string name="memory_budget_title">运行内存预算</string>
     <string name="memory_budget_description">MiniCPM-V 4.7 专用，下次加载模型时生效。调低预算会减少专家缓存。1 GB = 10亿字节；实际占用随输入变化。</string>
     <string name="memory_budget_value">%1$.1f GB</string>
+    <string name="model_pause">暂停</string>
+    <string name="model_resume">继续</string>
+    <string name="model_delete">删除</string>
+    <string name="model_paused_progress">已暂停 · %1$d%%</string>
+    <string name="model_ready_state">已下载</string>
+    <string name="model_not_downloaded_hint">该模型尚未下载，发送消息时会提示下载</string>
+    <string name="advanced_settings">高级设置</string>
+    <string name="model_switched_lazy">已选择 %1$s，发送消息时加载</string>
+    <string name="download_paused">已暂停</string>
 </resources>

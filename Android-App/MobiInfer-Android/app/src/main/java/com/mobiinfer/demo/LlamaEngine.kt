@@ -69,11 +69,16 @@ class LlamaEngine private constructor(
 
         private const val PREFS_NAME = "model_prefs"
         private const val KEY_SELECTED_MODEL = "selected_model_id"
+        // Tracks the built-in default that has already been force-applied so a
+        // changed DEFAULT_MODEL rolls the stored selection forward exactly
+        // once, instead of on every launch (which would clobber a user's
+        // manual choice).
+        private const val KEY_DEFAULT_MODEL_APPLIED = "default_model_applied_id"
         private const val KEY_IMAGE_MAX_SLICE = "image_max_slice_nums"
         private const val KEY_IMAGE_SCALE_FACTOR = "image_scale_factor"
-        private const val KEY_MEMORY_BUDGET_MB = "minicpm47_memory_budget_mb"
+        private const val KEY_MEMORY_BUDGET_MB = "minicpm47_memory_budget_v2_mb"
         const val MIN_MEMORY_BUDGET_MB = 5500
-        const val MAX_MEMORY_BUDGET_MB = 6000
+        const val MAX_MEMORY_BUDGET_MB = 8000
 
         fun getMemoryBudgetMb(context: Context): Int = prefs(context)
             .getInt(KEY_MEMORY_BUDGET_MB, MAX_MEMORY_BUDGET_MB)
@@ -118,6 +123,22 @@ class LlamaEngine private constructor(
 
         fun setSelectedModel(context: Context, modelId: String) {
             prefs(context).edit().putString(KEY_SELECTED_MODEL, modelId).apply()
+        }
+
+        /**
+         * Rolls the stored model selection forward to [ModelInfo.DEFAULT_MODEL]
+         * once per change of the shipped default. Fresh installs and users who
+         * already run the current default are no-ops; only a stale selection
+         * left by an older build (e.g. Qwen before the default moved to
+         * MiniCPM) is overridden, and a later manual choice is preserved.
+         */
+        fun applyDefaultModelIfNeeded(context: Context) {
+            val prefs = prefs(context)
+            if (prefs.getString(KEY_DEFAULT_MODEL_APPLIED, null) == ModelInfo.DEFAULT_MODEL.id) return
+            prefs.edit()
+                .putString(KEY_SELECTED_MODEL, ModelInfo.DEFAULT_MODEL.id)
+                .putString(KEY_DEFAULT_MODEL_APPLIED, ModelInfo.DEFAULT_MODEL.id)
+                .apply()
         }
 
         fun markModelSwitched(context: Context) {
@@ -184,18 +205,35 @@ class LlamaEngine private constructor(
             return File(modelDirFor(context, model), acoustic).absolutePath
         }
 
-        fun modelsExist(context: Context): Boolean {
-            val model = getSelectedModel(context)
+        fun modelsExist(context: Context): Boolean =
+            modelsExist(context, getSelectedModel(context))
+
+        /** Per-model completeness check (any model, not just the selection). */
+        fun modelsExist(context: Context, model: ModelInfo): Boolean {
+            val dir = File(modelDirFor(context, model))
             if (missingExpertFile(context, model) != null) return false
-            if (!File(modelPath(context)).exists()) return false
+            if (!File(dir, model.ggufFileName).exists()) return false
             if (model.isTextOnly) return true
             if (model.isTts) {
-                val ap = acousticPath(context) ?: return true
-                return File(ap).exists()
+                val acoustic = model.acousticFileName ?: return true
+                return File(dir, acoustic).exists()
             }
-            val mp = mmprojPath(context) ?: return true
-            return File(mp).exists()
+            val mmproj = model.mmprojFileName ?: return true
+            return File(dir, mmproj).exists()
         }
+
+        /** Bytes currently on disk for [model] (including partial `.tmp` files). */
+        fun downloadedBytes(context: Context, model: ModelInfo): Long {
+            val dir = File(modelDirFor(context, model))
+            if (!dir.exists()) return 0L
+            var total = 0L
+            dir.walkTopDown().forEach { if (it.isFile) total += it.length() }
+            return total
+        }
+
+        /** True when some bytes are present but the model is still incomplete. */
+        fun isPartial(context: Context, model: ModelInfo): Boolean =
+            !modelsExist(context, model) && downloadedBytes(context, model) > 0L
 
         private fun missingExpertFile(context: Context, model: ModelInfo): File? {
             // Bundle payloads are enumerated by the SHA256SUMS manifest, so the
@@ -445,8 +483,23 @@ class LlamaEngine private constructor(
         suspend fun downloadModels(
             context: Context,
             onProgress: (DownloadProgress) -> Unit
+        ) = downloadModels(context, getSelectedModel(context), onProgress)
+
+        suspend fun downloadModels(
+            context: Context,
+            modelId: String,
+            onProgress: (DownloadProgress) -> Unit
+        ) = downloadModels(
+            context,
+            ModelInfo.AVAILABLE_MODELS.firstOrNull { it.id == modelId } ?: getSelectedModel(context),
+            onProgress
+        )
+
+        suspend fun downloadModels(
+            context: Context,
+            model: ModelInfo,
+            onProgress: (DownloadProgress) -> Unit
         ) = withContext(Dispatchers.IO) {
-            val model = getSelectedModel(context)
             val dir = File(modelDirFor(context, model))
             if (!dir.exists()) dir.mkdirs()
             val sink = ProgressSink(context, model.totalBytes, onProgress)
@@ -1144,6 +1197,12 @@ class LlamaEngine private constructor(
     private external fun processUserPrompt(userPrompt: String, predictLength: Int): Int
     private external fun generateNextToken(): String?
     private external fun prefillImage(imageData: ByteArray, imageSize: Int): Int
+    private external fun restoreHistory(
+        roles: Array<String>,
+        texts: Array<String>,
+        imageCounts: IntArray,
+        images: Array<ByteArray>
+    ): Int
     private external fun resetPerformanceStatsNative()
     private external fun readPerformanceStatsNative(): DoubleArray
     private external fun fullReset()
@@ -1176,10 +1235,13 @@ class LlamaEngine private constructor(
                 init(nativeLibDir)
                 _state.value = LlamaState.Initialized
                 Log.i(TAG, "Native library loaded! System info: \n${systemInfo()}")
+            } catch (e: LinkageError) {
+                Log.e(TAG, "Native library is incompatible with this device", e)
+                _state.value = LlamaState.Error(RuntimeException(
+                    "无法加载本地推理库，请检查安装包与设备兼容性。", e))
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to load native library", e)
                 _state.value = LlamaState.Error(e)
-                throw e
             }
         }
     }
@@ -1439,6 +1501,55 @@ class LlamaEngine private constructor(
             _readyForSystemPrompt = true
             Log.i(TAG, "Context fully reset - context recreated, ready for new conversation")
         }
+
+    /**
+     * Re-seeds the engine with a previously saved conversation so the user can
+     * keep chatting with context intact. Images are read back from their
+     * persisted content-URI references; a URI that can no longer be opened is
+     * skipped (that image turn is then replayed without the picture, which is
+     * the graceful degradation we agreed on for reference-only storage).
+     */
+    suspend fun restoreConversation(turns: List<ChatHistoryTurn>) = withContext(llamaDispatcher) {
+        check(_state.value is LlamaState.ModelReady) {
+            "Cannot restore conversation in ${_state.value.javaClass.simpleName}"
+        }
+        val roles = ArrayList<String>(turns.size)
+        val texts = ArrayList<String>(turns.size)
+        val counts = IntArray(turns.size)
+        val images = ArrayList<ByteArray>()
+        turns.forEachIndexed { index, turn ->
+            roles.add(turn.role)
+            texts.add(turn.text)
+            var attached = 0
+            for (uriString in turn.imageUris) {
+                val bytes = readUriBytes(uriString)
+                if (bytes != null) {
+                    images.add(bytes)
+                    attached++
+                } else {
+                    Log.w(TAG, "restoreConversation: image URI no longer readable, skipping: $uriString")
+                }
+            }
+            counts[index] = attached
+        }
+        val result = restoreHistory(
+            roles.toTypedArray(),
+            texts.toTypedArray(),
+            counts,
+            images.toTypedArray()
+        )
+        if (result != 0) {
+            throw IllegalStateException("Failed to restore conversation (code: $result)")
+        }
+        Log.i(TAG, "Restored conversation: ${turns.size} turns, ${images.size} images")
+    }
+
+    private fun readUriBytes(uriString: String): ByteArray? = try {
+        context.contentResolver.openInputStream(android.net.Uri.parse(uriString))?.use { it.readBytes() }
+    } catch (e: Exception) {
+        Log.w(TAG, "Failed to read image URI: $uriString", e)
+        null
+    }
 
     fun sendUserPrompt(
         message: String,

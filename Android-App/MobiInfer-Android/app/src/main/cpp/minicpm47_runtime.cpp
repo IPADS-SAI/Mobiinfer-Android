@@ -8,12 +8,35 @@
 #include <fstream>
 #include <thread>
 #include <stdexcept>
+#include <mutex>
+
+// Defined in llama_jni.cpp: number of HTP sessions the device exposes
+// (1 on single-NSP SoCs, 2 where a second NSP is available).
+extern "C" int mobiinfer_htp_session_count();
 
 struct MiniCPM47Runtime::Impl {
     common_params params;
     std::unique_ptr<server_context> server;
     std::unique_ptr<server_response_reader> reader;
     std::thread worker;
+    std::mutex failure_mutex;
+    std::string worker_failure;
+
+    bool failed() {
+        std::lock_guard<std::mutex> lock(failure_mutex);
+        return !worker_failure.empty();
+    }
+
+    void check_worker() {
+        std::lock_guard<std::mutex> lock(failure_mutex);
+        if (!worker_failure.empty()) throw std::runtime_error(worker_failure);
+    }
+
+    void fail_worker(const char * detail) {
+        std::lock_guard<std::mutex> lock(failure_mutex);
+        worker_failure = std::string("Inference stopped; reload the model. ") + detail;
+        LOGe("MiniCPM47 worker failed: %s", worker_failure.c_str());
+    }
     std::vector<common_chat_msg> messages;
     std::vector<raw_buffer> files;
     std::string pending_media;
@@ -69,10 +92,21 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
     p.n_ctx_checkpoints = 1;
     p.n_parallel = 1;
     p.n_gpu_layers = 99;
-    p.devices = {ggml_backend_dev_by_name("HTP0"), ggml_backend_dev_by_name("HTP1"), nullptr};
-    if (!p.devices[0] || !p.devices[1]) throw std::runtime_error("MiniCPM-V 4.7 requires HTP0 and HTP1");
-    p.split_mode = LLAMA_SPLIT_MODE_LAYER;
-    p.tensor_split[0] = p.tensor_split[1] = 1.0f;
+    // One HTP device on single-NSP SoCs (8 Gen 5 / SM8850), two where the
+    // platform brings up a second NSP (8 Elite / SM8750). Kept in sync with
+    // llama_jni.cpp's detection via mobiinfer_htp_session_count().
+    const int n_htp = mobiinfer_htp_session_count();
+    ggml_backend_dev_t htp0 = ggml_backend_dev_by_name("HTP0");
+    ggml_backend_dev_t htp1 = n_htp > 1 ? ggml_backend_dev_by_name("HTP1") : nullptr;
+    if (!htp0 || (n_htp > 1 && !htp1)) {
+        throw std::runtime_error(std::string("MiniCPM-V 4.7 requires HTP0")
+                                 + (n_htp > 1 ? " and HTP1" : ""));
+    }
+    p.devices = {htp0, htp1, nullptr};
+    if (n_htp > 1) {
+        p.split_mode = LLAMA_SPLIT_MODE_LAYER;
+        p.tensor_split[0] = p.tensor_split[1] = 1.0f;
+    }
     p.fit_params = false;
     p.warmup = false;
     p.ctx_shift = false;
@@ -95,8 +129,10 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
     }
     setenv("LLAMA_MOE_DECODE_WINDOW", std::to_string(memory.cache_slots).c_str(), 1);
     unsetenv("LLAMA_MOE_LAYER_WINDOWS");
-    setenv("LLAMA_MOE_IO_THREADS", "8", 1);
-    setenv("LLAMA_MOE_PREFILL_WARM_ROWS", "32", 1);
+    setenv("LLAMA_MOE_IO_THREADS", "4", 1);
+    setenv("LLAMA_MOE_LOOKAHEAD_PREFETCH", "1", 1);
+    setenv("LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH", std::to_string(memory.prefetch).c_str(), 1);
+    setenv("LLAMA_MOE_PREFILL_WARM_ROWS", "0", 1);
     setenv("LLAMA_MOE_PREFETCH_MAX_ROWS", "8", 1);
     setenv("LLAMA_MOE_PREFILL_SORT_READS", "1", 1);
     setenv("MB_MEDIA_EMBD_BATCH", "1", 1);
@@ -121,7 +157,15 @@ bool MiniCPM47Runtime::start() {
          impl->params.n_batch, impl->params.speculative.draft.n_max,
          impl->memory_budget_mb, impl->cache_slots);
     if (!impl->server->load_model(impl->params)) return false;
-    impl->worker = std::thread([this] { impl->server->start_loop(); });
+    impl->worker = std::thread([this] {
+        try {
+            impl->server->start_loop();
+        } catch (const std::exception & e) {
+            impl->fail_worker(e.what());
+        } catch (...) {
+            impl->fail_worker("Unknown native error");
+        }
+    });
     return true;
 }
 
@@ -141,6 +185,7 @@ void MiniCPM47Runtime::addImage(const uint8_t * data, size_t size) {
 }
 
 void MiniCPM47Runtime::submit(const std::string & text, int n_predict) {
+    impl->check_worker();
     if (impl->reader) throw std::runtime_error("A completion is already active");
     common_chat_msg msg;
     msg.role = "user";
@@ -181,7 +226,8 @@ void MiniCPM47Runtime::submit(const std::string & text, int n_predict) {
 std::string MiniCPM47Runtime::next(bool & done) {
     done = false;
     if (!impl->reader) { done = true; return {}; }
-    while (auto result = impl->reader->next([] { return false; })) {
+    impl->check_worker();
+    while (auto result = impl->reader->next([this] { return impl->failed(); })) {
         if (result->is_error()) {
             const auto error = result->to_json().dump();
             impl->finish();
@@ -228,6 +274,7 @@ std::string MiniCPM47Runtime::next(bool & done) {
         }
     }
     impl->finish();
+    impl->check_worker();
     done = true;
     return {};
 }
@@ -242,6 +289,32 @@ void MiniCPM47Runtime::reset() {
     // SLOT_ERASE rejects multimodal contexts. The next completion instead starts
     // with n_past=0, which clears both target and draft state on the server thread.
     impl->cache_prompt = false;
+}
+
+void MiniCPM47Runtime::restore(const std::vector<RestoreTurn> & turns) {
+    cancel();
+    impl->messages.clear();
+    impl->files.clear();
+    impl->pending_media.clear();
+    impl->response.clear();
+    for (const auto & turn : turns) {
+        common_chat_msg msg;
+        msg.role = turn.role;
+        std::string content = turn.text;
+        // Media markers must precede the turn's text, one per attached image,
+        // mirroring addImage()/submit(). The server maps markers to cli_files
+        // positionally, so the file order must match the marker order.
+        for (const auto & image : turn.images) {
+            content = std::string(get_media_marker()) + content;
+            impl->files.emplace_back(image.begin(), image.end());
+        }
+        msg.content = std::move(content);
+        impl->messages.push_back(std::move(msg));
+    }
+    // Force the next submit() to evaluate the whole restored history instead
+    // of trying to reuse a (now stale) KV prefix.
+    impl->cache_prompt = false;
+    LOGi("MiniCPM47Runtime::restore: %zu turns, %zu images", turns.size(), impl->files.size());
 }
 
 void MiniCPM47Runtime::resetPerformanceStats() {

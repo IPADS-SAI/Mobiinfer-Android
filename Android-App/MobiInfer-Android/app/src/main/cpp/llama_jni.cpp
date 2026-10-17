@@ -1,9 +1,12 @@
 #include <android/log.h>
 #include <jni.h>
+#include <dlfcn.h>
 #include <iomanip>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <string>
+#include <sys/system_properties.h>
 #include <unistd.h>
 #include <vector>
 
@@ -25,6 +28,113 @@ static std::string join(const std::vector<T> &values, const std::string &delim) 
         if (i < values.size() - 1) { str << delim; }
     }
     return str.str();
+}
+
+// Number of Hexagon (HTP) sessions to open, decided once at init(). Two
+// sessions (layers split across HTP0 + HTP1) is the dual-NSP layout the 4.7
+// tiled-expert MoE path was built for. Detected via FastRPC when possible;
+// otherwise a conservative single-session default, with only Snapdragon
+// 8 Elite (SM8750) keeping two. Overridable with MOBIINFER_HTP_SESSIONS.
+static int g_htp_sessions = 2;
+
+// Minimal copies of the Hexagon SDK fastrpc structs (remote.h) needed to issue
+// FASTRPC_GET_DOMAINS. Kept local so this file needs no SDK include path.
+namespace htp_probe {
+    constexpr int MAX_DOMAIN_NAMELEN = 30;
+    constexpr int FASTRPC_GET_DOMAINS = 0;   // system_req_id
+    constexpr int FASTRPC_NSP         = 1;   // fastrpc_domain_type
+    constexpr int TYPE_POS            = 5;
+
+    struct domain {
+        int          id;
+        int          instance_id;
+        char         name[MAX_DOMAIN_NAMELEN];
+        int          type;       // fastrpc_domain_type
+        int          status;     // 0 = down, non-zero = up
+        unsigned int card;
+        unsigned int soc_id;
+        unsigned int reserved[10];
+    };
+
+    struct domains_info {
+        domain *           domains;
+        int                max_domains;
+        int                num_domains;
+        unsigned long long flags;
+    };
+
+    struct system_req_payload {
+        int          id;
+        domains_info sys;
+    };
+
+    inline unsigned long long nsp_flag() {
+        return (unsigned long long) (FASTRPC_NSP & ((1 << TYPE_POS) - 1));
+    }
+} // namespace htp_probe
+
+// Guard the local copies against accidental divergence from the SDK ABI
+// (verified against remote.h: 96 / 24 / 32 bytes, sys at offset 8).
+static_assert(sizeof(htp_probe::domain)           == 96, "fastrpc_domain ABI");
+static_assert(sizeof(htp_probe::domains_info)     == 24, "fastrpc_domains_info ABI");
+static_assert(sizeof(htp_probe::system_req_payload) == 32, "system_req_payload ABI");
+
+static int detect_htp_sessions(std::string & soc_out) {
+    char soc[PROP_VALUE_MAX] = {0};
+    __system_property_get("ro.soc.model", soc);
+    soc_out = soc;
+
+    const char * override = getenv("MOBIINFER_HTP_SESSIONS");
+    if (override && *override) {
+        int n = atoi(override);
+        if (n >= 1 && n <= 2) return n;
+    }
+
+    // Conservative default when we cannot measure: one session. Only the one
+    // platform we know brings up a second NSP gets two. Everything else
+    // (8 Gen 3 / 8 Gen 5 / unknown) stays at one until proven otherwise.
+    auto fallback = [&]() -> int {
+        if (strncmp(soc, "SM8750", 6) == 0) {   // Snapdragon 8 Elite (8 Gen 4)
+            return 2;
+        }
+        return 1;
+    };
+
+    // Measured path: ask the FastRPC driver how many NSP (CDSP / HTP) domains
+    // are up. Available on SM8850 (8 Gen 5, reports one); absent on SM8750.
+    void * lib = dlopen("libcdsprpc.so", RTLD_NOW);
+    if (!lib) {
+        LOGi("libcdsprpc.so not loadable - using fallback HTP sessions");
+        return fallback();
+    }
+
+    using rsr_t = int (*)(htp_probe::system_req_payload *);
+    rsr_t rsr = (rsr_t) dlsym(lib, "remote_system_request");
+    if (!rsr) {
+        LOGi("remote_system_request symbol absent - using fallback HTP sessions");
+        return fallback();
+    }
+
+    htp_probe::system_req_payload req = {};
+    req.id              = htp_probe::FASTRPC_GET_DOMAINS;
+    req.sys.domains     = nullptr;
+    req.sys.max_domains = 0;
+    req.sys.flags       = htp_probe::nsp_flag();
+
+    if (rsr(&req) != 0 || req.sys.num_domains <= 0) {
+        LOGw("FastRPC FASTRPC_GET_DOMAINS query failed - using fallback HTP sessions");
+        return fallback();
+    }
+
+    const int n = req.sys.num_domains;
+    LOGi("FastRPC reports %d NSP domain(s)", n);
+    return n >= 2 ? 2 : 1;
+}
+
+// Exposed to minicpm47_runtime.cpp so the MoE runtime picks the same number
+// of HTP devices as the JNI layer.
+extern "C" int mobiinfer_htp_session_count() {
+    return g_htp_sessions;
 }
 
 // Inference parameters mirror the iOS demo defaults (MTMDParams.swift / mtmd-ios.cpp):
@@ -142,27 +252,44 @@ Java_com_mobiinfer_demo_LlamaEngine_init(JNIEnv *env, jobject /*unused*/, jstrin
     llama_log_set(minicpm_android_log_callback, nullptr);
     mtmd_log_set(minicpm_android_log_callback, nullptr);
 
-    const auto *path_to_backend = env->GetStringUTFChars(nativeLibDir, 0);
-    LOGi("Loading backends from %s", path_to_backend);
-    setenv("ADSP_LIBRARY_PATH", path_to_backend, 1);
-    // Register both virtual sessions before the backend's one-time registry
-    // initialization. Dense models still explicitly select only HTP0.
-    setenv("GGML_HEXAGON_DEVICES", "2", 1);
-    setenv("GGML_HEXAGON_OPPOLL", "1", 1);
-    setenv("GGML_HEXAGON_MBUF", "256M,512M,4G", 1);
-    LOGi("ADSP_LIBRARY_PATH=%s", getenv("ADSP_LIBRARY_PATH"));
-    ggml_backend_load_all_from_path(path_to_backend);
-    env->ReleaseStringUTFChars(nativeLibDir, path_to_backend);
+    try {
+        const auto *native_path = env->GetStringUTFChars(nativeLibDir, 0);
+        if (!native_path) return; // JVM already has a pending allocation exception.
+        const std::string backend_path(native_path);
+        env->ReleaseStringUTFChars(nativeLibDir, native_path);
+        const auto *path_to_backend = backend_path.c_str();
+        LOGi("Loading backends from %s", path_to_backend);
+        setenv("ADSP_LIBRARY_PATH", path_to_backend, 1);
+        // Register the HTP sessions before the backend's one-time registry
+        // initialization. Two sessions on dual-CDSP SoCs (8 Elite / SM8750);
+        // one on single-CDSP SoCs (8 Gen 5 / SM8850). Dense models still
+        // explicitly select only HTP0.
+        std::string soc_model;
+        g_htp_sessions = detect_htp_sessions(soc_model);
+        setenv("GGML_HEXAGON_DEVICES", g_htp_sessions > 1 ? "2" : "1", 1);
+        LOGi("HTP sessions: %d (ro.soc.model=%s)", g_htp_sessions, soc_model.c_str());
+        // Wait for DSP responses instead of repeatedly polling with a zero timeout.
+        // Some FastRPC drivers log every empty poll as AEE_EEXPIRED.
+        setenv("GGML_HEXAGON_OPPOLL", "0", 1);
+        setenv("GGML_HEXAGON_MBUF", "256M,512M,4G", 1);
+        LOGi("ADSP_LIBRARY_PATH=%s", getenv("ADSP_LIBRARY_PATH"));
+        ggml_backend_load_all_from_path(path_to_backend);
 
-    if (ggml_backend_reg_count() == 0) {
-        LOGw("%s: No backends loaded from path, trying ggml_backend_load_all()", __func__);
-        ggml_backend_load_all();
+        if (ggml_backend_reg_count() == 0) {
+            LOGw("%s: No backends loaded from path, trying ggml_backend_load_all()", __func__);
+            ggml_backend_load_all();
+        }
+
+        LOGi("%s: Backend count: %zu", __func__, ggml_backend_reg_count());
+
+        llama_backend_init();
+        LOGi("Backend initiated; Log handler set.");
+    } catch (const std::exception & e) {
+        LOGe("Backend initialization failed: %s", e.what());
+        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), e.what());
+    } catch (...) {
+        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), "Unknown backend initialization error");
     }
-
-    LOGi("%s: Backend count: %zu", __func__, ggml_backend_reg_count());
-
-    llama_backend_init();
-    LOGi("Backend initiated; Log handler set.");
 }
 
 extern "C"
@@ -194,18 +321,24 @@ Java_com_mobiinfer_demo_LlamaEngine_load(JNIEnv *env, jobject, jstring jmodel_pa
     } else {
         unsetenv("LLAMA_MOE_HTP_PACKED_DIR");
     }
+    const bool dual_htp = g_moe && g_htp_sessions > 1;
     ggml_backend_dev_t devices[] = {
         ggml_backend_dev_by_name("HTP0"),
-        g_moe ? ggml_backend_dev_by_name("HTP1") : nullptr,
+        dual_htp ? ggml_backend_dev_by_name("HTP1") : nullptr,
         nullptr,
     };
-    if (g_moe && (!devices[0] || !devices[1])) {
+    if (!devices[0]) {
+        LOGe("Hexagon backend did not expose HTP0");
+        return 3;
+    }
+    if (dual_htp && !devices[1]) {
         LOGe("MiniCPM-V 4.7 tiled experts require HTP0 and HTP1");
         return 3;
     }
     const float tensor_split[] = {1.0f, 1.0f};
-    if (devices[0]) model_params.devices = devices;
-    if (g_moe) {
+    model_params.devices = devices;
+    if (dual_htp) {
+        // Two physical CDSP cores available: layer-split the MoE model.
         model_params.split_mode = LLAMA_SPLIT_MODE_LAYER;
         model_params.tensor_split = tensor_split;
     }
@@ -857,6 +990,76 @@ Java_com_mobiinfer_demo_LlamaEngine_processUserPrompt(
     }
 
     stop_generation_position = current_position + n_predict;
+    return 0;
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_com_mobiinfer_demo_LlamaEngine_restoreHistory(
+        JNIEnv *env,
+        jobject /*unused*/,
+        jobjectArray jroles,
+        jobjectArray jtexts,
+        jintArray jimage_counts,
+        jobjectArray jimages
+) {
+    if (!g_moe_runtime) {
+        // Only the MiniCPM-V 4.7 (MoE) runtime keeps an in-memory chat history
+        // that can be swapped wholesale. The generic llama.cpp path has no
+        // equivalent hook, so restoring there is a no-op: the conversation is
+        // still shown, just without KV-context continuity.
+        LOGw("%s: restore not supported for this model, ignoring", __func__);
+        return 0;
+    }
+
+    const jsize turns_n  = env->GetArrayLength(jroles);
+    const jsize images_n = jimages ? env->GetArrayLength(jimages) : 0;
+    jint * counts = jimage_counts ? env->GetIntArrayElements(jimage_counts, nullptr) : nullptr;
+
+    std::vector<RestoreTurn> turns;
+    turns.reserve(turns_n);
+    jsize image_cursor = 0;
+    for (jsize i = 0; i < turns_n; ++i) {
+        RestoreTurn turn;
+        auto jr = (jstring) env->GetObjectArrayElement(jroles, i);
+        auto jt = (jstring) env->GetObjectArrayElement(jtexts, i);
+        if (jr) {
+            const char * s = env->GetStringUTFChars(jr, nullptr);
+            turn.role = s;
+            env->ReleaseStringUTFChars(jr, s);
+            env->DeleteLocalRef(jr);
+        }
+        if (jt) {
+            const char * s = env->GetStringUTFChars(jt, nullptr);
+            turn.text = s;
+            env->ReleaseStringUTFChars(jt, s);
+            env->DeleteLocalRef(jt);
+        }
+        const int n_for_turn = counts ? counts[i] : 0;
+        for (int j = 0; j < n_for_turn && image_cursor < images_n; ++j, ++image_cursor) {
+            auto jb = (jbyteArray) env->GetObjectArrayElement(jimages, image_cursor);
+            if (!jb) continue;
+            const jsize len = env->GetArrayLength(jb);
+            jbyte * data = env->GetByteArrayElements(jb, nullptr);
+            if (data) {
+                turn.images.emplace_back(
+                    reinterpret_cast<uint8_t *>(data),
+                    reinterpret_cast<uint8_t *>(data) + len);
+                env->ReleaseByteArrayElements(jb, data, JNI_ABORT);
+            }
+            env->DeleteLocalRef(jb);
+        }
+        turns.push_back(std::move(turn));
+    }
+    if (counts) env->ReleaseIntArrayElements(jimage_counts, counts, JNI_ABORT);
+
+    try {
+        g_moe_runtime->restore(turns);
+    } catch (const std::exception & e) {
+        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), e.what());
+        return 2;
+    }
+    LOGi("%s: restored %d turns", __func__, (int) turns.size());
     return 0;
 }
 

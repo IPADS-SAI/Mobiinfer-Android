@@ -166,6 +166,9 @@ data class ModelInfo(
             )
         )
 
-        val DEFAULT_MODEL = AVAILABLE_MODELS.first()
+        // The default selection is the MiniCPM-V 4.7 NPU bundle. Falls back to
+        // the first entry only if that model is ever removed from the lineup.
+        val DEFAULT_MODEL = AVAILABLE_MODELS.firstOrNull { it.id == "minicpm-v-4_7" }
+            ?: AVAILABLE_MODELS.first()
     }
 }

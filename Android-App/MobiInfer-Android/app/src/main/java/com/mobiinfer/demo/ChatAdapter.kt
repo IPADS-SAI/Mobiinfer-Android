@@ -21,14 +21,21 @@ class ChatAdapter(
         private const val TYPE_WELCOME = 0
         private const val TYPE_USER = 1
         private const val TYPE_AI = 2
+        private const val TYPE_DOWNLOAD = 3
     }
 
     private var onSuggestionClick: ((String) -> Unit)? = null
     private var onSuggestionImageClick: (() -> Unit)? = null
     private var onStopClick: (() -> Unit)? = null
+    private var onDownloadConfirm: (() -> Unit)? = null
+    private var onDownloadCancel: (() -> Unit)? = null
+    private var onDownloadPause: (() -> Unit)? = null
+    private var onDownloadResume: (() -> Unit)? = null
 
     private var activeAiHolder: AiMessageViewHolder? = null
     private var activeAiId: Long = -1L
+    private var activeDownloadHolder: DownloadPromptViewHolder? = null
+    private var activeDownloadId: Long = -1L
 
     fun setOnSuggestionClick(listener: (String) -> Unit) {
         onSuggestionClick = listener
@@ -42,6 +49,22 @@ class ChatAdapter(
         onStopClick = listener
     }
 
+    fun setOnDownloadConfirm(listener: () -> Unit) {
+        onDownloadConfirm = listener
+    }
+
+    fun setOnDownloadCancel(listener: () -> Unit) {
+        onDownloadCancel = listener
+    }
+
+    fun setOnDownloadPause(listener: () -> Unit) {
+        onDownloadPause = listener
+    }
+
+    fun setOnDownloadResume(listener: () -> Unit) {
+        onDownloadResume = listener
+    }
+
     fun setActiveAiMessage(id: Long) {
         activeAiId = id
     }
@@ -49,6 +72,27 @@ class ChatAdapter(
     fun clearActiveAiMessage() {
         activeAiId = -1L
         activeAiHolder = null
+    }
+
+    fun setActiveDownload(id: Long) {
+        activeDownloadId = id
+        activeDownloadHolder = null
+    }
+
+    fun clearActiveDownload() {
+        activeDownloadId = -1L
+        activeDownloadHolder = null
+    }
+
+    /**
+     * Direct, in-place progress update for the download card.  Going through
+     * submitList() on every progress tick rebinds the item and restarts the
+     * progress animation, which makes the card flicker.
+     */
+    fun updateDownloadProgress(id: Long, fraction: Float, status: String?) {
+        if (id == activeDownloadId) {
+            activeDownloadHolder?.updateProgress(fraction, status)
+        }
     }
 
     fun updateStreamingText(id: Long, text: String) {
@@ -68,6 +112,7 @@ class ChatAdapter(
             is ChatMessage.WelcomeCard -> TYPE_WELCOME
             is ChatMessage.UserMessage -> TYPE_USER
             is ChatMessage.AiMessage -> TYPE_AI
+            is ChatMessage.ModelDownloadPrompt -> TYPE_DOWNLOAD
         }
     }
 
@@ -88,6 +133,11 @@ class ChatAdapter(
                     .inflate(R.layout.item_ai_message, parent, false)
                 AiMessageViewHolder(view)
             }
+            TYPE_DOWNLOAD -> {
+                val view = LayoutInflater.from(parent.context)
+                    .inflate(R.layout.item_download_prompt, parent, false)
+                DownloadPromptViewHolder(view)
+            }
             else -> throw IllegalArgumentException("Unknown view type: $viewType")
         }
     }
@@ -103,12 +153,22 @@ class ChatAdapter(
                     activeAiHolder = aiHolder
                 }
             }
+            is ChatMessage.ModelDownloadPrompt -> {
+                val promptHolder = holder as DownloadPromptViewHolder
+                promptHolder.bind(item)
+                if (item.id == activeDownloadId) {
+                    activeDownloadHolder = promptHolder
+                }
+            }
         }
     }
 
     override fun onViewRecycled(holder: RecyclerView.ViewHolder) {
         if (holder is AiMessageViewHolder && holder == activeAiHolder) {
             activeAiHolder = null
+        }
+        if (holder is DownloadPromptViewHolder && holder == activeDownloadHolder) {
+            activeDownloadHolder = null
         }
     }
 
@@ -142,6 +202,58 @@ class ChatAdapter(
                 btnSuggestion2.setOnClickListener { onSuggestionClick?.invoke(s2) }
             } else {
                 btnSuggestion2.setOnClickListener { onSuggestionImageClick?.invoke() }
+            }
+        }
+    }
+
+    inner class DownloadPromptViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
+        private val tvTitle: TextView = itemView.findViewById(R.id.tv_download_title)
+        private val tvStatus: TextView = itemView.findViewById(R.id.tv_download_status)
+        private val progress: LinearProgressIndicator = itemView.findViewById(R.id.progress_download)
+        private val layoutButtons: View = itemView.findViewById(R.id.layout_download_buttons)
+        private val btnConfirm: MaterialButton = itemView.findViewById(R.id.btn_download_confirm)
+        private val btnCancel: MaterialButton = itemView.findViewById(R.id.btn_download_cancel)
+        private val btnPause: MaterialButton = itemView.findViewById(R.id.btn_download_pause)
+        private val btnResume: MaterialButton = itemView.findViewById(R.id.btn_download_resume)
+
+        fun bind(item: ChatMessage.ModelDownloadPrompt) {
+            tvTitle.text = itemView.context.getString(R.string.model_download_prompt, item.modelName)
+            layoutButtons.visibility = View.VISIBLE
+            if (item.downloading) {
+                progress.visibility = View.VISIBLE
+                progress.isIndeterminate = false
+                progress.setProgressCompat((item.fraction * 100f).toInt().coerceIn(0, 100), false)
+                applyStatus(item.status)
+            } else {
+                progress.visibility = View.GONE
+                tvStatus.visibility = View.GONE
+            }
+            btnConfirm.visibility = if (!item.downloading) View.VISIBLE else View.GONE
+            btnCancel.visibility = if (!item.downloading || item.paused) View.VISIBLE else View.GONE
+            btnPause.visibility = if (item.downloading && !item.paused) View.VISIBLE else View.GONE
+            btnResume.visibility = if (item.downloading && item.paused) View.VISIBLE else View.GONE
+
+            btnConfirm.setOnClickListener { onDownloadConfirm?.invoke() }
+            btnCancel.setOnClickListener { onDownloadCancel?.invoke() }
+            btnPause.setOnClickListener { onDownloadPause?.invoke() }
+            btnResume.setOnClickListener { onDownloadResume?.invoke() }
+        }
+
+        /** In-place progress update; avoids rebinding / animation restart. */
+        fun updateProgress(fraction: Float, status: String?) {
+            layoutButtons.visibility = View.GONE
+            progress.visibility = View.VISIBLE
+            progress.isIndeterminate = false
+            progress.setProgressCompat((fraction * 100f).toInt().coerceIn(0, 100), false)
+            applyStatus(status)
+        }
+
+        private fun applyStatus(status: String?) {
+            if (status != null) {
+                tvStatus.visibility = View.VISIBLE
+                tvStatus.text = status
+            } else {
+                tvStatus.visibility = View.GONE
             }
         }
     }
@@ -187,6 +299,7 @@ class ChatAdapter(
         private val dividerThinking: View = itemView.findViewById(R.id.divider_thinking)
 
         private val prefillStatus: View = itemView.findViewById(R.id.layout_prefill_status)
+        private val tvPrefillStatus: TextView = itemView.findViewById(R.id.tv_prefill_status)
         private var thinkingExpanded = false
         private var streamingMinWidth = 0
 
@@ -196,6 +309,13 @@ class ChatAdapter(
                 streamingMinWidth = 0
                 (tvText.parent as? ViewGroup)?.minimumWidth = 0
             }
+            // The same spinner block is used for two different waits: model
+            // loading (placeholder bubble) and prefill/thinking. Keep the copy
+            // distinct so they are not confused.
+            tvPrefillStatus.text = itemView.context.getString(
+                if (item.isLoadingPlaceholder) R.string.model_loading_in_progress
+                else R.string.thinking_in_progress
+            )
             renderWithThinking(item.text, item.isGenerating)
             val metrics = item.metrics
             if (!item.isGenerating && metrics != null) {
@@ -215,7 +335,7 @@ class ChatAdapter(
             } else {
                 tvMetrics.visibility = View.GONE
             }
-            btnStop.visibility = if (item.isGenerating) View.VISIBLE else View.GONE
+            btnStop.visibility = if (item.isGenerating && !item.isLoadingPlaceholder) View.VISIBLE else View.GONE
             btnStop.setOnClickListener {
                 onStopClick?.invoke()
             }
@@ -326,6 +446,12 @@ class ChatAdapter(
                             (oldItem.isGenerating || (oldItem.text == newItem.text && oldItem.metrics == newItem.metrics))
                 oldItem is ChatMessage.WelcomeCard && newItem is ChatMessage.WelcomeCard ->
                     oldItem.isTextOnly == newItem.isTextOnly
+                oldItem is ChatMessage.ModelDownloadPrompt && newItem is ChatMessage.ModelDownloadPrompt ->
+                    oldItem.modelName == newItem.modelName &&
+                            oldItem.downloading == newItem.downloading &&
+                            oldItem.paused == newItem.paused &&
+                            oldItem.fraction == newItem.fraction &&
+                            oldItem.status == newItem.status
                 else -> false
             }
         }
