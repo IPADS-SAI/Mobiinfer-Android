@@ -13,6 +13,7 @@
 #include "logging.h"
 #include "chat.h"
 #include "common.h"
+#include "log.h"
 #include "llama.h"
 #include "sampling.h"
 #include "mtmd.h"
@@ -268,9 +269,26 @@ Java_com_mobiinfer_demo_LlamaEngine_init(JNIEnv *env, jobject /*unused*/, jstrin
         g_htp_sessions = detect_htp_sessions(soc_model);
         setenv("GGML_HEXAGON_DEVICES", g_htp_sessions > 1 ? "2" : "1", 1);
         LOGi("HTP sessions: %d (ro.soc.model=%s)", g_htp_sessions, soc_model.c_str());
-        // Wait for DSP responses instead of repeatedly polling with a zero timeout.
-        // Some FastRPC drivers log every empty poll as AEE_EEXPIRED.
-        setenv("GGML_HEXAGON_OPPOLL", "0", 1);
+        // Default to polling via the dedicated nonblocking DSP queue API.
+        // Read before backend registration, which caches this setting once.
+        // adb shell setprop debug.mobiinfer.htp_poll 0 disables polling; restart the App.
+        char poll_property[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.mobiinfer.htp_poll", poll_property);
+        const bool poll = std::strcmp(poll_property, "0") != 0;
+        setenv("GGML_HEXAGON_OPPOLL", poll ? "1" : "0", 1);
+        LOGi("HTP response wait: %s", poll ? "poll" : "blocking");
+        char profile_property[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.mobiinfer.htp_profile", profile_property);
+        const bool profile = std::strcmp(profile_property, "1") == 0;
+        setenv("GGML_HEXAGON_PROFILE", profile ? "1" : "0", 1);
+        setenv("LLAMA_PROFILE_TARGET", profile ? "1" : "0", 1);
+        if (profile) {
+            // Keep detailed DSP records in common_log's runtime.log instead of
+            // flooding logcat. Profiling runs are separate from speed runs.
+            common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
+            llama_log_set(common_log_default_callback, nullptr);
+            LOGi("HTP profiling enabled; detailed records use runtime.log");
+        }
         setenv("GGML_HEXAGON_MBUF", "256M,512M,4G", 1);
         LOGi("ADSP_LIBRARY_PATH=%s", getenv("ADSP_LIBRARY_PATH"));
         ggml_backend_load_all_from_path(path_to_backend);
@@ -833,6 +851,10 @@ Java_com_mobiinfer_demo_LlamaEngine_fullReset(JNIEnv *env, jobject) {
         catch (const std::exception & e) { env->ThrowNew(env->FindClass("java/lang/RuntimeException"), e.what()); }
         return;
     }
+    if (!g_model || !g_context) {
+        env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), "Model is not loaded; reload before resetting the conversation");
+        return;
+    }
     reset_long_term_states();
     reset_short_term_states();
 
@@ -847,6 +869,7 @@ Java_com_mobiinfer_demo_LlamaEngine_fullReset(JNIEnv *env, jobject) {
     auto *context = init_context(g_model, g_n_ctx);
     if (!context) {
         LOGe("%s: Failed to reinitialize context!", __func__);
+        env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), "Failed to recreate model context; reload the model");
         return;
     }
     g_context = context;
@@ -887,6 +910,10 @@ Java_com_mobiinfer_demo_LlamaEngine_processUserPrompt(
             return 1;
         }
         return 0;
+    }
+    if (!g_model || !g_context || !g_chat_templates || !g_sampler) {
+        env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), "Model is not ready; reload before sending a prompt");
+        return 1;
     }
     reset_short_term_states();
 

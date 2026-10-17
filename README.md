@@ -67,13 +67,15 @@ Android 应用（[`Android-App/`](Android-App/README.md)，基于 [OpenBMB/MiniC
 
 ## 性能数据 / Performance
 
-> 📱 OnePlus 13（Snapdragon 8 Elite，HTP0 + HTP1），纯文本 CLI 实测，128-token 输出。
+> 📱 OnePlus 13（Snapdragon 8 Elite，HTP0 + HTP1），纯文本实测，128-token 输出。
 
 | 模型 / Model | SoC | Prefill (token/s) | Decode (token/s) |
 |---|---|---:|---:|
 | MiniCPM-V 4.7 35B-A3B（Q3，MoE + LES + DSpark） | Snapdragon 8 Elite | 66.22 | 14.64 |
+| MiniCPM-V 4.7 35B-A3B（同上，App 短 prompt，41 tokens） | Snapdragon 8 Elite | 22.02 | 17.98 |
 | Qwen3-VL-4B-Instruct（Q4_K_M） | Snapdragon 8 Elite | 1013.74 | 18.13 |
 
+短 prompt 使用「Python 斐波那契数列」示例，未加载 mmproj；其余行为 CLI 数据。
 
 
 ---

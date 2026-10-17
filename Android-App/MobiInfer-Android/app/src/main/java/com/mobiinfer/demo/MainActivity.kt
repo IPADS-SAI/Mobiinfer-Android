@@ -50,7 +50,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnImage: ImageButton
     private lateinit var btnThink: MaterialButton
     private lateinit var btnModelManager: ImageButton
-    private lateinit var btnImageSlice: ImageButton
     private lateinit var cardInputBar: View
     private lateinit var appBarLayout: AppBarLayout
     private lateinit var tvTitle: TextView
@@ -139,7 +138,6 @@ class MainActivity : AppCompatActivity() {
         btnImage = findViewById(R.id.btn_image)
         btnThink = findViewById(R.id.btn_think)
         btnModelManager = findViewById(R.id.btn_model_manager)
-        btnImageSlice = findViewById(R.id.btn_image_slice)
         cardInputBar = findViewById(R.id.card_input_bar)
         appBarLayout = findViewById(R.id.appBarLayout)
         tvTitle = findViewById(R.id.tv_title)
@@ -159,7 +157,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupRecyclerView() {
-        chatAdapter = ChatAdapter(Markwon.create(this))
+        chatAdapter = ChatAdapter(MarkdownRenderer.create(this))
         chatAdapter.setOnStopClick {
             engine.cancelGeneration()
         }
@@ -215,7 +213,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun setupConversationDrawer() {
         conversationAdapter = ConversationAdapter(
-            onOpen = { meta -> if (meta.id != currentConversationId) openConversation(meta.id, restoreContext = true) },
+            onOpen = { meta ->
+                if (meta.id != currentConversationId) openConversation(meta.id, restoreContext = true)
+                drawerLayout.closeDrawers()
+            },
             onDelete = { meta -> confirmDeleteConversation(meta) },
             onRename = { meta -> showRenameDialog(meta) }
         )
@@ -371,7 +372,6 @@ class MainActivity : AppCompatActivity() {
         }
         findViewById<com.google.android.material.button.MaterialButton>(R.id.btn_new_conversation)
             .setOnClickListener { startNewConversation() }
-        btnImageSlice.setOnClickListener { showImageSliceDialog() }
 
         etInput.setOnFocusChangeListener { _, hasFocus ->
             if (hasFocus) {
@@ -408,44 +408,6 @@ class MainActivity : AppCompatActivity() {
                 clearChat()
             }
             .setNegativeButton(R.string.cancel, null)
-            .show()
-    }
-
-    /**
-     * Pops up the slice-cap picker.  The slider drives a live preview of
-     * the selected value; only on dialog "confirm" do we persist + push
-     * the value to native.  Cancel = no-op.
-     *
-     * Live update path is cheap (no mmproj reload), but we still gate it
-     * behind a confirm step so users don't accidentally regenerate cached
-     * embeddings while dragging the knob.
-     */
-    private fun showImageSliceDialog() {
-        val view = layoutInflater.inflate(R.layout.dialog_image_slice, null, false)
-        val slider = view.findViewById<com.google.android.material.slider.Slider>(R.id.slider_image_slice)
-        val tvValue = view.findViewById<android.widget.TextView>(R.id.tv_image_slice_value)
-
-        val initial = LlamaEngine.getImageMaxSliceNums(this)
-        slider.value = initial.toFloat()
-        tvValue.text = initial.toString()
-        slider.addOnChangeListener { _, value, _ -> tvValue.text = value.toInt().toString() }
-
-        AlertDialog.Builder(this)
-            .setTitle(R.string.image_slice_dialog_title)
-            .setView(view)
-            .setPositiveButton(android.R.string.ok) { _, _ ->
-                val chosen = slider.value.toInt()
-                lifecycleScope.launch {
-                    engine.setImageMaxSliceNums(chosen)
-                    val msgRes = if (engine.isVisionSupported) {
-                        R.string.image_slice_apply_toast
-                    } else {
-                        R.string.image_slice_pending_toast
-                    }
-                    Toast.makeText(this@MainActivity, getString(msgRes, chosen), Toast.LENGTH_SHORT).show()
-                }
-            }
-            .setNegativeButton(android.R.string.cancel, null)
             .show()
     }
 
@@ -563,7 +525,6 @@ class MainActivity : AppCompatActivity() {
         btnSend.isEnabled = true
         btnImage.isEnabled = false
         btnImage.visibility = View.GONE
-        btnImageSlice.visibility = View.GONE
         btnThink.visibility = View.GONE
     }
 
@@ -578,7 +539,6 @@ class MainActivity : AppCompatActivity() {
 
         tvTitle.setText(if (isVision) R.string.app_title else R.string.app_title_text)
         btnImage.visibility = if (isVision) View.VISIBLE else View.GONE
-        btnImageSlice.visibility = if (isVision) View.VISIBLE else View.GONE
         btnImage.isEnabled = isVision
         btnThink.visibility = if (model.supportsThinking) View.VISIBLE else View.GONE
         if (model.supportsThinking) {
@@ -1146,8 +1106,11 @@ class MainActivity : AppCompatActivity() {
         (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
             .hideSoftInputFromWindow(etInput.windowToken, 0)
 
-        // Reuse the regular "thinking" animation as the model-load indicator:
-        // an assistant placeholder with empty text shows the prefill spinner.
+        // Show the user's message first, then the "thinking" placeholder used as
+        // the model-load indicator, so the order matches the already-loaded path.
+        if (pendingText != null) {
+            messages.add(ChatMessage.UserMessage(id = messageIdCounter++, text = pendingText))
+        }
         val placeholderId = messageIdCounter++
         messages.add(ChatMessage.AiMessage(id = placeholderId, text = "", isGenerating = true, isLoadingPlaceholder = true))
         chatAdapter.setActiveAiMessage(placeholderId)
@@ -1183,7 +1146,7 @@ class MainActivity : AppCompatActivity() {
                         pendingImageQuestion = getString(R.string.suggestion_2)
                         getMedia.launch(arrayOf("image/*"))
                     } else if (pendingText != null) {
-                        sendPrompt(pendingText)
+                        sendPrompt(pendingText, userMessageAlreadyAdded = true)
                     }
                 }
             } catch (e: Exception) {
@@ -1216,7 +1179,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun sendPrompt(userMsg: String) {
+    private fun sendPrompt(userMsg: String, userMessageAlreadyAdded: Boolean = false) {
         etInput.clearFocus()
         (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
             .hideSoftInputFromWindow(etInput.windowToken, 0)
@@ -1226,16 +1189,18 @@ class MainActivity : AppCompatActivity() {
 
         collapseAppBar()
 
-        val msgId = messageIdCounter++
-        val userMessage = ChatMessage.UserMessage(
-            id = msgId,
-            text = userMsg,
-            imageBitmap = null,
-            imageInfo = null
-        )
-        messages.add(userMessage)
-        chatAdapter.submitList(messages.toList()) {
-            scrollToBottom()
+        if (!userMessageAlreadyAdded) {
+            val msgId = messageIdCounter++
+            val userMessage = ChatMessage.UserMessage(
+                id = msgId,
+                text = userMsg,
+                imageBitmap = null,
+                imageInfo = null
+            )
+            messages.add(userMessage)
+            chatAdapter.submitList(messages.toList()) {
+                scrollToBottom()
+            }
         }
 
         val imageProcessingMs = if (isImagePrefilled) pendingImageProcessingMs else null

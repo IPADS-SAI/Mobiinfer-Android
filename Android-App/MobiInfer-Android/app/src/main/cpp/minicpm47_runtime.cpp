@@ -48,6 +48,9 @@ struct MiniCPM47Runtime::Impl {
     int64_t request_start = 0;
     int64_t first_token = 0;
     std::string directory;
+    std::string vision_path;
+    bool vision_loaded = false;
+    bool benchmark_eager_mmproj = false;
     std::string label;
     int benchmark_max_tokens = 0;
     int memory_budget_mb = 6000;
@@ -72,6 +75,10 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
     const auto memory = minicpm47_memory_config(memory_budget_mb);
     impl->memory_budget_mb = memory.budget_mb;
     impl->cache_slots = memory.cache_slots;
+    int prefetch = memory.prefetch;
+    int io_threads = 4;
+    int benchmark_cache_slots = -1;
+    int benchmark_ubatch = memory.batch;
     const auto dir = model.substr(0, model.find_last_of('/'));
     impl->directory = dir;
     // Optional local benchmark overrides. Normal use defaults to HTP + DSpark.
@@ -82,13 +89,37 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
         impl->dspark = config.value("dspark", true);
         impl->label = config.value("label", std::string());
         impl->benchmark_max_tokens = config.value("max_tokens", 0);
+        impl->benchmark_eager_mmproj = config.value("eager_mmproj", false);
+        prefetch = config.value("prefetch", prefetch);
+        io_threads = config.value("io_threads", io_threads);
+        benchmark_cache_slots = config.value("cache_slots", -1);
+        benchmark_ubatch = config.value("ubatch", benchmark_ubatch);
+        if (benchmark_ubatch < 1 || benchmark_ubatch > memory.batch) {
+            throw std::invalid_argument("Benchmark ubatch must be 1..batch");
+        }
+        if (benchmark_cache_slots != -1 && (benchmark_cache_slots < 8 || benchmark_cache_slots > 128)) {
+            throw std::invalid_argument("Benchmark cache_slots must be 8..128");
+        }
+        if (prefetch < 0 || prefetch > 16 || io_threads < 1 || io_threads > 8) {
+            throw std::invalid_argument("Benchmark prefetch must be 0..16 and io_threads 1..8");
+        }
+    }
+    // Keep the total decode window within the selected memory budget when
+    // comparing prefetch depths. Disabled prefetch returns its slots to cache.
+    impl->cache_slots = memory.cache_slots + memory.prefetch - prefetch;
+    // Explicit local experiments may exceed the budget-derived slot estimate.
+    if (benchmark_cache_slots != -1) {
+        impl->cache_slots = benchmark_cache_slots;
+    }
+    if (impl->cache_slots < 8) {
+        throw std::invalid_argument("Benchmark prefetch leaves fewer than 8 expert cache slots");
     }
     p.model.path = model;
     p.moe_experts = experts;
     p.moe_slot_bank = memory.bank;
     p.n_ctx = 2048;
     p.n_batch = memory.batch;
-    p.n_ubatch = memory.batch;
+    p.n_ubatch = benchmark_ubatch;
     p.n_ctx_checkpoints = 1;
     p.n_parallel = 1;
     p.n_gpu_layers = 99;
@@ -127,11 +158,13 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
         std::ifstream draft(p.speculative.draft.mparams.path, std::ios::binary);
         if (!draft) throw std::runtime_error("Missing Q8_0 DSpark draft: " + p.speculative.draft.mparams.path);
     }
-    setenv("LLAMA_MOE_DECODE_WINDOW", std::to_string(memory.cache_slots).c_str(), 1);
+    setenv("LLAMA_MOE_DECODE_WINDOW", std::to_string(impl->cache_slots).c_str(), 1);
     unsetenv("LLAMA_MOE_LAYER_WINDOWS");
-    setenv("LLAMA_MOE_IO_THREADS", "4", 1);
-    setenv("LLAMA_MOE_LOOKAHEAD_PREFETCH", "1", 1);
-    setenv("LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH", std::to_string(memory.prefetch).c_str(), 1);
+    setenv("LLAMA_MOE_IO_THREADS", std::to_string(io_threads).c_str(), 1);
+    setenv("LLAMA_MOE_LOOKAHEAD_PREFETCH", prefetch > 0 ? "1" : "0", 1);
+    setenv("LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH", std::to_string(prefetch).c_str(), 1);
+    LOGi("MiniCPM47 expert configuration: cache=%d prefetch=%d io_threads=%d",
+         impl->cache_slots, prefetch, io_threads);
     setenv("LLAMA_MOE_PREFILL_WARM_ROWS", "0", 1);
     setenv("LLAMA_MOE_PREFETCH_MAX_ROWS", "8", 1);
     setenv("LLAMA_MOE_PREFILL_SORT_READS", "1", 1);
@@ -146,17 +179,22 @@ MiniCPM47Runtime::~MiniCPM47Runtime() {
     if (impl->worker.joinable()) impl->worker.join();
 }
 
-void MiniCPM47Runtime::setVisionPath(const std::string & path) { impl->params.mmproj.path = path; }
+void MiniCPM47Runtime::setVisionPath(const std::string & path) {
+    impl->vision_path = path;
+    if (impl->benchmark_eager_mmproj) impl->params.mmproj.path = path;
+}
 
 bool MiniCPM47Runtime::start() {
     common_log_set_file(common_log_main(), (impl->directory + "/runtime.log").c_str());
     common_log_set_timestamps(common_log_main(), true);
     impl->server = std::make_unique<server_context>();
+    LOGi("MiniCPM47 mmproj: %s", impl->params.mmproj.path.empty() ? "deferred until image input" : "loading");
     LOGi("MiniCPM47 runtime: vision=%s dspark=%d bank=%d batch=%d n_max=%d budget=%dMB cache=%d temp=0 seed=42",
          impl->vision_htp ? "HTP" : "CPU", impl->dspark, impl->params.moe_slot_bank,
          impl->params.n_batch, impl->params.speculative.draft.n_max,
          impl->memory_budget_mb, impl->cache_slots);
     if (!impl->server->load_model(impl->params)) return false;
+    impl->vision_loaded = !impl->params.mmproj.path.empty();
     impl->worker = std::thread([this] {
         try {
             impl->server->start_loop();
@@ -187,6 +225,33 @@ void MiniCPM47Runtime::addImage(const uint8_t * data, size_t size) {
 void MiniCPM47Runtime::submit(const std::string & text, int n_predict) {
     impl->check_worker();
     if (impl->reader) throw std::runtime_error("A completion is already active");
+    if (!impl->files.empty() && !impl->vision_loaded) {
+        if (impl->vision_path.empty()) {
+            throw std::runtime_error("Image input requires an mmproj model");
+        }
+        std::ifstream projector(impl->vision_path, std::ios::binary);
+        if (!projector) {
+            throw std::runtime_error("Missing mmproj model: " + impl->vision_path);
+        }
+        // Multimodal slots, positions and DSpark state are initialized together
+        // by server_context. Recreate them before submitting any image tokens.
+        // Release the text runtime first so two target/draft models never coexist.
+        LOGi("MiniCPM47 first image: switching to vision runtime; preserving chat history");
+        impl->server->terminate();
+        if (impl->worker.joinable()) impl->worker.join();
+        impl->server.reset();
+        impl->cache_prompt = false;
+        impl->params.mmproj.path = impl->vision_path;
+        try {
+            if (!start()) throw std::runtime_error("Failed to load vision runtime");
+        } catch (const std::exception & e) {
+            impl->fail_worker(e.what());
+            throw;
+        } catch (...) {
+            impl->fail_worker("Failed to load vision runtime");
+            throw;
+        }
+    }
     common_chat_msg msg;
     msg.role = "user";
     msg.content = impl->pending_media + text;

@@ -3416,7 +3416,17 @@ private:
                 }
             }
             llama_set_moe_prefill_final(ctx_tgt, final_prefill);
+            const char * profile_target_env = getenv("LLAMA_PROFILE_TARGET");
+            const bool profile_target = profile_target_env && strcmp(profile_target_env, "1") == 0;
+            const int64_t target_start = profile_target ? ggml_time_us() : 0;
             const int ret = llama_decode(ctx_tgt, batch_view);
+            if (profile_target) {
+                // Diagnostic synchronization makes this inclusive of completed
+                // device work. Do not use this run for normal throughput claims.
+                llama_synchronize(ctx_tgt);
+                SRV_INF("profile-target tokens=%d wall_us=%lld ret=%d\n", batch_view.n_tokens,
+                        (long long) (ggml_time_us() - target_start), ret);
+            }
             llama_set_moe_prefill_final(ctx_tgt, false);
 
             metrics.on_decoded(slots);
