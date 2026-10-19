@@ -85,6 +85,9 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
     int benchmark_ubatch = memory.batch;
     const auto dir = model.substr(0, model.find_last_of('/'));
     impl->directory = dir;
+    int cfg_draft_n_max = -1;
+    int cfg_bank        = 0;
+    int cfg_batch       = 0;
     // Optional local benchmark overrides. Normal use defaults to HTP + DSpark.
     std::ifstream config_file(dir + "/runtime.json");
     if (config_file) {
@@ -94,6 +97,9 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
         impl->label = config.value("label", std::string());
         impl->benchmark_max_tokens = config.value("max_tokens", 0);
         impl->benchmark_eager_mmproj = config.value("eager_mmproj", true);
+        cfg_draft_n_max = config.value("draft_n_max", -1);
+        cfg_bank        = config.value("moe_slot_bank", 0);
+        cfg_batch       = config.value("batch", 0);
         prefetch = config.value("prefetch", prefetch);
         io_threads = config.value("io_threads", io_threads);
         benchmark_cache_slots = config.value("cache_slots", -1);
@@ -120,9 +126,9 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
     }
     p.model.path = model;
     p.moe_experts = experts;
-    p.moe_slot_bank = memory.bank;
+    p.moe_slot_bank = cfg_bank > 0 ? cfg_bank : memory.bank;
     p.n_ctx = 2048;
-    p.n_batch = memory.batch;
+    p.n_batch = cfg_batch > 0 ? cfg_batch : memory.batch;
     p.n_ubatch = benchmark_ubatch;
     p.n_ctx_checkpoints = 1;
     p.n_parallel = 1;
@@ -210,7 +216,10 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
             p.speculative.draft.mparams.path = draft_path;
             p.speculative.draft.n_gpu_layers = 99;
             p.speculative.draft.devices = p.devices;
-            p.speculative.draft.n_max = memory.draft;
+            // DFlash is fastest at n_max=5; DSpark keeps the memory-config value.
+            const int default_n_max = spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH
+                ? 5 : memory.draft;
+            p.speculative.draft.n_max = cfg_draft_n_max > 0 ? cfg_draft_n_max : default_n_max;
             p.speculative.draft.cpuparams.n_threads = p.speculative.draft.cpuparams_batch.n_threads = 4;
             LOGi("MiniCPM47 runtime: draft = %s", draft_path.c_str());
         }

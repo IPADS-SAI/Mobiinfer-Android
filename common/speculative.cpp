@@ -946,7 +946,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const char * value = std::getenv("LLAMA_DSPARK_MEDIA_FEATURES");
             return value && *value && *value != '0';
         }();
-        const bool media_features = is_dspark && media_features_enabled &&
+        // A vision model with mmproj prefills even text prompts as one embedding
+        // batch ("route A"). DFlash must process those too, otherwise its KV is
+        // never populated during prefill (ctx_dft pos_max == -1) and drafting
+        // degrades / llama_decode fails. The injection logic below only uses
+        // media_features to pick the M-RoPE position rows, so it is valid for
+        // both DFlash and DSpark.
+        const bool media_features = media_features_enabled &&
             batch_in.token == nullptr && batch_in.embd != nullptr;
         if (!media_features && (batch_in.token == nullptr || batch_in.embd != nullptr)) {
             return true;
