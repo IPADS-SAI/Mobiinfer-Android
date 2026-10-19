@@ -85,7 +85,7 @@
                                 android:layout_height="wrap_content"
                                 android:ellipsize="end"
                                 android:maxLines="1"
-                                android:maxWidth="200dp"
+                                android:maxWidth="160dp"
                                 android:textColor="?attr/colorOnSurfaceVariant"
                                 android:textSize="11sp" />
                         </LinearLayout>
@@ -95,6 +95,17 @@
                             android:layout_height="wrap_content"
                             android:layout_gravity="end|center_vertical"
                             android:orientation="horizontal">
+
+                            <TextView
+                                android:id="@+id/btn_language"
+                                android:layout_width="40dp"
+                                android:layout_height="40dp"
+                                android:gravity="center"
+                                android:text="中/EN"
+                                android:textSize="11sp"
+                                android:textColor="?attr/colorOnSurfaceVariant"
+                                android:background="?attr/selectableItemBackgroundBorderless"
+                                android:contentDescription="@string/settings_language" />
 
                             <ImageButton
                                 android:id="@+id/btn_model_select"

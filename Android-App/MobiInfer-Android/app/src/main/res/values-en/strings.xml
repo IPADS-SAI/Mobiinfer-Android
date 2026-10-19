@@ -12,7 +12,8 @@
 
     <string name="welcome_desc">I can help you learn, get inspired, and work faster — and I can also understand images for you.</string>
     <string name="welcome_desc_text">I can help you learn, get inspired, and work faster — ask me anything.</string>
-    <string name="suggestion_1">Tell me about Shanghai Jiao Tong University</string>
+    <string name="suggestion_1">Python Fibonacci sequence</string>
+    <string name="suggestion_1_prompt">Write a Python function that returns the first n terms of the Fibonacci sequence. Include clear comments and an example call.</string>
     <string name="suggestion_2">What is in this picture?</string>
     <string name="suggestion_1_text">What is artificial intelligence?</string>
     <string name="suggestion_2_text">Write a short poem about spring.</string>

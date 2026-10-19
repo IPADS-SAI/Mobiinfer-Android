@@ -365,6 +365,22 @@ class MainActivity : AppCompatActivity() {
             engine.setEnableThinking(next)
             refreshThinkButton()
         }
+        findViewById<View>(R.id.btn_language).setOnClickListener {
+            val languages = LocaleManager.AppLanguage.entries
+            AlertDialog.Builder(this)
+                .setTitle(R.string.language_picker_title)
+                .setSingleChoiceItems(
+                    languages.map { it.displayName }.toTypedArray(),
+                    languages.indexOf(LocaleManager.currentLanguage(this))
+                ) { dialog, which ->
+                    dialog.dismiss()
+                    if (languages[which] != LocaleManager.currentLanguage(this)) {
+                        isLocaleRestart = true
+                        LocaleManager.setLanguageAndRestart(this, languages[which])
+                    }
+                }
+                .show()
+        }
         btnSend.setOnClickListener { handleUserInput() }
         findViewById<ImageButton>(R.id.btn_model_select).setOnClickListener { showModelSelector() }
         btnModelManager.setOnClickListener {
