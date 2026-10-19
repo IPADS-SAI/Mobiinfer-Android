@@ -442,6 +442,19 @@ class LlamaEngine private constructor(
             /** Emit an informational message at the current overall offset. */
             fun message(text: String) = emit(DownloadProgress(text, completedBytes, grandTotal))
 
+            /** A file was already complete on disk: add it to progress, not to network speed. */
+            fun fileSkipped(bytes: Long) {
+                completedBytes += bytes
+                lastSampleTime = 0L
+                overall(0L)
+            }
+
+            /** We are resuming an on-disk `.tmp`: exclude its prefix from network speed. */
+            fun resuming(resumeFrom: Long) {
+                lastSampleTime = 0L
+                overall(resumeFrom)
+            }
+
             /** Emit ongoing progress: [downloadedInFile] bytes into the current file. */
             fun overall(downloadedInFile: Long) {
                 val done = completedBytes + downloadedInFile
@@ -450,8 +463,10 @@ class LlamaEngine private constructor(
                     val dtMs = now - lastSampleTime
                     if (dtMs > 0L) {
                         val inst = (done - lastSampleBytes).toDouble() * 1000.0 / dtMs
-                        smoothedBytesPerSec =
-                            if (smoothedBytesPerSec <= 0.0) inst else smoothedBytesPerSec * 0.7 + inst * 0.3
+                        if (inst >= 0.0) {
+                            smoothedBytesPerSec =
+                                if (smoothedBytesPerSec <= 0.0) inst else smoothedBytesPerSec * 0.7 + inst * 0.3
+                        }
                     }
                 }
                 lastSampleTime = now
@@ -461,7 +476,28 @@ class LlamaEngine private constructor(
                     ((done * 100L) / grandTotal).toInt().coerceIn(0, 100)
                 } else 0
                 val mbPerSec = smoothedBytesPerSec / (1024.0 * 1024.0)
-                emit(DownloadProgress(context.getString(R.string.download_overall_progress, pct, mbPerSec), done, grandTotal))
+                val remaining = (grandTotal - done).coerceAtLeast(0L)
+                val etaText = if (smoothedBytesPerSec > 1024.0) {
+                    formatEta((remaining / smoothedBytesPerSec).toLong())
+                } else {
+                    context.getString(R.string.eta_unknown)
+                }
+                emit(DownloadProgress(
+                    context.getString(R.string.download_overall_progress, pct, mbPerSec, etaText),
+                    done,
+                    grandTotal
+                ))
+            }
+
+            private fun formatEta(totalSec: Long): String {
+                val h = totalSec / 3600
+                val m = (totalSec % 3600) / 60
+                val sec = totalSec % 60
+                return when {
+                    h > 0 -> context.getString(R.string.eta_hours_minutes, h, m)
+                    m > 0 -> context.getString(R.string.eta_minutes_seconds, m, sec)
+                    else -> context.getString(R.string.eta_seconds, sec)
+                }
             }
 
             /** Record a file that finished (or was already present) on disk. */
@@ -653,7 +689,7 @@ class LlamaEngine private constructor(
             ) {
                 sink.message(context.getString(R.string.download_verifying_existing, fileName))
                 if (matchesExpectation(targetFile, expectedMd5, expectedSha256, expectedBytes)) {
-                    sink.fileFinished(targetFile.length())
+                    sink.fileSkipped(targetFile.length())
                     sink.message(context.getString(R.string.download_file_ready, fileName))
                     Log.i(TAG, "$fileName already present and matches expectation, skipping download")
                     if (tmpFile.exists()) tmpFile.delete()
@@ -793,6 +829,7 @@ class LlamaEngine private constructor(
                         Log.w(TAG, "$fileName: server returned 200 instead of 206; restarting from 0")
                         if (tmpFile.exists()) tmpFile.delete()
                     }
+                    sink.resuming(effectiveStart)
 
                     conn.inputStream.use { input ->
                         FileOutputStream(tmpFile, acceptedResume && resumeFrom > 0).use { output ->
@@ -874,7 +911,7 @@ class LlamaEngine private constructor(
             ) {
                 sink.message(context.getString(R.string.download_verifying_existing_src, source, fileName))
                 if (matchesExpectation(targetFile, expectedMd5, expectedSha256, expectedBytes)) {
-                    sink.fileFinished(targetFile.length())
+                    sink.fileSkipped(targetFile.length())
                     sink.message(context.getString(R.string.download_file_ready, fileName))
                     Log.i(TAG, "$fileName already present and matches expectation, skipping download")
                     // Stale .tmp from an even older interrupted attempt - drop it.
@@ -941,6 +978,7 @@ class LlamaEngine private constructor(
                     }
 
                     val effectiveStart = if (acceptedResume) resumeFrom else 0L
+                    sink.resuming(effectiveStart)
                     val remaining = conn.contentLength.toLong() // -1 if unknown
                     val totalSize = if (remaining > 0) remaining + effectiveStart else -1L
 
@@ -1271,12 +1309,16 @@ class LlamaEngine private constructor(
                 val modelInfo = getSelectedModel(context)
                 val missingExpert = missingExpertFile(context, modelInfo)
                 require(missingExpert == null) { "Missing or unreadable expert file: $missingExpert" }
+                // Experts live under the per-model root (not necessarily next to
+                // the GGUF, which may be in a `models/` subdirectory), and only
+                // vision models require an mmproj; text-only MoE bundles (e.g.
+                // Qwen3.5) must not be forced to have one.
                 val expertsPath = modelInfo.expertsDirectory?.let {
-                    File(File(pathToModel).parentFile, it).absolutePath
+                    File(modelDirFor(context, modelInfo), it).absolutePath
                 }
-                if (expertsPath != null) {
+                if (modelInfo.mmprojFileName != null) {
                     require(pathToMmproj != null && File(pathToMmproj).canRead()) {
-                        "MiniCPM-V 4.7 vision weights are missing or unreadable"
+                        "${modelInfo.displayName} vision weights are missing or unreadable"
                     }
                 }
                 load(pathToModel, expertsPath, getMemoryBudgetMb(context)).let {
@@ -1295,7 +1337,7 @@ class LlamaEngine private constructor(
                     Log.i(TAG, "Loading mmproj (image_max_slice_nums=$sliceCap)... \n$pathToMmproj")
                     loadMmproj(pathToMmproj, sliceCap).let {
                         if (it != 0) {
-                            if (expertsPath != null) throw RuntimeException("Failed to load MiniCPM-V 4.7 vision weights (code: $it)")
+                            if (modelInfo.mmprojFileName != null) throw RuntimeException("Failed to load ${modelInfo.displayName} vision weights (code: $it)")
                             Log.w(TAG, "Failed to load mmproj (code: $it), continuing without vision support")
                         } else {
                             _mmprojLoaded = true

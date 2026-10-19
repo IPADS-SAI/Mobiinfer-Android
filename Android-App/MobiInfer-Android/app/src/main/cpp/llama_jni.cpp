@@ -1029,6 +1029,181 @@ Java_com_mobiinfer_demo_LlamaEngine_processUserPrompt(
     return 0;
 }
 
+
+// ---------------------------------------------------------------------------
+// Generic (non-MoE / mtmd) conversation restore.
+//
+// The MoE runtime keeps an in-memory message list and can swap it wholesale.
+// The generic path instead has to replay the saved turns into the KV cache,
+// re-encoding images through mtmd, so follow-up turns keep both text and image
+// context (otherwise a reopened image chat answers as if the image was never
+// there).
+// ---------------------------------------------------------------------------
+
+static int generic_restore_prefill_image(const std::vector<uint8_t> & image) {
+    if (!g_ctx_vision || image.empty()) {
+        return 0;
+    }
+
+    auto * bitmap = mtmd_helper_bitmap_init_from_buf(
+        g_ctx_vision, image.data(), image.size());
+    if (!bitmap) {
+        return 3;
+    }
+
+    mtmd_input_text text;
+    // Open the user turn once, before its first image; keep it open for text.
+    const std::string image_prompt =
+        std::string(!g_image_prefilled ? "<|im_start|>user\n" : "") + mtmd_default_marker();
+    text.text          = image_prompt.c_str();
+    text.add_special   = current_position == 0;
+    text.parse_special = true;
+
+    mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+    const mtmd_bitmap * bitmaps_cptr[] = { bitmap };
+    int32_t res = mtmd_tokenize(g_ctx_vision, chunks, &text, bitmaps_cptr, 1);
+    mtmd_bitmap_free(bitmap);
+    if (res != 0) {
+        mtmd_input_chunks_free(chunks);
+        return 4;
+    }
+
+    llama_pos new_n_past;
+    if (mtmd_helper_eval_chunks(g_ctx_vision, g_context, chunks,
+                                current_position, 0, g_batch_size, false, &new_n_past)) {
+        mtmd_input_chunks_free(chunks);
+        return 5;
+    }
+    current_position = new_n_past;
+    mtmd_input_chunks_free(chunks);
+    g_image_prefilled = true;
+    g_vision_mode = true;
+    return 0;
+}
+
+static int generic_restore_eval_text(const std::string & formatted) {
+    if (formatted.empty()) {
+        return 0;
+    }
+    if (g_ctx_vision) {
+        mtmd_input_text text;
+        text.text          = formatted.c_str();
+        text.add_special   = current_position == 0;
+        text.parse_special = true;
+
+        mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+        int32_t res = mtmd_tokenize(g_ctx_vision, chunks, &text, nullptr, 0);
+        if (res != 0) {
+            mtmd_input_chunks_free(chunks);
+            return 2;
+        }
+        llama_pos new_n_past;
+        if (mtmd_helper_eval_chunks(g_ctx_vision, g_context, chunks,
+                                    current_position, 0, g_batch_size, false, &new_n_past)) {
+            mtmd_input_chunks_free(chunks);
+            return 2;
+        }
+        current_position = new_n_past;
+        mtmd_input_chunks_free(chunks);
+    } else {
+        auto tokens = common_tokenize(g_context, formatted, current_position == 0, true);
+        const int max_batch_size = g_n_ctx - OVERFLOW_HEADROOM;
+        if ((int) tokens.size() > max_batch_size) {
+            tokens.resize(max_batch_size);
+        }
+        if (decode_tokens_in_batches(g_context, g_batch, tokens, current_position, false)) {
+            return 2;
+        }
+        current_position += (int) tokens.size();
+    }
+    return 0;
+}
+
+static int generic_restore(const std::vector<RestoreTurn> & turns) {
+    if (!g_context) {
+        LOGe("%s: context not initialised", __func__);
+        return 2;
+    }
+    if (!g_ctx_vision && !g_chat_templates) {
+        LOGe("%s: chat templates not initialised", __func__);
+        return 2;
+    }
+    reset_long_term_states();
+
+    for (const auto & turn : turns) {
+        if (turn.role == ROLE_USER) {
+            for (const auto & image : turn.images) {
+                const int ir = generic_restore_prefill_image(image);
+                if (ir != 0) {
+                    LOGe("%s: image prefill failed (%d)", __func__, ir);
+                    return ir;
+                }
+            }
+
+            const std::string content = turn.text.empty() ? " " : turn.text;
+            std::string formatted;
+            if (g_ctx_vision) {
+                if (!g_image_prefilled) {
+                    formatted += "<|im_start|>user\n";
+                }
+                formatted += content + "<|im_end|>\n";
+                formatted += assistant_turn_prefix();
+
+                common_chat_msg msg;
+                msg.role = ROLE_USER;
+                msg.content = content;
+                chat_msgs.push_back(msg);
+                g_image_prefilled = false;
+            } else {
+                const bool has_tmpl = common_chat_templates_was_explicit(g_chat_templates.get());
+                formatted = has_tmpl ? chat_add_and_format(ROLE_USER, content.c_str()) : content;
+                apply_minicpm5_thinking_suffix(formatted);
+            }
+            if (generic_restore_eval_text(formatted) != 0) {
+                return 2;
+            }
+        } else if (turn.role == ROLE_ASSISTANT) {
+            if (turn.text.empty()) {
+                continue;
+            }
+            std::string formatted;
+            if (g_ctx_vision) {
+                // The assistant header was already emitted by the user turn; the
+                // reply must be closed with <|im_end|> so the turn boundary is
+                // complete (the live path decodes the EOG token too).
+                formatted = turn.text + "<|im_end|>\n";
+                common_chat_msg msg;
+                msg.role = ROLE_ASSISTANT;
+                msg.content = turn.text;
+                chat_msgs.push_back(msg);
+            } else {
+                const bool has_tmpl = common_chat_templates_was_explicit(g_chat_templates.get());
+                formatted = has_tmpl ? chat_add_and_format(ROLE_ASSISTANT, turn.text.c_str()) : turn.text;
+            }
+            if (generic_restore_eval_text(formatted) != 0) {
+                return 2;
+            }
+        } else if (turn.role == ROLE_SYSTEM) {
+            std::string formatted = turn.text;
+            if (common_chat_templates_was_explicit(g_chat_templates.get())) {
+                formatted = chat_add_and_format(ROLE_SYSTEM, turn.text.c_str());
+            }
+            if (generic_restore_eval_text(formatted) != 0) {
+                return 2;
+            }
+            system_prompt_position = current_position;
+        }
+    }
+
+    reset_short_term_states();
+    g_image_prefilled = false;
+    generation_start_position = current_position;
+    stop_generation_position = current_position;
+    LOGi("%s: replayed %d turns into the generic context, position %d",
+         __func__, (int) turns.size(), current_position);
+    return 0;
+}
+
 extern "C"
 JNIEXPORT jint JNICALL
 Java_com_mobiinfer_demo_LlamaEngine_restoreHistory(
@@ -1039,15 +1214,6 @@ Java_com_mobiinfer_demo_LlamaEngine_restoreHistory(
         jintArray jimage_counts,
         jobjectArray jimages
 ) {
-    if (!g_moe_runtime) {
-        // Only the MiniCPM-V 4.7 (MoE) runtime keeps an in-memory chat history
-        // that can be swapped wholesale. The generic llama.cpp path has no
-        // equivalent hook, so restoring there is a no-op: the conversation is
-        // still shown, just without KV-context continuity.
-        LOGw("%s: restore not supported for this model, ignoring", __func__);
-        return 0;
-    }
-
     const jsize turns_n  = env->GetArrayLength(jroles);
     const jsize images_n = jimages ? env->GetArrayLength(jimages) : 0;
     jint * counts = jimage_counts ? env->GetIntArrayElements(jimage_counts, nullptr) : nullptr;
@@ -1089,11 +1255,27 @@ Java_com_mobiinfer_demo_LlamaEngine_restoreHistory(
     }
     if (counts) env->ReleaseIntArrayElements(jimage_counts, counts, JNI_ABORT);
 
-    try {
-        g_moe_runtime->restore(turns);
-    } catch (const std::exception & e) {
-        env->ThrowNew(env->FindClass("java/lang/RuntimeException"), e.what());
-        return 2;
+    if (g_moe_runtime) {
+        try {
+            g_moe_runtime->restore(turns);
+        } catch (const std::exception & e) {
+            env->ThrowNew(env->FindClass("java/lang/RuntimeException"), e.what());
+            return 2;
+        }
+    } else {
+        int restore_rc = 0;
+        try {
+            restore_rc = generic_restore(turns);
+        } catch (const std::exception & e) {
+            // A C++ exception must never cross the JNI boundary (std::terminate).
+            env->ThrowNew(env->FindClass("java/lang/RuntimeException"), e.what());
+            return 2;
+        }
+        if (restore_rc != 0) {
+            env->ThrowNew(env->FindClass("java/lang/RuntimeException"),
+                          "Failed to restore conversation for this model");
+            return 3;
+        }
     }
     LOGi("%s: restored %d turns", __func__, (int) turns.size());
     return 0;
