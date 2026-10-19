@@ -185,7 +185,7 @@
                         android:layout_height="wrap_content"
                         android:contentDescription="@string/memory_budget_title"
                         android:value="8.0"
-                        android:valueFrom="5.5"
+                        android:valueFrom="5.2"
                         android:valueTo="8.0"
                         android:stepSize="0.1"
                         app:tickVisible="true" />

@@ -78,7 +78,8 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
     int prefetch = memory.prefetch;
     int io_threads = 4;
     int benchmark_cache_slots = -1;
-    int benchmark_ubatch = memory.batch;
+    int benchmark_ubatch = memory.ubatch;
+    int benchmark_bank = memory.bank;
     const auto dir = model.substr(0, model.find_last_of('/'));
     impl->directory = dir;
     // Optional local benchmark overrides. Normal use defaults to HTP + DSpark.
@@ -94,6 +95,10 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
         io_threads = config.value("io_threads", io_threads);
         benchmark_cache_slots = config.value("cache_slots", -1);
         benchmark_ubatch = config.value("ubatch", benchmark_ubatch);
+        benchmark_bank = config.value("bank", benchmark_bank);
+        if (benchmark_bank < 8 || benchmark_bank > 256) {
+            throw std::invalid_argument("Benchmark bank must be 8..256");
+        }
         if (benchmark_ubatch < 1 || benchmark_ubatch > memory.batch) {
             throw std::invalid_argument("Benchmark ubatch must be 1..batch");
         }
@@ -103,6 +108,12 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
         if (prefetch < 0 || prefetch > 16 || io_threads < 1 || io_threads > 8) {
             throw std::invalid_argument("Benchmark prefetch must be 0..16 and io_threads 1..8");
         }
+    }
+    if (benchmark_bank < 256 && benchmark_ubatch > benchmark_bank / 8) {
+        throw std::invalid_argument("MiniCPM47 ubatch exceeds the expert bank capacity");
+    }
+    if (impl->dspark && benchmark_ubatch < memory.draft + 1) {
+        throw std::invalid_argument("MiniCPM47 DSpark requires ubatch >= draft length + 1");
     }
     // Keep the total decode window within the selected memory budget when
     // comparing prefetch depths. Disabled prefetch returns its slots to cache.
@@ -116,7 +127,7 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
     }
     p.model.path = model;
     p.moe_experts = experts;
-    p.moe_slot_bank = memory.bank;
+    p.moe_slot_bank = benchmark_bank;
     p.n_ctx = 2048;
     p.n_batch = memory.batch;
     p.n_ubatch = benchmark_ubatch;
@@ -189,9 +200,9 @@ bool MiniCPM47Runtime::start() {
     common_log_set_timestamps(common_log_main(), true);
     impl->server = std::make_unique<server_context>();
     LOGi("MiniCPM47 mmproj: %s", impl->params.mmproj.path.empty() ? "deferred until image input" : "loading");
-    LOGi("MiniCPM47 runtime: vision=%s dspark=%d bank=%d batch=%d n_max=%d budget=%dMB cache=%d temp=0 seed=42",
+    LOGi("MiniCPM47 runtime: vision=%s dspark=%d bank=%d batch=%d ubatch=%d n_max=%d budget=%dMB cache=%d temp=0 seed=42",
          impl->vision_htp ? "HTP" : "CPU", impl->dspark, impl->params.moe_slot_bank,
-         impl->params.n_batch, impl->params.speculative.draft.n_max,
+         impl->params.n_batch, impl->params.n_ubatch, impl->params.speculative.draft.n_max,
          impl->memory_budget_mb, impl->cache_slots);
     if (!impl->server->load_model(impl->params)) return false;
     impl->vision_loaded = !impl->params.mmproj.path.empty();
