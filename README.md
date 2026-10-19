@@ -75,7 +75,6 @@ Android 应用（[`Android-App/`](Android-App/README.md)，基于 [OpenBMB/MiniC
 | MiniCPM-V 4.7 35B-A3B| Q3 LES + DSpark| 8 Elite | 512 | 94.28 | 13.65 |
 | Qwen3-VL-4B-Instruct | Q4_K_M | 8 Elite | 512 | 1013.74 | 18.13 |
 
-MiniCPM 两行为 App 数据：短 prompt 使用「Python 斐波那契数列」示例，未加载 mmproj；512-token 数据为[连续五轮的中位数](docs/app-chunk512-five-runs-20261017.md)，加载 mmproj。Qwen3 为 CLI 数据。
 
 
 ---

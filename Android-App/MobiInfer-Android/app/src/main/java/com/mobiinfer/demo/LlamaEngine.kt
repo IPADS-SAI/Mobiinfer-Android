@@ -82,7 +82,7 @@ class LlamaEngine private constructor(
         private const val KEY_IMAGE_MAX_SLICE = "image_max_slice_nums"
         private const val KEY_IMAGE_SCALE_FACTOR = "image_scale_factor"
         private const val KEY_MEMORY_BUDGET_MB = "minicpm47_memory_budget_v2_mb"
-        const val MIN_MEMORY_BUDGET_MB = 5500
+        const val MIN_MEMORY_BUDGET_MB = 5200
         const val MAX_MEMORY_BUDGET_MB = 8000
 
         fun getMemoryBudgetMb(context: Context): Int = prefs(context)

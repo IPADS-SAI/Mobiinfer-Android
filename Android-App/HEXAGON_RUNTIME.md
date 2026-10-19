@@ -1,48 +1,51 @@
 # MiniCPM-V 4.7 Hexagon runtime notes
 
-Status: experimental, 2026-10-16. Final defaults are still under phone validation.
+Status: experimental, memory mapping recalibrated on OnePlus 13 on 2026-10-19.
 Bundle: tiled mixed-Q3 experts, Q8 DSpark, real F16 pad4320 vision projector,
 HTP0/HTP1, context 2048, top-8 routing. These estimates do not apply to arbitrary GGUF files.
 
 ## Memory setting
 
-The persistent model-manager preference accepts 5.5–6.0 decimal GB in 0.1 GB steps.
-Changes apply on the next model load. JNI passes the budget to the runtime constructor
-before allocation. `minicpm47_memory.h` owns the mapping:
+The model-manager preference accepts 5.2–8.0 decimal GB in 0.1 GB steps.
+Changes apply on the next model load. `minicpm47_memory.h` owns the mapping;
+Kotlin and the slider use the same endpoints. The selected value is an estimated
+budget, not an allocator-enforced process limit.
+
+The prefill bank and microbatch now decrease with the budget, as well as the
+expert cache.
+Batch remains 512, context 2048, DSpark draft length 3, and mmproj loads eagerly.
+
+| Budget GB | Prefill bank | Ubatch | Prefetch depth | Fixed estimate GB |
+| --- | ---: | ---: | ---: | ---: |
+| 5.2–5.8 | 32 | 4 | 0 | 4.65 |
+| 5.9–6.4 | 128 | 16 | 4 | 5.05 |
+| 6.5–8.0 | 256 | 128 | 4 | 5.70 |
 
 ```
-total_slots = floor((budget_MB * 1,000,000 - 4,740,000,000) / 62,914,560)
-cache_slots = total_slots - 4
+total_slots = floor((budget_MB * 1,000,000 - fixed_bytes) / 62,914,560)
+cache_slots = total_slots - prefetch_depth
 ```
 
-One expert occupies 1,572,864 bytes in one layer; one slot across all 40 layers
-costs 62,914,560 bytes. Four slots per layer reserve asynchronous prefetch capacity.
-The resulting demand-cache capacities at 5.5/5.6/5.7/5.8/5.9/6.0 GB are
-8/9/11/12/14/16. This is a quantized linear mapping, not an allocator-enforced cap.
-The fixed term includes a measured baseline plus reserve; a model change requires
-recalibration. Context checkpoints are limited to one to avoid history-driven growth.
+One expert slot is 1,572,864 bytes per layer, or 62,914,560 bytes across 40 layers.
+The fixed estimates include resident weights, Q8 draft, eager vision, context,
+profile-specific graph/bank reservations and a margin for UI/variation. At
+5.2/6.0/8.0 GB, demand cache capacities are 8/11/32 and prefetch depths are 0/4/4.
+At a profile boundary, a larger prefill bank/ubatch trades off against cache
+capacity; increasing the budget need not increase the slot count at that step.
+These estimates apply only to this model bundle. They do not cover arbitrary
+context sizes, image resolutions, other models or unlimited conversation history.
 
-Candidate configuration: prefill bank 128 per HTP backend, batch/ubatch 16,
-DSpark draft length 1, IO workers 8. A bank is shared by layers on its backend;
-two devices therefore allocate two banks. A 128-expert bank is 192 MiB per device.
-Static hot-expert prewarming is disabled by default.
+DSpark draft3 needs ubatch>=4. A smaller bank must fit the worst-case top-8 expert
+union for its microbatch. Invalid local benchmark overrides fail before inference
+instead of triggering the non-causal-attention assertion observed with ubatch1.
 
-Phone memory sampling uses unique process FD DMA objects (deduplicated by inode)
-plus full process PSS every 0.5 s. Their sum is a conservative upper bound because
-mapped DMA pages may also appear in PSS. Sampling can miss short peaks and excludes
-Java/UI when running the standalone native probe. It is not physical flash usage
-or a hard guarantee of a 6 GB maximum.
-
-The original CLI-calibrated 20-cache-slot candidate measured 5.737–5.739 GB during
-two image/256-token runs, but the actual packaged App native libraries reached
-6.047 GB over text, three images, cancellation, error and recovery. That candidate
-was rejected. The mapping was reduced to at most 16 cache slots. Two repeats at
-each revised endpoint, retaining conversation history through three image requests,
-passed with sampled upper bounds 5.744/5.744 GB at 6 GB and 5.241/5.240 GB at
-5.5 GB. Both runs also passed cancellation/error recovery. This leaves about
-256 MB at the upper endpoint for Java/UI and variation; actual UI-process peaks
-and all context-length extremes have not been validated. The setting is a budget
-estimate and does not implement a strict whole-process allocation cap.
+Phone memory sampling records smaps_rollup RSS/PSS and DMA objects exposed by
+process fdinfo, deduplicated by inode. RSS alone misses most HTP buffers. Their
+simultaneous PSS+DMA sum is a conservative estimate for observed resources:
+mapped DMA pages may be counted twice, short peaks can be missed, and driver
+internal allocations and system file cache are not fully included. Native probe
+measurements exclude Java/UI; the estimates retain a reserve rather than claiming
+a strict whole-device physical memory bound.
 
 ## Timings and request lifecycle
 
@@ -53,7 +56,8 @@ uses the request wall clock and includes media preparation once. Failed/cancelle
 requests do not display successful completion rates. The waiting indicator is
 shown before the first output and hidden on output, cancellation or failure.
 
-The packaged native runtime passed phone SSH tests for text, three consecutive
+In the earlier 2026-10-16 measurements, the packaged native runtime passed phone
+SSH tests for text, three consecutive
 image requests, cancellation followed by generation, and oversized-prompt error
 followed by generation. Vision times were 380–407 ms; decode was 11.7–13.1 token/s
 for the short successful requests. These runs used the rejected 20-slot memory
