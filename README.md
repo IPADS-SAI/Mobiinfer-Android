@@ -52,12 +52,13 @@ Android 应用（[`Android-App/`](Android-App/README.md)，基于 [OpenBMB/MiniC
 
 | 模型 / Model | 规模 / Scale | 说明 / Notes |
 |---|---|---|
-| **MiniCPM-V 4.7 35B-A3B** | 35B 总参 / 3B 激活 | 端侧 MoE 主线目标，多模态（视觉 + 文本） |
-| **Qwen3-0.6B** | 0.6B（dense） | `qwen3`，文本 |
-| **Qwen3-1.7B** | 1.7B（dense） | `qwen3`，文本 |
-| **Qwen3-4B** | 4B（dense） | `qwen3`，文本 |
-| **Qwen3-VL-2B** | 2B（dense） | `qwen3vl`，视觉 + 文本 |
-| **Qwen3-VL-4B** | 4B（dense） | `qwen3vl`，视觉 + 文本 |
+| **[MiniCPM-V 4.7 35B-A3B](https://www.modelscope.cn/models/fengerhu1/MiniCPM-V-4.7-35B-A3B-gguf-hexagon)** | 35B 总参 / 3B 激活 | 端侧 MoE 主线目标，多模态（视觉 + 文本） |
+| **[Qwen3.5-35B-A3B](https://www.modelscope.cn/models/fengerhu1/Qwen3.5-35B-A3B-gguf-hexagon)** | 35B 总参 / 3B 激活 | `qwen35moe`，视觉 + 文本，LES + DFlash |
+| **[Qwen3-0.6B](https://www.modelscope.cn/models/Qwen/Qwen3-0.6B-GGUF)** | 0.6B（dense） | `qwen3`，文本 |
+| **[Qwen3-1.7B](https://www.modelscope.cn/models/Qwen/Qwen3-1.7B-GGUF)** | 1.7B（dense） | `qwen3`，文本 |
+| **[Qwen3-4B](https://www.modelscope.cn/models/Qwen/Qwen3-4B-GGUF)** | 4B（dense） | `qwen3`，文本 |
+| **[Qwen3-VL-2B](https://www.modelscope.cn/models/Qwen/Qwen3-VL-2B-Instruct-GGUF)** | 2B（dense） | `qwen3vl`，视觉 + 文本 |
+| **[Qwen3-VL-4B](https://www.modelscope.cn/models/Qwen/Qwen3-VL-4B-Instruct-GGUF)** | 4B（dense） | `qwen3vl`，视觉 + 文本 |
 | DFlash / DSpark 草稿模型 | — | 投机采样（`dflash` / `dspark`） |
 
 模型架构覆盖 `qwen3`/`qwen3moe`/`qwen3next`、`qwen3vl`/`qwen3vlmoe`、`qwen35moe`、`dflash`、`minicpm` 系列，以及 llama.cpp 体系内的其余常见架构。
