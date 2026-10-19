@@ -229,6 +229,7 @@
     <string name="model_running">运行中</string>
     <string name="eta_unknown">计算中…</string>
     <string name="model_desc_qwen35_35b">Qwen3.5 35B-A3B 端侧 MoE 模型；一键下载主模型、DFlash 草稿和 40 层专家</string>
+    <string name="model_desc_qwen3_30b">Qwen3-30B-A3B 端侧 MoE 模型（qwen3moe）；一键下载主模型和 48 层专家</string>
     <string name="eta_hours_minutes">%1$d小时%2$d分钟</string>
     <string name="eta_minutes_seconds">%1$d分%2$d秒</string>
     <string name="eta_seconds">%1$d秒</string>

@@ -58,6 +58,8 @@ data class ModelInfo(
     val mmprojBytes: Long? = null,
     val acousticBytes: Long? = null,
     val expertsDirectory: String? = null,
+    /** Number of tiled expert layer files (`layer_NNN.bin`) in [expertsDirectory]. */
+    val expertsLayerCount: Int = 40,
     /**
      * On-disk name of the DSpark draft GGUF inside a bundle, relative to the
      * per-model directory. Bundle payloads are enumerated by [bundleManifestFile],
@@ -167,6 +169,19 @@ data class ModelInfo(
                 msRepo = "fengerhu1/Qwen3.5-35B-A3B-gguf-hexagon",
                 bundleManifestFile = "SHA256SUMS",
                 totalBytes = 25_064_701_899L
+            ),
+            // Qwen3-30B-A3B (qwen3moe) Hexagon bundle: text-only MoE, no draft and
+            // no mmproj. Same hexagon-tiled-v1 expert layout (48 layers).
+            ModelInfo(
+                id = "qwen3-30b-a3b",
+                displayName = "Qwen3-30B-A3B (Q4_K_M, NPU)",
+                descriptionResName = "model_desc_qwen3_30b",
+                ggufFileName = "models/qwen3-30b-a3b-les-hexagon.gguf",
+                expertsDirectory = "experts-htp-tiled",
+                expertsLayerCount = 48,
+                msRepo = "fengerhu1/Qwen3-30B-A3B-gguf-hexagon",
+                bundleManifestFile = "SHA256SUMS",
+                totalBytes = 20_331_058_440L
             ),
             ModelInfo(
                 id = "minicpm-v-4_7",

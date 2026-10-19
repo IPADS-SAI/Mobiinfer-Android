@@ -88,6 +88,7 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
     impl->directory = dir;
     int cfg_draft_n_max = -1;
     int cfg_batch       = 0;
+    std::string cfg_layer_windows;
     // Optional local benchmark overrides. Normal use defaults to HTP + DSpark.
     std::ifstream config_file(dir + "/runtime.json");
     if (config_file) {
@@ -99,6 +100,7 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
         impl->benchmark_eager_mmproj = config.value("eager_mmproj", true);
         cfg_draft_n_max = config.value("draft_n_max", -1);
         cfg_batch       = config.value("batch", 0);
+        cfg_layer_windows = config.value("layer_windows", std::string());
         prefetch = config.value("prefetch", prefetch);
         io_threads = config.value("io_threads", io_threads);
         benchmark_cache_slots = config.value("cache_slots", -1);
@@ -239,7 +241,15 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
         }
     }
     setenv("LLAMA_MOE_DECODE_WINDOW", std::to_string(impl->cache_slots).c_str(), 1);
-    unsetenv("LLAMA_MOE_LAYER_WINDOWS");
+    // Optional per-layer decode windows ("llama,windows" style: "0:16,1:19,...").
+    // Overrides the uniform DECODE_WINDOW above; needed to reallocate the same
+    // RAM across layers (dispersed early layers need bigger windows than
+    // concentrated late layers).
+    if (!cfg_layer_windows.empty()) {
+        setenv("LLAMA_MOE_LAYER_WINDOWS", cfg_layer_windows.c_str(), 1);
+    } else {
+        unsetenv("LLAMA_MOE_LAYER_WINDOWS");
+    }
     setenv("LLAMA_MOE_IO_THREADS", std::to_string(io_threads).c_str(), 1);
     setenv("LLAMA_MOE_LOOKAHEAD_PREFETCH", prefetch > 0 ? "1" : "0", 1);
     setenv("LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH", std::to_string(prefetch).c_str(), 1);

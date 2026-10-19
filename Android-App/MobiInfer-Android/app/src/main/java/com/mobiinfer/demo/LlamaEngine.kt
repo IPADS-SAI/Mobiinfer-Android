@@ -253,7 +253,7 @@ class LlamaEngine private constructor(
             }
             val name = model.expertsDirectory ?: return null
             val dir = File(modelDirFor(context, model), name)
-            return (listOf(File(dir, "manifest.json")) + (0 until 40).map {
+            return (listOf(File(dir, "manifest.json")) + (0 until model.expertsLayerCount).map {
                 File(dir, "layer_%03d.bin".format(java.util.Locale.ROOT, it))
             }).firstOrNull { !it.isFile || !it.canRead() || it.length() == 0L }
         }
