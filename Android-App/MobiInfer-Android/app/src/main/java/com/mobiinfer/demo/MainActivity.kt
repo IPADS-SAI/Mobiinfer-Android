@@ -68,6 +68,10 @@ class MainActivity : AppCompatActivity() {
     private var pendingRestore = false
     // Throttle for the in-flight streaming checkpoint (see [persistDuringStreaming]).
     private var lastStreamPersistAt = 0L
+    // While the model streams, only keep the list pinned to the bottom when the
+    // user has not scrolled away. Scrolling up disables it until they return to
+    // the bottom (or send a new message).
+    private var autoFollowStreaming = true
 
     private lateinit var engine: LlamaEngine
     private var generationJob: Job? = null
@@ -75,11 +79,12 @@ class MainActivity : AppCompatActivity() {
     private var isImagePrefilled = false
     private var pendingImageProcessingMs: Long? = null
     private var pendingImageQuestion: String? = null
+    // Image/video chosen before the model was ready; processed after it loads.
+    private var pendingMediaUri: Uri? = null
     private var isProcessingVideo = false
     private var hasAutoLoaded = false
     private var loadedModelId: String? = null
     private var pendingPrompt: String? = null
-    private var pendingImageAfterLoad = false
     private var downloadPromptId: Long = -1L
     private var downloadModelId: String? = null
     private var isInlineDownloading = false
@@ -202,16 +207,38 @@ class MainActivity : AppCompatActivity() {
             when {
                 isProcessingVideo ->
                     Toast.makeText(this, R.string.toast_wait_video, Toast.LENGTH_SHORT).show()
-                isModelReady -> {
+                else -> {
+                    // Pick the image first; the model is loaded only after the
+                    // user has chosen a file (see handleSelectedMedia()).
                     pendingImageQuestion = getString(R.string.suggestion_2)
                     getMedia.launch(arrayOf("image/*"))
                 }
-                else -> requestImagePickAfterModel()
             }
         }
 
         recyclerChat.layoutManager = LinearLayoutManager(this)
         recyclerChat.adapter = chatAdapter
+        recyclerChat.addOnScrollListener(object : RecyclerView.OnScrollListener() {
+            override fun onScrollStateChanged(view: RecyclerView, newState: Int) {
+                if (newState == RecyclerView.SCROLL_STATE_DRAGGING) {
+                    // The user grabbed the list: follow only if they are at the bottom.
+                    autoFollowStreaming = isChatAtBottom()
+                } else if (newState == RecyclerView.SCROLL_STATE_IDLE && isChatAtBottom()) {
+                    autoFollowStreaming = true
+                }
+            }
+
+            override fun onScrolled(view: RecyclerView, dx: Int, dy: Int) {
+                // During a user drag/fling follow the viewport; while idle only
+                // re-enable following, never disable it (layout changes from
+                // growing messages also emit onScrolled).
+                if (view.scrollState == RecyclerView.SCROLL_STATE_IDLE) {
+                    if (isChatAtBottom()) autoFollowStreaming = true
+                } else {
+                    autoFollowStreaming = isChatAtBottom()
+                }
+            }
+        })
 
         cardInputBar.viewTreeObserver.addOnGlobalLayoutListener {
             recyclerChat.setPadding(
@@ -441,8 +468,19 @@ class MainActivity : AppCompatActivity() {
         appBarLayout.setExpanded(false, true)
     }
 
-    private fun scrollToBottom() {
+    private fun isChatAtBottom(): Boolean = !recyclerChat.canScrollVertically(1)
+
+    /**
+     * Auto-scroll used by the streaming path: keeps the newest tokens visible
+     * only while the user is following along at the bottom.
+     */
+    private fun followStreamingIfAtBottom() {
+        scrollToBottom(onlyIfFollowing = true)
+    }
+
+    private fun scrollToBottom(onlyIfFollowing: Boolean = false) {
         recyclerChat.post {
+            if (onlyIfFollowing && !autoFollowStreaming) return@post
             val adapterCount = chatAdapter.itemCount
             if (adapterCount == 0) return@post
             val layoutManager = recyclerChat.layoutManager as? LinearLayoutManager ?: return@post
@@ -738,18 +776,51 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun handleSelectedMedia(uri: Uri) {
-        if (!isModelReady) {
-            Toast.makeText(this, R.string.toast_load_model_first, Toast.LENGTH_SHORT).show()
-            return
-        }
         val mime = contentResolver.getType(uri).orEmpty()
+        val selected = LlamaEngine.getSelectedModel(applicationContext)
         when {
-            mime.startsWith("video/") -> handleSelectedVideo(uri)
-            mime.startsWith("image/") || mime.isEmpty() -> handleSelectedImage(uri)
+            mime.startsWith("video/") -> {
+                if (!selected.supportsVideo) {
+                    Toast.makeText(this, R.string.video_only_v46, Toast.LENGTH_LONG).show()
+                    return
+                }
+                if (!ensureModelLoadedForMedia(uri)) return
+                if (!engine.isVideoUnderstandingSupported) {
+                    Toast.makeText(this, R.string.video_only_v46, Toast.LENGTH_LONG).show()
+                    return
+                }
+                handleSelectedVideo(uri)
+            }
+            mime.startsWith("image/") || mime.isEmpty() -> {
+                if (!ensureModelLoadedForMedia(uri)) return
+                handleSelectedImage(uri)
+            }
             else -> {
                 Toast.makeText(this, getString(R.string.toast_unsupported_file, mime), Toast.LENGTH_SHORT).show()
             }
         }
+    }
+
+    /**
+     * The picker runs before the model is loaded, so the selected file is
+     * stashed and the normal inline-loading flow resumes it afterwards.
+     * Returns true only when the model is ready and the caller can proceed.
+     */
+    private fun ensureModelLoadedForMedia(uri: Uri): Boolean {
+        if (isInlineModelLoad || isInlineDownloading) {
+            Toast.makeText(this, R.string.toast_please_wait_model, Toast.LENGTH_SHORT).show()
+            return false
+        }
+        val selected = LlamaEngine.getSelectedModel(applicationContext)
+        val budgetReload = LlamaEngine.consumeMemoryBudgetReloadPending(applicationContext)
+        if (isModelReady && loadedModelId == selected.id && !budgetReload) return true
+        pendingMediaUri = uri
+        if (!LlamaEngine.modelsExist(applicationContext, selected)) {
+            showDownloadPrompt()
+        } else {
+            loadModelThenSend()
+        }
+        return false
     }
 
     private fun handleSelectedImage(uri: Uri) {
@@ -959,7 +1030,10 @@ class MainActivity : AppCompatActivity() {
         }
 
         val selected = LlamaEngine.getSelectedModel(applicationContext)
-        if (isModelReady && loadedModelId == selected.id) {
+        // A changed memory budget is only consumed while loading the model, so
+        // force one reload on the next request instead of reusing the old one.
+        val budgetReload = LlamaEngine.consumeMemoryBudgetReloadPending(applicationContext)
+        if (isModelReady && loadedModelId == selected.id && !budgetReload) {
             sendPrompt(userMsg)
             return
         }
@@ -978,29 +1052,11 @@ class MainActivity : AppCompatActivity() {
             return
         }
         pendingPrompt = userMsg
-        pendingImageAfterLoad = false
+        pendingMediaUri = null
         etInput.text = null
         etInput.clearFocus()
         (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
             .hideSoftInputFromWindow(etInput.windowToken, 0)
-        collapseAppBar()
-
-        val model = LlamaEngine.getSelectedModel(applicationContext)
-        if (!LlamaEngine.modelsExist(applicationContext, model)) {
-            showDownloadPrompt()
-        } else {
-            loadModelThenSend()
-        }
-    }
-
-    /**
-     * Like [beginModelFlow] but for the "attach an image" suggestion: once the
-     * model is available, open the picker instead of sending a text prompt.
-     */
-    private fun requestImagePickAfterModel() {
-        if (isInlineDownloading || isInlineModelLoad) return
-        pendingPrompt = null
-        pendingImageAfterLoad = true
         collapseAppBar()
 
         val model = LlamaEngine.getSelectedModel(applicationContext)
@@ -1056,7 +1112,8 @@ class MainActivity : AppCompatActivity() {
         removeDownloadPrompt()
         pendingPrompt?.let { etInput.setText(it) }
         pendingPrompt = null
-        pendingImageAfterLoad = false
+        pendingMediaUri = null
+        pendingImageQuestion = null
         enableInput(true)
         etInput.requestFocus()
     }
@@ -1155,7 +1212,8 @@ class MainActivity : AppCompatActivity() {
                             ).show()
                             pendingPrompt?.let { etInput.setText(it) }
                             pendingPrompt = null
-                            pendingImageAfterLoad = false
+                            pendingMediaUri = null
+                            pendingImageQuestion = null
                             enableInput(true)
                             ModelDownloadController.acknowledge()
                         }
@@ -1175,9 +1233,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun loadModelThenSend() {
         val pendingText = pendingPrompt
-        val pickImage = pendingImageAfterLoad
-        if (pendingText == null && !pickImage) return
+        val mediaUri = pendingMediaUri
+        if (pendingText == null && mediaUri == null) return
         if (isInlineModelLoad) return
+        autoFollowStreaming = true
         isInlineModelLoad = true
         enableInput(false)
         (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
@@ -1212,8 +1271,9 @@ class MainActivity : AppCompatActivity() {
 
                 // The lazy (re)load starts from an empty context. Replay the
                 // saved turns so follow-up messages keep the conversation
-                // context instead of silently forgetting it.
-                if (!pickImage && pendingText != null) {
+                // context instead of silently forgetting it. Media also needs
+                // the history replayed before its image/audio prefill.
+                if (pendingText != null || mediaUri != null) {
                     restoreHistoryForCurrentConversation()
                 }
 
@@ -1225,11 +1285,10 @@ class MainActivity : AppCompatActivity() {
                     loadedModelId = LlamaEngine.getSelectedModel(applicationContext).id
                     updateUIForModelType()
                     pendingPrompt = null
-                    pendingImageAfterLoad = false
                     enableInput(true)
-                    if (pickImage) {
-                        pendingImageQuestion = getString(R.string.suggestion_2)
-                        getMedia.launch(arrayOf("image/*"))
+                    if (mediaUri != null) {
+                        pendingMediaUri = null
+                        handleSelectedMedia(mediaUri)
                     } else if (pendingText != null) {
                         sendPrompt(pendingText, userMessageAlreadyAdded = true)
                     }
@@ -1244,7 +1303,8 @@ class MainActivity : AppCompatActivity() {
                     isModelReady = false
                     pendingPrompt?.let { etInput.setText(it) }
                     pendingPrompt = null
-                    pendingImageAfterLoad = false
+                    pendingMediaUri = null
+                    pendingImageQuestion = null
                     enableInput(true)
                     Toast.makeText(
                         this@MainActivity,
@@ -1277,6 +1337,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun sendPrompt(userMsg: String, userMessageAlreadyAdded: Boolean = false) {
+        autoFollowStreaming = true
         etInput.clearFocus()
         (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
             .hideSoftInputFromWindow(etInput.windowToken, 0)
@@ -1351,7 +1412,7 @@ class MainActivity : AppCompatActivity() {
                             chatAdapter.clearActiveAiMessage()
                             chatAdapter.submitList(messages.toList())
                             enableInput(true)
-                            scrollToBottom()
+                            followStreamingIfAtBottom()
                         }
                         persistCurrentConversation()
                         withContext(Dispatchers.Main) { refreshConversationList() }
@@ -1375,7 +1436,7 @@ class MainActivity : AppCompatActivity() {
                             )
                         }
                         chatAdapter.updateStreamingText(aiMsgId, currentText)
-                        scrollToBottom()
+                        followStreamingIfAtBottom()
                     }
                     persistDuringStreaming()
                 }

@@ -22,6 +22,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import com.google.android.material.button.MaterialButton
 import com.google.android.material.slider.Slider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -106,13 +107,20 @@ class ModelManagerActivity : AppCompatActivity() {
         fun showValue(mb: Int) {
             valueView.text = getString(R.string.memory_budget_value, mb / 1000f)
         }
-        val budget = LlamaEngine.getMemoryBudgetMb(this)
+        // The ceiling depends on the device's physical RAM: a 24 GB phone can
+        // cache many more experts than the old fixed 8 GB cap allowed.
+        val maxMb = LlamaEngine.getMaxMemoryBudgetMb(this)
+        slider.valueTo = maxMb / 1000f
+        val budget = LlamaEngine.getMemoryBudgetMb(this).coerceIn(LlamaEngine.MIN_MEMORY_BUDGET_MB, maxMb)
         slider.value = budget / 1000f
         showValue(budget)
         slider.addOnChangeListener { _, value, fromUser ->
             val mb = (value * 10).roundToInt() * 100
             showValue(mb)
             if (fromUser) LlamaEngine.setMemoryBudgetMb(this, mb)
+        }
+        findViewById<MaterialButton>(R.id.btn_memory_budget_max).setOnClickListener {
+            slider.value = slider.valueTo
         }
         updateMemoryBudgetVisibility()
     }

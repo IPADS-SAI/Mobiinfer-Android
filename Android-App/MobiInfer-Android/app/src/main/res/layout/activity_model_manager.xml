@@ -189,6 +189,14 @@
                         android:valueTo="8.0"
                         android:stepSize="0.1"
                         app:tickVisible="true" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btn_memory_budget_max"
+                        style="@style/Widget.Material3.Button.OutlinedButton"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:text="@string/memory_budget_use_max" />
                 </LinearLayout>
             </com.google.android.material.card.MaterialCardView>
 

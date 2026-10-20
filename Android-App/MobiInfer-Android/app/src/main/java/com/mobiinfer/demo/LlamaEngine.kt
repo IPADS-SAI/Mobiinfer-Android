@@ -1,5 +1,6 @@
 package com.mobiinfer.demo
 
+import android.app.ActivityManager
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Log
@@ -82,16 +83,58 @@ class LlamaEngine private constructor(
         private const val KEY_IMAGE_MAX_SLICE = "image_max_slice_nums"
         private const val KEY_IMAGE_SCALE_FACTOR = "image_scale_factor"
         private const val KEY_MEMORY_BUDGET_MB = "minicpm47_memory_budget_v2_mb"
+        private const val KEY_MEMORY_BUDGET_RELOAD = "minicpm47_memory_budget_reload_pending"
         const val MIN_MEMORY_BUDGET_MB = 5200
-        const val MAX_MEMORY_BUDGET_MB = 8000
+        const val DEFAULT_MEMORY_BUDGET_MB = 8000
+        // Device-independent safety ceiling. The real ceiling is derived from
+        // the device's physical RAM by getMaxMemoryBudgetMb().
+        const val ABSOLUTE_MAX_MEMORY_BUDGET_MB = 32768
+        private const val MEMORY_RESERVE_MB = 3072
 
-        fun getMemoryBudgetMb(context: Context): Int = prefs(context)
-            .getInt(KEY_MEMORY_BUDGET_MB, MAX_MEMORY_BUDGET_MB)
-            .coerceIn(MIN_MEMORY_BUDGET_MB, MAX_MEMORY_BUDGET_MB)
+        /**
+         * Upper bound for the runtime memory budget on this device.
+         *
+         * The model, vision encoder, context and expert cache all live in this
+         * budget, so we leave a reserve for Android, the UI and the HTP driver.
+         * A 24 GB device therefore tops out around 20 GB instead of trying to
+         * use the whole physical RAM (which would be killed by LMKD).
+         */
+        fun getMaxMemoryBudgetMb(context: Context): Int {
+            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val info = ActivityManager.MemoryInfo()
+            am.getMemoryInfo(info)
+            val totalMb = (info.totalMem / 1_000_000L).toInt()
+            val reserveMb = maxOf(MEMORY_RESERVE_MB, totalMb / 5)
+            val usableMb = ((totalMb - reserveMb) / 100) * 100
+            return usableMb
+                .coerceAtLeast(DEFAULT_MEMORY_BUDGET_MB)
+                .coerceAtMost(ABSOLUTE_MAX_MEMORY_BUDGET_MB)
+        }
+
+        fun getMemoryBudgetMb(context: Context): Int {
+            val maxMb = getMaxMemoryBudgetMb(context)
+            return prefs(context)
+                .getInt(KEY_MEMORY_BUDGET_MB, DEFAULT_MEMORY_BUDGET_MB)
+                .coerceIn(MIN_MEMORY_BUDGET_MB, maxMb)
+        }
 
         fun setMemoryBudgetMb(context: Context, value: Int) {
-            require(value in MIN_MEMORY_BUDGET_MB..MAX_MEMORY_BUDGET_MB && value % 100 == 0)
-            prefs(context).edit().putInt(KEY_MEMORY_BUDGET_MB, value).apply()
+            val maxMb = getMaxMemoryBudgetMb(context)
+            require(value in MIN_MEMORY_BUDGET_MB..maxMb && value % 100 == 0)
+            val current = prefs(context).getInt(KEY_MEMORY_BUDGET_MB, DEFAULT_MEMORY_BUDGET_MB)
+            val editor = prefs(context).edit().putInt(KEY_MEMORY_BUDGET_MB, value)
+            // The budget is consumed by the native load path, so the model has
+            // to be loaded again before the new value can take effect.
+            if (value != current) editor.putBoolean(KEY_MEMORY_BUDGET_RELOAD, true)
+            editor.apply()
+        }
+
+        /** Returns true once after the budget changed, so the caller reloads. */
+        fun consumeMemoryBudgetReloadPending(context: Context): Boolean {
+            val prefs = prefs(context)
+            val pending = prefs.getBoolean(KEY_MEMORY_BUDGET_RELOAD, false)
+            if (pending) prefs.edit().putBoolean(KEY_MEMORY_BUDGET_RELOAD, false).apply()
+            return pending
         }
         private const val KEY_MODEL_SWITCHED = "model_switched"
         private const val KEY_ENABLE_THINKING = "enable_thinking"

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 
@@ -7,10 +8,16 @@
 // Decimal MB/GB; this is not an allocator-enforced process limit.
 struct MiniCPM47MemoryConfig {
     static constexpr int min_mb = 5200;
-    static constexpr int max_mb = 8000;
+    // Device RAM is the real limit; the Kotlin layer derives a per-device
+    // ceiling and passes it in. This is only a defensive absolute bound.
+    static constexpr int max_mb = 32768;
     static constexpr int batch = 512;
     static constexpr int draft = 3;
     static constexpr int64_t slot_bytes = 40LL * 1572864;
+    // Qwen35MoE in this bundle has 256 experts per layer. A wider per-layer
+    // decode window cannot hold more distinct experts, so RAM above this is
+    // simply wasted.
+    static constexpr int max_useful_slots = 256;
 
     int budget_mb;
     int bank;
@@ -22,7 +29,7 @@ struct MiniCPM47MemoryConfig {
 
 inline MiniCPM47MemoryConfig minicpm47_memory_config(int budget_mb) {
     if (budget_mb < MiniCPM47MemoryConfig::min_mb || budget_mb > MiniCPM47MemoryConfig::max_mb) {
-        throw std::invalid_argument("MiniCPM-V 4.7 memory budget must be 5200..8000 MB");
+        throw std::invalid_argument("MiniCPM-V 4.7 memory budget must be 5200..32768 MB");
     }
     // Smaller budgets must also reduce the prefill bank and graph reservation.
     // Fixed terms include the resident model, draft, eager vision, context and
@@ -33,8 +40,9 @@ inline MiniCPM47MemoryConfig minicpm47_memory_config(int budget_mb) {
     const int ubatch = low ? 4 : medium ? 16 : 128;
     const int prefetch = low ? 0 : 4;
     const int64_t fixed_bytes = low ? 4650000000LL : medium ? 5050000000LL : 5700000000LL;
-    const int total_slots = int((int64_t(budget_mb) * 1000000 - fixed_bytes)
-                               / MiniCPM47MemoryConfig::slot_bytes);
+    const int total_slots = int(std::min<int64_t>(
+        (int64_t(budget_mb) * 1000000 - fixed_bytes) / MiniCPM47MemoryConfig::slot_bytes,
+        MiniCPM47MemoryConfig::max_useful_slots));
     if (total_slots < prefetch + 8) {
         throw std::invalid_argument("MiniCPM-V 4.7 budget leaves fewer than 8 expert cache slots");
     }

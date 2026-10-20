@@ -95,6 +95,10 @@ data class ModelInfo(
     val isTts: Boolean
         get() = acousticFileName != null
 
+    /** Only the MiniCPM-V 4.7 bundle has the multi-frame video path. */
+    val supportsVideo: Boolean
+        get() = id == "minicpm-v-4_7"
+
     /** MiniCPM5 (text), MiniCPM-V-4.6 and Qwen3.5 expose a thinking toggle. */
     val supportsThinking: Boolean
         get() = isTextOnly || id == "minicpm-v-4_6-instruct" || id == "qwen35-35b-a3b"

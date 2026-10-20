@@ -207,8 +207,9 @@
     <string name="tts_baselm_missing">BaseLM GGUF file missing, please download</string>
     <string name="tts_acoustic_missing">Acoustic GGUF file missing, please download</string>
     <string name="memory_budget_title">Runtime memory budget</string>
-    <string name="memory_budget_description">For MiniCPM-V 4.7; applies on the next model load. A lower budget adjusts the expert cache and prompt chunk size. 1 GB = 1 billion bytes; actual usage varies with input.</string>
+    <string name="memory_budget_description">For MiniCPM-V 4.7; applies on the next model load. A lower budget adjusts the expert cache and prompt chunk size. 1 GB = 1 billion bytes; actual usage varies with input. The upper limit is derived from device RAM with a reserve for the system.</string>
     <string name="memory_budget_value">%1$.1f GB</string>
+    <string name="memory_budget_use_max">Use device maximum</string>
     <string name="model_pause">Pause</string>
     <string name="model_resume">Resume</string>
     <string name="model_delete">Delete</string>
