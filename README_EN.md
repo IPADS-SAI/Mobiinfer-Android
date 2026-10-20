@@ -53,6 +53,8 @@ The Android app ([`Android-App/`](Android-App/README.md), based on [OpenBMB/Mini
 | Model | Scale | Notes |
 |---|---|---|
 | **MiniCPM-V 4.7 35B-A3B** | 35B total / 3B active | Primary on-device MoE target, multimodal (vision + text) |
+| **Qwen3.5-35B-A3B** | 35B total / 3B active | `qwen35moe`, vision + text, LES + DFlash |
+| **Qwen3-30B-A3B** | 30B total / 3B active | `qwen3moe`, text, LES + external experts |
 | **Qwen3-0.6B** | 0.6B (dense) | `qwen3`, text |
 | **Qwen3-1.7B** | 1.7B (dense) | `qwen3`, text |
 | **Qwen3-4B** | 4B (dense) | `qwen3`, text |

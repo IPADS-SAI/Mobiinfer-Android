@@ -24,11 +24,13 @@ The on-device **Android** app shipped with **MobiInfer-Android**. It runs large 
 
 ## Supported models
 
-This NPU branch offers two entries in **Model Manager** (the upstream demo's other variants are intentionally not shipped here):
+This NPU branch offers four entries in **Model Manager** (the upstream demo's other variants are intentionally not shipped here):
 
 | Model | Quant | Size | Notes |
 | --- | --- | --- | --- |
 | **MiniCPM-V 4.7 35B-A3B** | Q3 (mixed, tiled experts) | **~17 GB** | Main target. MoE experts streamed from flash; needs Hexagon v79 + ≥12 GB RAM |
+| **Qwen3.5-35B-A3B** | Q4_K_M (tiled experts) | **~25 GB** | `qwen35moe`, vision + text, LES + DFlash |
+| **Qwen3-30B-A3B** | Q4_K_M (tiled experts) | **~20 GB** | `qwen3moe`, text-only, LES + external experts |
 | **Qwen3-VL-4B-Instruct** | Q4_K_M | ~3.3 GB | Vision-language; language + vision on HTP |
 
 The 4.7 bundle is **not a single GGUF**. It ships a resident main model, a padded F16 `mmproj`, a Q8_0 DSpark draft, and 40 tiled expert layer files:
