@@ -226,6 +226,7 @@ static int                                g_image_max_slice_nums = 9;
 // as a global rather than a llama_n_ctx() call so we don't depend on
 // llama-side defaults when llama_context_default_params changes.
 static int                                g_n_ctx = DEFAULT_CONTEXT_SIZE;
+static int                                g_requested_context_size = DEFAULT_CONTEXT_SIZE;
 
 // MiniCPM5 / V-4.6 thinking toggle. Default off so the first reply is
 // not a long <think> dump.
@@ -313,8 +314,9 @@ Java_com_mobiinfer_demo_LlamaEngine_init(JNIEnv *env, jobject /*unused*/, jstrin
 extern "C"
 JNIEXPORT jint JNICALL
 Java_com_mobiinfer_demo_LlamaEngine_load(JNIEnv *env, jobject, jstring jmodel_path,
-                                                jstring jexperts_path, jint memory_budget_mb) {
+                                                jstring jexperts_path, jint memory_budget_mb, jint context_size) {
     llama_model_params model_params = llama_model_default_params();
+    g_requested_context_size = context_size > 0 ? context_size : DEFAULT_CONTEXT_SIZE;
     model_params.n_gpu_layers = 99;
 
     g_moe = jexperts_path != nullptr;
@@ -377,7 +379,7 @@ Java_com_mobiinfer_demo_LlamaEngine_load(JNIEnv *env, jobject, jstring jmodel_pa
 
     if (g_moe) {
         try {
-            g_moe_runtime = std::make_unique<MiniCPM47Runtime>(model_path, g_experts_path, memory_budget_mb);
+            g_moe_runtime = std::make_unique<MiniCPM47Runtime>(model_path, g_experts_path, memory_budget_mb, g_requested_context_size);
         } catch (const std::exception & e) {
             LOGe("MiniCPM47 configuration failed: %s", e.what());
             env->ReleaseStringUTFChars(jmodel_path, model_path);
@@ -560,7 +562,9 @@ Java_com_mobiinfer_demo_LlamaEngine_prepare(JNIEnv * /*env*/, jobject /*unused*/
     const bool is_v46 = (g_minicpmv_version == 46) ||
                         (g_minicpmv_version == 460) ||
                         (g_minicpmv_version == 461);
-    const int  n_ctx  = g_moe ? 2048 : (is_v46 ? V46_CONTEXT_SIZE : DEFAULT_CONTEXT_SIZE);
+    const int  n_ctx  = g_requested_context_size > 0
+                      ? g_requested_context_size
+                      : (g_moe ? 2048 : (is_v46 ? V46_CONTEXT_SIZE : DEFAULT_CONTEXT_SIZE));
     LOGi("%s: minicpmv_version=%d -> n_ctx=%d", __func__, g_minicpmv_version, n_ctx);
 
     auto *context = init_context(g_model, n_ctx);
@@ -1309,6 +1313,15 @@ static bool is_valid_utf8(const char *string) {
         }
     }
     return true;
+}
+
+extern "C"
+JNIEXPORT jboolean JNICALL
+Java_com_mobiinfer_demo_LlamaEngine_wasContextTruncatedNative(
+        JNIEnv * /*env*/,
+        jobject /*unused*/
+) {
+    return g_moe_runtime && g_moe_runtime->contextTruncated() ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C"

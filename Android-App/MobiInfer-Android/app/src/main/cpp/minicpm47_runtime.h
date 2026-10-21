@@ -20,7 +20,7 @@ struct RestoreTurn {
 // requests and the worker loop. No HTTP listener or external process.
 class MiniCPM47Runtime {
 public:
-    MiniCPM47Runtime(const std::string & model, const std::string & experts, int memory_budget_mb = 6000);
+    MiniCPM47Runtime(const std::string & model, const std::string & experts, int memory_budget_mb = 6000, int context_size = 4096);
     ~MiniCPM47Runtime();
     void setVisionPath(const std::string & path);
     bool start();
@@ -38,6 +38,7 @@ public:
     void restore(const std::vector<RestoreTurn> & turns);
     void resetPerformanceStats();
     std::array<double, 5> performanceStats() const;
+    bool contextTruncated() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;

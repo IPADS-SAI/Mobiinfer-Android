@@ -812,7 +812,7 @@ class MainActivity : AppCompatActivity() {
             return false
         }
         val selected = LlamaEngine.getSelectedModel(applicationContext)
-        val budgetReload = LlamaEngine.consumeMemoryBudgetReloadPending(applicationContext)
+        val budgetReload = LlamaEngine.consumeRuntimeReloadPending(applicationContext)
         if (isModelReady && loadedModelId == selected.id && !budgetReload) return true
         pendingMediaUri = uri
         if (!LlamaEngine.modelsExist(applicationContext, selected)) {
@@ -1032,7 +1032,7 @@ class MainActivity : AppCompatActivity() {
         val selected = LlamaEngine.getSelectedModel(applicationContext)
         // A changed memory budget is only consumed while loading the model, so
         // force one reload on the next request instead of reusing the old one.
-        val budgetReload = LlamaEngine.consumeMemoryBudgetReloadPending(applicationContext)
+        val budgetReload = LlamaEngine.consumeRuntimeReloadPending(applicationContext)
         if (isModelReady && loadedModelId == selected.id && !budgetReload) {
             sendPrompt(userMsg)
             return
@@ -1399,6 +1399,8 @@ class MainActivity : AppCompatActivity() {
                             decodeTokensPerSecond = decodeRate,
                             totalMs = totalMs
                         ) else null
+                        val contextTruncated = cause == null &&
+                            runCatching { engine.wasLastGenerationTruncated() }.getOrDefault(false)
                         withContext(Dispatchers.Main) {
                             val index = messages.indexOfFirst { it.id == aiMsgId }
                             if (index >= 0) {
@@ -1413,6 +1415,13 @@ class MainActivity : AppCompatActivity() {
                             chatAdapter.submitList(messages.toList())
                             enableInput(true)
                             followStreamingIfAtBottom()
+                            if (contextTruncated) {
+                                Toast.makeText(
+                                    this@MainActivity,
+                                    R.string.context_limit_reached,
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            }
                         }
                         persistCurrentConversation()
                         withContext(Dispatchers.Main) { refreshConversationList() }
@@ -1420,7 +1429,14 @@ class MainActivity : AppCompatActivity() {
                 }
                 .catch { error ->
                     withContext(Dispatchers.Main) {
-                        Toast.makeText(this@MainActivity, error.message ?: getString(android.R.string.dialog_alert_title), Toast.LENGTH_LONG).show()
+                        val message = error.message.orEmpty()
+                        val text = if (message.contains("context size", ignoreCase = true) ||
+                                      message.contains("context capacity", ignoreCase = true)) {
+                            getString(R.string.context_limit_reached)
+                        } else {
+                            message.ifBlank { getString(android.R.string.dialog_alert_title) }
+                        }
+                        Toast.makeText(this@MainActivity, text, Toast.LENGTH_LONG).show()
                     }
                 }
                 .collect { token ->

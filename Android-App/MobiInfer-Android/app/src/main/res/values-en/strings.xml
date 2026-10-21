@@ -210,6 +210,10 @@
     <string name="memory_budget_description">For MiniCPM-V 4.7; applies on the next model load. A lower budget adjusts the expert cache and prompt chunk size. 1 GB = 1 billion bytes; actual usage varies with input. The upper limit is derived from device RAM with a reserve for the system.</string>
     <string name="memory_budget_value">%1$.1f GB</string>
     <string name="memory_budget_use_max">Use device maximum</string>
+    <string name="context_size_title">Context length</string>
+    <string name="context_size_description">Maximum tokens per request (prompt, history, images and reply all count). Defaults to 4096; larger values use more memory. Generation stops when the limit is reached.</string>
+    <string name="context_size_value">%1$d tokens</string>
+    <string name="context_limit_reached">Context limit reached; the reply was truncated. Increase the context length in Model Manager.</string>
     <string name="model_pause">Pause</string>
     <string name="model_resume">Resume</string>
     <string name="model_delete">Delete</string>

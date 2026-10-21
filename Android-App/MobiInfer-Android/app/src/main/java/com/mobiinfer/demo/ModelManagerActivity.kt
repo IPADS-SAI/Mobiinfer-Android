@@ -86,6 +86,7 @@ class ModelManagerActivity : AppCompatActivity() {
         setupModelList()
         setupImageScale()
         setupMemoryBudget()
+        setupContextSize()
         refreshStates()
         observeDownloads()
     }
@@ -123,6 +124,25 @@ class ModelManagerActivity : AppCompatActivity() {
             slider.value = slider.valueTo
         }
         updateMemoryBudgetVisibility()
+    }
+
+    private fun setupContextSize() {
+        val slider = findViewById<Slider>(R.id.slider_context_size)
+        val valueView = findViewById<TextView>(R.id.tv_context_size_value)
+        fun showValue(tokens: Int) {
+            valueView.text = getString(R.string.context_size_value, tokens)
+        }
+        slider.valueFrom = LlamaEngine.MIN_CONTEXT_SIZE.toFloat()
+        slider.valueTo = LlamaEngine.MAX_CONTEXT_SIZE.toFloat()
+        slider.stepSize = LlamaEngine.CONTEXT_SIZE_STEP.toFloat()
+        val size = LlamaEngine.getContextSize(this)
+        slider.value = size.toFloat()
+        showValue(size)
+        slider.addOnChangeListener { _, value, fromUser ->
+            val tokens = (value / LlamaEngine.CONTEXT_SIZE_STEP).roundToInt() * LlamaEngine.CONTEXT_SIZE_STEP
+            showValue(tokens)
+            if (fromUser) LlamaEngine.setContextSize(this, tokens)
+        }
     }
 
     private fun updateMemoryBudgetVisibility() {

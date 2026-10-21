@@ -83,13 +83,19 @@ class LlamaEngine private constructor(
         private const val KEY_IMAGE_MAX_SLICE = "image_max_slice_nums"
         private const val KEY_IMAGE_SCALE_FACTOR = "image_scale_factor"
         private const val KEY_MEMORY_BUDGET_MB = "minicpm47_memory_budget_v2_mb"
-        private const val KEY_MEMORY_BUDGET_RELOAD = "minicpm47_memory_budget_reload_pending"
+        private const val KEY_RUNTIME_RELOAD = "minicpm47_memory_budget_reload_pending"
+        private const val KEY_CONTEXT_SIZE = "context_size_tokens"
         const val MIN_MEMORY_BUDGET_MB = 5200
         const val DEFAULT_MEMORY_BUDGET_MB = 8000
         // Device-independent safety ceiling. The real ceiling is derived from
         // the device's physical RAM by getMaxMemoryBudgetMb().
         const val ABSOLUTE_MAX_MEMORY_BUDGET_MB = 32768
         private const val MEMORY_RESERVE_MB = 3072
+
+        const val MIN_CONTEXT_SIZE = 1024
+        const val DEFAULT_CONTEXT_SIZE = 4096
+        const val MAX_CONTEXT_SIZE = 16384
+        const val CONTEXT_SIZE_STEP = 1024
 
         /**
          * Upper bound for the runtime memory budget on this device.
@@ -125,15 +131,27 @@ class LlamaEngine private constructor(
             val editor = prefs(context).edit().putInt(KEY_MEMORY_BUDGET_MB, value)
             // The budget is consumed by the native load path, so the model has
             // to be loaded again before the new value can take effect.
-            if (value != current) editor.putBoolean(KEY_MEMORY_BUDGET_RELOAD, true)
+            if (value != current) editor.putBoolean(KEY_RUNTIME_RELOAD, true)
             editor.apply()
         }
 
-        /** Returns true once after the budget changed, so the caller reloads. */
-        fun consumeMemoryBudgetReloadPending(context: Context): Boolean {
+        fun getContextSize(context: Context): Int = prefs(context)
+            .getInt(KEY_CONTEXT_SIZE, DEFAULT_CONTEXT_SIZE)
+            .coerceIn(MIN_CONTEXT_SIZE, MAX_CONTEXT_SIZE)
+
+        fun setContextSize(context: Context, value: Int) {
+            require(value in MIN_CONTEXT_SIZE..MAX_CONTEXT_SIZE && value % CONTEXT_SIZE_STEP == 0)
+            val current = getContextSize(context)
+            val editor = prefs(context).edit().putInt(KEY_CONTEXT_SIZE, value)
+            if (value != current) editor.putBoolean(KEY_RUNTIME_RELOAD, true)
+            editor.apply()
+        }
+
+        /** Returns true once after a load-time setting changed. */
+        fun consumeRuntimeReloadPending(context: Context): Boolean {
             val prefs = prefs(context)
-            val pending = prefs.getBoolean(KEY_MEMORY_BUDGET_RELOAD, false)
-            if (pending) prefs.edit().putBoolean(KEY_MEMORY_BUDGET_RELOAD, false).apply()
+            val pending = prefs.getBoolean(KEY_RUNTIME_RELOAD, false)
+            if (pending) prefs.edit().putBoolean(KEY_RUNTIME_RELOAD, false).apply()
             return pending
         }
         private const val KEY_MODEL_SWITCHED = "model_switched"
@@ -1260,7 +1278,7 @@ class LlamaEngine private constructor(
     private var _readyForSystemPrompt = false
 
     private external fun init(nativeLibDir: String)
-    private external fun load(modelPath: String, expertsPath: String?, memoryBudgetMb: Int): Int
+    private external fun load(modelPath: String, expertsPath: String?, memoryBudgetMb: Int, contextSize: Int): Int
     // image_max_slice_nums: 1..9 (or -1 for model default).  See JNI for
     // the semantics; the upper layer should pass MIN_IMAGE_SLICE..MAX_IMAGE_SLICE.
     private external fun loadMmproj(mmprojPath: String, imageMaxSliceNums: Int): Int
@@ -1292,6 +1310,7 @@ class LlamaEngine private constructor(
     ): Int
     private external fun resetPerformanceStatsNative()
     private external fun readPerformanceStatsNative(): DoubleArray
+    private external fun wasContextTruncatedNative(): Boolean
     private external fun fullReset()
     private external fun nativeCancelGeneration()
     private external fun unload()
@@ -1364,7 +1383,7 @@ class LlamaEngine private constructor(
                         "${modelInfo.displayName} vision weights are missing or unreadable"
                     }
                 }
-                load(pathToModel, expertsPath, getMemoryBudgetMb(context)).let {
+                load(pathToModel, expertsPath, getMemoryBudgetMb(context), getContextSize(context)).let {
                     if (it != 0) throw RuntimeException("Failed to load model (code: $it)")
                 }
 
@@ -1502,6 +1521,11 @@ class LlamaEngine private constructor(
         val prefillRate = if (prefillMs > 0.0 && prefillTokens > 0.0) prefillTokens * 1000.0 / prefillMs else null
         val decodeRate = if (decodeMs > 0.0 && decodeTokens > 0.0) decodeTokens * 1000.0 / decodeMs else null
         prefillRate to decodeRate
+    }
+
+    /** True when the last completed request hit the context limit. */
+    suspend fun wasLastGenerationTruncated(): Boolean = withContext(llamaDispatcher) {
+        wasContextTruncatedNative()
     }
 
     /**

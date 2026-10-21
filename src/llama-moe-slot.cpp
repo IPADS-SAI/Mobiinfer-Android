@@ -664,6 +664,10 @@ struct llama_moe_slot_runtime::impl {
         std::vector<int32_t> expert_to_slot;
         std::vector<uint64_t> slot_age;
         std::vector<uint8_t> protected_experts;
+        /// Persistently pinned hot experts (`LLAMA_MOE_PREWARM`, unless
+        /// `LLAMA_MOE_PREWARM_PIN=0`). Unlike `protected_experts` (cleared every
+        /// step), these are never evicted, so the resident hot set stays put.
+        std::vector<uint8_t> pinned_experts;
         uint64_t age = 0;
         std::mutex mutex;
     };
@@ -802,6 +806,7 @@ struct llama_moe_slot_runtime::impl {
             state.slot_to_expert.assign(n_slots, kSlotFree);
             state.expert_to_slot.assign(n_expert, kSlotFree);
             state.protected_experts.assign(n_expert, 0);
+            state.pinned_experts.assign(n_expert, 0);
             state.slot_age.assign(n_slots, 0);
             // window_start 不在这里算 —— decode_window 要到 resolve_decode_window()
             // 才确定，此处还是 0。在那边统一赋值，否则所有层会共用窗口起点 [0, W)，
@@ -1008,7 +1013,8 @@ struct llama_moe_slot_runtime::impl {
                     continue;
                 }
                 const int32_t resident = st.slot_to_expert[(size_t) cand];
-                if (resident >= 0 && st.protected_experts[(size_t) resident]) continue;
+                if (resident >= 0 && (st.protected_experts[(size_t) resident] ||
+                                      st.pinned_experts[(size_t) resident])) continue;
                 if (st.slot_age[(size_t) cand] < oldest) {
                     oldest = st.slot_age[(size_t) cand];
                     slot = cand;
@@ -2398,6 +2404,39 @@ struct llama_moe_slot_runtime::impl {
                 path, li, total, (int) decode_window, prewarm_enabled ? "on" : "off");
         if (decode_window <= 0) {
             moe_log("prewarm: 窗口未开（LLAMA_MOE_DECODE_WINDOW=0），预热不会生效");
+        }
+        // 持久 pin：把热表钉进窗口，LRU 永不淘汰（`LLAMA_MOE_PREWARM_PIN=0` 可关）。
+        // 与每步清的 protected_experts 不同，这份是常驻的。
+        if (prewarm_enabled) {
+            const char * pv = std::getenv("LLAMA_MOE_PREWARM_PIN");
+            const bool pin = !(pv && *pv && *pv == '0');
+            int n_pin_layers = 0, n_pin_total = 0;
+            for (size_t il = 0; il < prewarm_table.size() && il < layers.size(); ++il) {
+                auto & st = layers[il];
+                std::fill(st.pinned_experts.begin(), st.pinned_experts.end(), 0);
+                if (!pin) {
+                    continue;
+                }
+                int n_pin = 0;
+                for (int32_t e : prewarm_table[il]) {
+                    if (e >= 0 && e < (int32_t) st.pinned_experts.size() && !st.pinned_experts[(size_t) e]) {
+                        st.pinned_experts[(size_t) e] = 1;
+                        ++n_pin;
+                    }
+                }
+                const int32_t cap = st.window_width > 0 ? st.window_width - prefetch_slots : 0;
+                if (cap > 0 && n_pin > cap) {
+                    moe_log("prewarm: layer %zu 的 pin %d 超过容量 %d，本层不 pin", il, n_pin, (int) cap);
+                    std::fill(st.pinned_experts.begin(), st.pinned_experts.end(), 0);
+                    n_pin = 0;
+                }
+                if (n_pin > 0) {
+                    ++n_pin_layers;
+                    n_pin_total += n_pin;
+                }
+            }
+            moe_log("prewarm: pin %s（%d 层 / %d 个专家常驻，LRU 不淘汰）",
+                    pin ? "on" : "off", n_pin_layers, n_pin_total);
         }
     }
 

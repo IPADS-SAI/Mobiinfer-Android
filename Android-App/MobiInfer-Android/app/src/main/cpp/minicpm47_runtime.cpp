@@ -59,6 +59,7 @@ struct MiniCPM47Runtime::Impl {
     int benchmark_max_tokens = 0;
     int memory_budget_mb = 6000;
     int cache_slots = 0;
+    bool context_truncated = false;
     std::array<double, 5> last_performance_stats = {0.0, 0.0, 0.0, 0.0, 0.0};
 
     void finish() {
@@ -73,7 +74,7 @@ struct MiniCPM47Runtime::Impl {
     }
 };
 
-MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string & experts, int memory_budget_mb)
+MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string & experts, int memory_budget_mb, int context_size)
     : impl(std::make_unique<Impl>()) {
     auto & p = impl->params;
     const auto memory = minicpm47_memory_config(memory_budget_mb);
@@ -89,6 +90,7 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
     int cfg_draft_n_max = -1;
     int cfg_batch       = 0;
     std::string cfg_layer_windows;
+    std::string cfg_prewarm;
     // Optional local benchmark overrides. Normal use defaults to HTP + DSpark.
     std::ifstream config_file(dir + "/runtime.json");
     if (config_file) {
@@ -101,6 +103,7 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
         cfg_draft_n_max = config.value("draft_n_max", -1);
         cfg_batch       = config.value("batch", 0);
         cfg_layer_windows = config.value("layer_windows", std::string());
+        cfg_prewarm     = config.value("prewarm", std::string());
         prefetch = config.value("prefetch", prefetch);
         io_threads = config.value("io_threads", io_threads);
         benchmark_cache_slots = config.value("cache_slots", -1);
@@ -138,7 +141,7 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
     p.model.path = model;
     p.moe_experts = experts;
     p.moe_slot_bank = benchmark_bank;
-    p.n_ctx = 2048;
+    p.n_ctx = context_size > 0 ? context_size : 4096;
     p.n_batch = cfg_batch > 0 ? cfg_batch : memory.batch;
     p.n_ubatch = benchmark_ubatch;
     p.n_ctx_checkpoints = 1;
@@ -250,6 +253,16 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
     } else {
         unsetenv("LLAMA_MOE_LAYER_WINDOWS");
     }
+    // Optional static hot-expert table (one layer per line, expert ids).
+    // With the persistent-pin patch these stay resident (LRU never evicts them).
+    // Relative paths resolve against the model directory.
+    if (!cfg_prewarm.empty()) {
+        const std::string p = cfg_prewarm.front() == '/'
+                ? cfg_prewarm : impl->directory + "/" + cfg_prewarm;
+        setenv("LLAMA_MOE_PREWARM", p.c_str(), 1);
+    } else {
+        unsetenv("LLAMA_MOE_PREWARM");
+    }
     setenv("LLAMA_MOE_IO_THREADS", std::to_string(io_threads).c_str(), 1);
     setenv("LLAMA_MOE_LOOKAHEAD_PREFETCH", prefetch > 0 ? "1" : "0", 1);
     setenv("LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH", std::to_string(prefetch).c_str(), 1);
@@ -358,6 +371,7 @@ void MiniCPM47Runtime::submit(const std::string & text, int n_predict) {
     msg.content = impl->pending_media + text;
     impl->pending_media.clear();
     impl->last_performance_stats = {0.0, 0.0, 0.0, 0.0, 0.0};
+    impl->context_truncated = false;
     impl->messages.push_back(std::move(msg));
     const auto meta = impl->server->get_meta();
     common_chat_templates_inputs inputs;
@@ -419,6 +433,7 @@ std::string MiniCPM47Runtime::next(bool & done) {
                 static_cast<double>(final->timings.predicted_n),
                 final->timings.vision_encode_ms
             };
+            impl->context_truncated = final->truncated;
             const int64_t wall = ggml_time_ms() - impl->request_start;
             const int64_t ttft = impl->first_token ? impl->first_token - impl->request_start : -1;
             json record = {
@@ -489,4 +504,8 @@ void MiniCPM47Runtime::resetPerformanceStats() {
 
 std::array<double, 5> MiniCPM47Runtime::performanceStats() const {
     return impl->last_performance_stats;
+}
+
+bool MiniCPM47Runtime::contextTruncated() const {
+    return impl->context_truncated;
 }
