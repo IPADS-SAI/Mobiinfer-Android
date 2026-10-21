@@ -99,9 +99,9 @@ data class ModelInfo(
     val supportsVideo: Boolean
         get() = id == "minicpm-v-4_7"
 
-    /** MiniCPM5 (text), MiniCPM-V-4.6 and Qwen3.5 expose a thinking toggle. */
+    /** MiniCPM5 (text), MiniCPM-V-4.6, Qwen3.5 and Sage-A1.5 expose a thinking toggle. */
     val supportsThinking: Boolean
-        get() = isTextOnly || id == "minicpm-v-4_6-instruct" || id == "qwen35-35b-a3b"
+        get() = isTextOnly || id == "minicpm-v-4_6-instruct" || id == "qwen35-35b-a3b" || id == "sage-a1.5"
 
     fun getDescription(context: Context): String {
         val resId = context.resources.getIdentifier(descriptionResName, "string", context.packageName)
@@ -130,10 +130,10 @@ data class ModelInfo(
         get() = !hfRepo.isNullOrBlank() || !msRepo.isNullOrBlank()
 
     companion object {
-        // This NPU branch ships only two entries: the Qwen3-VL-4B demo model
-        // and the MiniCPM-V 4.7 Hexagon bundle. The upstream demo's other
-        // variants (V-4, V-4.6, MiniCPM5-1B/2B, VoxCPM2) are intentionally
-        // not offered here.
+        // This NPU branch ships the Qwen3-VL-4B demo model plus the Hexagon
+        // MoE bundles (MiniCPM-V 4.7, Qwen3.5-35B-A3B, Sage-A1.5, Qwen3-30B-A3B).
+        // The upstream demo's other variants (V-4, V-4.6, MiniCPM5-1B/2B,
+        // VoxCPM2) are intentionally not offered here.
         val AVAILABLE_MODELS = listOf(
             // Qwen3-VL-4B-Instruct: vision-language model served from
             // ModelScope only (Qwen/Qwen3-VL-4B-Instruct-GGUF). No HuggingFace
@@ -173,6 +173,21 @@ data class ModelInfo(
                 msRepo = "fengerhu1/Qwen3.5-35B-A3B-gguf-hexagon",
                 bundleManifestFile = "SHA256SUMS",
                 totalBytes = 25_064_701_899L
+            ),
+            // Sage-A1.5 35B-A3B (qwen35moe) Hexagon bundle: vision + text
+            // agentic MoE with a 41st MTP expert layer, no speculative draft.
+            // Same hexagon-tiled-v1 expert layout as the Qwen3.5 bundle.
+            ModelInfo(
+                id = "sage-a1.5",
+                displayName = "Sage-A1.5 35B-A3B (Q4_K_M, NPU)",
+                descriptionResName = "model_desc_sage_a1_5",
+                ggufFileName = "models/sage-a1.5-les-hexagon.gguf",
+                mmprojFileName = "models/Sage-A1.5-mmproj.gguf",
+                expertsDirectory = "experts-htp-tiled",
+                expertsLayerCount = 41,
+                msRepo = "fengerhu1/Sage-A1.5-gguf-hexagon",
+                bundleManifestFile = "SHA256SUMS",
+                totalBytes = 24_632_376_251L
             ),
             // Qwen3-30B-A3B (qwen3moe) Hexagon bundle: text-only MoE, no draft and
             // no mmproj. Same hexagon-tiled-v1 expert layout (48 layers).

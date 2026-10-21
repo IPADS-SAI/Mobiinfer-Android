@@ -55,6 +55,7 @@ Android 应用（[`Android-App/`](Android-App/README.md)，基于 [OpenBMB/MiniC
 | **[MiniCPM-V 4.7 35B-A3B](https://www.modelscope.cn/models/fengerhu1/MiniCPM-V-4.7-35B-A3B-gguf-hexagon)** | 35B 总参 / 3B 激活 | 端侧 MoE 主线目标，多模态（视觉 + 文本） |
 | **[Qwen3.5-35B-A3B](https://www.modelscope.cn/models/fengerhu1/Qwen3.5-35B-A3B-gguf-hexagon)** | 35B 总参 / 3B 激活 | `qwen35moe`，视觉 + 文本，LES + DFlash |
 | **[Qwen3-30B-A3B](https://www.modelscope.cn/models/fengerhu1/Qwen3-30B-A3B-gguf-hexagon)** | 30B 总参 / 3B 激活 | `qwen3moe`，文本，LES + 外置专家 |
+| **[Sage-A1.5 35B-A3B](https://www.modelscope.cn/models/fengerhu1/Sage-A1.5-gguf-hexagon)** | 35B 总参 / 3B 激活 | `qwen35moe`，视觉 + 文本（agentic），LES + 外置专家 |
 | **[Qwen3-0.6B](https://www.modelscope.cn/models/Qwen/Qwen3-0.6B-GGUF)** | 0.6B（dense） | `qwen3`，文本 |
 | **[Qwen3-1.7B](https://www.modelscope.cn/models/Qwen/Qwen3-1.7B-GGUF)** | 1.7B（dense） | `qwen3`，文本 |
 | **[Qwen3-4B](https://www.modelscope.cn/models/Qwen/Qwen3-4B-GGUF)** | 4B（dense） | `qwen3`，文本 |

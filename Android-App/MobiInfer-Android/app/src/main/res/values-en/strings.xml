@@ -223,6 +223,7 @@
     <string name="model_running">Running</string>
     <string name="eta_unknown">calculating…</string>
     <string name="model_desc_qwen35_35b">Qwen3.5 35B-A3B on-device MoE; downloads main model, DFlash draft and 40 expert layers</string>
+    <string name="model_desc_sage_a1_5">Sage-A1.5 35B-A3B on-device MoE (qwen35moe); downloads main model, vision projector and 41 expert layers</string>
     <string name="eta_hours_minutes">%1$dh %2$dm</string>
     <string name="eta_minutes_seconds">%1$dm %2$ds</string>
     <string name="eta_seconds">%1$ds</string>
