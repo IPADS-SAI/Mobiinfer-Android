@@ -44,6 +44,12 @@ MobiInfer-Android 引入完整的 **Qualcomm Hexagon NPU 后端**，打通了**�
 | 骁龙8 Elite | 一加13、红米K80 Pro、小米15 / 小米15 Ultra、真我GT7 Pro、iQOO 13、红魔11S Pro、荣耀Magic7系列、iQOO Neo10 Pro+ |
 | 骁龙8 Gen5 | 一加Ace 6T、iQOO Z11 Turbo、vivo S50 Pro mini、Redmi K100 Pro、真我GT8、联想拯救者Y70、STEPX Neo 先行版 |
 | 骁龙8 Elite Gen5 | 小米17系列（含Pro/Pro Max/Ultra）、一加15、真我GT8 Pro、红米K90 Pro Max、iQOO 15、荣耀Magic8系列、三星Galaxy S26系列、红魔游戏手机、vivo X300系列 |
+
+<p align="center">
+  <img src="Android-App/assets/screenshoot/index.jpg" width="45%" alt="MobiInfer 首页" />
+  <img src="Android-App/assets/screenshoot/setting.jpg" width="45%" alt="MobiInfer 设置页" />
+</p>
+
 ---
 
 ## 核心
