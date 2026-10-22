@@ -15,6 +15,7 @@
     <string name="suggestion_1">Python Fibonacci sequence</string>
     <string name="suggestion_1_prompt">Write a Python function that returns the first n terms of the Fibonacci sequence. Include clear comments and an example call.</string>
     <string name="suggestion_2">What is in this picture?</string>
+    <string name="image_only_prompt">Describe this image in detail and point out the key information.</string>
     <string name="suggestion_1_text">What is artificial intelligence?</string>
     <string name="suggestion_2_text">Write a short poem about spring.</string>
     <string name="model_management">Model Management</string>
@@ -36,7 +37,7 @@
     <string name="load_model">Load Model</string>
     <string name="hint_input">Message</string>
     <string name="add_image">Add Image</string>
-    <string name="think_toggle">Think</string>
+    <string name="think_toggle">Deep Thinking</string>
     <string name="send">Send</string>
     <string name="stop_generating">Stop</string>
     <string name="metric_image_time">Image processing %1$s</string>
@@ -67,6 +68,8 @@
     <string name="reload_model">Reload</string>
     <string name="no_model_file">No model file</string>
     <string name="select_model">Select Model</string>
+    <string name="model_label">Model · %1$s</string>
+    <string name="select_model_named">Current model: %1$s. Tap the model name or the arrow on the right to switch.</string>
     <string name="delete_model_files">Delete Model Files</string>
 
     <!-- MainActivity -->
@@ -231,4 +234,11 @@
     <string name="eta_hours_minutes">%1$dh %2$dm</string>
     <string name="eta_minutes_seconds">%1$dm %2$ds</string>
     <string name="eta_seconds">%1$ds</string>
+    <string name="debug_logs_title">Debug logs</string>
+    <string name="debug_logs_toggle">Enable debug logging</string>
+    <string name="debug_logs_description">Debug builds only. When enabled, app logs and the most recent abnormal-exit report are kept across restarts (up to about 512 KB). Off by default.</string>
+    <string name="debug_logs_open">View and copy logs</string>
+    <string name="debug_logging_enabled">Debug logging enabled</string>
+    <string name="debug_logging_disabled">Debug logging disabled</string>
+    <string name="debug_logs_unavailable">This build does not include the debug log viewer</string>
 </resources>

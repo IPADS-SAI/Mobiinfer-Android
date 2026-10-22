@@ -18,6 +18,28 @@
 // (1 on single-NSP SoCs, 2 where a second NSP is available).
 extern "C" int mobiinfer_htp_session_count();
 
+static const std::string kThinkOpen = "\x3Cthink\x3E";
+static const std::string kThinkClose = "\x3C/think\x3E";
+
+static bool split_thinking_content(const std::string & raw, std::string & reasoning, std::string & content) {
+    const auto think_start = raw.find(kThinkOpen);
+    if (think_start == std::string::npos) {
+        return false;
+    }
+    const std::string body = raw.substr(think_start + kThinkOpen.size());
+    const auto think_end = body.find(kThinkClose);
+    if (think_end == std::string::npos) {
+        reasoning = body;
+        content.clear();
+    } else {
+        reasoning = body.substr(0, think_end);
+        content = body.substr(think_end + kThinkClose.size());
+        const auto first = content.find_first_not_of("\r\n");
+        content.erase(0, first == std::string::npos ? content.size() : first);
+    }
+    return true;
+}
+
 struct MiniCPM47Runtime::Impl {
     common_params params;
     std::unique_ptr<server_context> server;
@@ -45,6 +67,9 @@ struct MiniCPM47Runtime::Impl {
     std::vector<raw_buffer> files;
     std::string pending_media;
     std::string response;
+    std::string reasoning;
+    bool reasoning_started = false;
+    bool reasoning_closed = false;
     bool thinking = false;
     bool vision_htp = true;
     bool dspark = true;
@@ -58,25 +83,34 @@ struct MiniCPM47Runtime::Impl {
     std::string label;
     int benchmark_max_tokens = 0;
     int memory_budget_mb = 6000;
+    int image_min_tokens = -1;
+    int image_max_tokens = -1;
     int cache_slots = 0;
     bool context_truncated = false;
     std::array<double, 5> last_performance_stats = {0.0, 0.0, 0.0, 0.0, 0.0};
 
     void finish() {
-        if (!response.empty()) {
+        if (!response.empty() || !reasoning.empty()) {
             common_chat_msg msg;
             msg.role = "assistant";
             msg.content = response;
+            msg.reasoning_content = reasoning;
             messages.push_back(std::move(msg));
         }
         response.clear();
+        reasoning.clear();
+        reasoning_started = false;
+        reasoning_closed = false;
         reader.reset();
     }
 };
 
-MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string & experts, int memory_budget_mb, int context_size)
+MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string & experts, int memory_budget_mb,
+                                   int context_size, int image_min_tokens, int image_max_tokens)
     : impl(std::make_unique<Impl>()) {
     auto & p = impl->params;
+    impl->image_min_tokens = image_min_tokens;
+    impl->image_max_tokens = image_max_tokens;
     const auto memory = minicpm47_memory_config(memory_budget_mb);
     impl->memory_budget_mb = memory.budget_mb;
     impl->cache_slots = memory.cache_slots;
@@ -167,7 +201,8 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
     p.ctx_shift = false;
     p.cpuparams.n_threads = p.cpuparams_batch.n_threads = 4;
     p.mmproj_use_gpu = impl->vision_htp;
-    p.image_max_tokens = 64;
+    if (impl->image_min_tokens > 0) p.image_min_tokens = impl->image_min_tokens;
+    p.image_max_tokens = impl->image_max_tokens > 0 ? impl->image_max_tokens : 64;
     p.enable_reasoning = 0;
     p.sampling.temp = 0.0f;
     p.sampling.seed = 42;
@@ -292,10 +327,11 @@ bool MiniCPM47Runtime::start() {
     common_log_set_timestamps(common_log_main(), true);
     impl->server = std::make_unique<server_context>();
     LOGi("MiniCPM47 mmproj: %s", impl->params.mmproj.path.empty() ? "deferred until image input" : "loading");
-    LOGi("MiniCPM47 runtime: vision=%s dspark=%d bank=%d batch=%d ubatch=%d n_max=%d budget=%dMB cache=%d temp=0 seed=42",
+    LOGi("MiniCPM47 runtime: vision=%s dspark=%d bank=%d batch=%d ubatch=%d n_max=%d budget=%dMB cache=%d image_tokens=%d..%d temp=0 seed=42",
          impl->vision_htp ? "HTP" : "CPU", impl->dspark, impl->params.moe_slot_bank,
          impl->params.n_batch, impl->params.n_ubatch, impl->params.speculative.draft.n_max,
-         impl->memory_budget_mb, impl->cache_slots);
+         impl->memory_budget_mb, impl->cache_slots, impl->params.image_min_tokens,
+         impl->params.image_max_tokens);
     if (!impl->server->load_model(impl->params)) {
         if (impl->dspark) {
             LOGw("MiniCPM47 runtime: load_model failed with draft; retrying without speculative decoding");
@@ -372,6 +408,8 @@ void MiniCPM47Runtime::submit(const std::string & text, int n_predict) {
     impl->pending_media.clear();
     impl->last_performance_stats = {0.0, 0.0, 0.0, 0.0, 0.0};
     impl->context_truncated = false;
+    impl->reasoning_started = false;
+    impl->reasoning_closed = false;
     impl->messages.push_back(std::move(msg));
     const auto meta = impl->server->get_meta();
     common_chat_templates_inputs inputs;
@@ -415,13 +453,29 @@ std::string MiniCPM47Runtime::next(bool & done) {
         }
         if (auto * partial = dynamic_cast<server_task_result_cmpl_partial *>(result.get())) {
             std::string chunk;
-            for (const auto & diff : partial->oaicompat_msg_diffs) chunk += diff.content_delta;
+            for (const auto & diff : partial->oaicompat_msg_diffs) {
+                if (!diff.reasoning_content_delta.empty()) {
+                    if (!impl->reasoning_started) {
+                        chunk += kThinkOpen + "\n";
+                        impl->reasoning_started = true;
+                    }
+                    impl->reasoning += diff.reasoning_content_delta;
+                    chunk += diff.reasoning_content_delta;
+                }
+                if (!diff.content_delta.empty()) {
+                    if (impl->reasoning_started && !impl->reasoning_closed) {
+                        chunk += "\n" + kThinkClose + "\n";
+                        impl->reasoning_closed = true;
+                    }
+                    impl->response += diff.content_delta;
+                    chunk += diff.content_delta;
+                }
+            }
             if (!chunk.empty()) {
                 if (!impl->first_token) {
                     impl->first_token = ggml_time_ms();
                     LOGi("MiniCPM47 first_token_ms=%lld", (long long)(impl->first_token - impl->request_start));
                 }
-                impl->response += chunk;
                 return chunk;
             }
         }
@@ -482,6 +536,14 @@ void MiniCPM47Runtime::restore(const std::vector<RestoreTurn> & turns) {
         common_chat_msg msg;
         msg.role = turn.role;
         std::string content = turn.text;
+        if (turn.role == "assistant") {
+            std::string reasoning;
+            std::string answer;
+            if (split_thinking_content(content, reasoning, answer)) {
+                msg.reasoning_content = std::move(reasoning);
+                content = std::move(answer);
+            }
+        }
         // Media markers must precede the turn's text, one per attached image,
         // mirroring addImage()/submit(). The server maps markers to cli_files
         // positionally, so the file order must match the marker order.

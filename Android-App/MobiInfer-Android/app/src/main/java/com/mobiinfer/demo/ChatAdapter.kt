@@ -183,8 +183,8 @@ class ChatAdapter(
             if (item.isTextOnly) {
                 tvWelcomeTitle.setText(R.string.welcome_title_text)
                 tvWelcomeDesc.setText(R.string.welcome_desc_text)
-                btnSuggestion1.setText(R.string.suggestion_1_text)
-                btnSuggestion2.setText(R.string.suggestion_2_text)
+                btnSuggestion1.setText(R.string.suggestion_1)
+                btnSuggestion2.setText(R.string.suggestion_1_text)
                 btnSuggestion1.setIconResource(R.drawable.ic_lightbulb)
                 btnSuggestion2.setIconResource(R.drawable.ic_lightbulb)
             } else {
@@ -195,8 +195,7 @@ class ChatAdapter(
                 btnSuggestion1.setIconResource(R.drawable.ic_lightbulb)
                 btnSuggestion2.setIconResource(R.drawable.ic_image)
             }
-            val s1 = if (item.isTextOnly) btnSuggestion1.text.toString()
-                     else ctx.getString(R.string.suggestion_1_prompt)
+            val s1 = ctx.getString(R.string.suggestion_1_prompt)
             val s2 = btnSuggestion2.text.toString()
             btnSuggestion1.setOnClickListener { onSuggestionClick?.invoke(s1) }
             if (item.isTextOnly) {

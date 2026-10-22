@@ -57,6 +57,15 @@ data class ModelInfo(
     val ggufBytes: Long? = null,
     val mmprojBytes: Long? = null,
     val acousticBytes: Long? = null,
+    /**
+     * Optional dynamic-resolution limits for the vision encoder. Qwen-VL
+     * family mmproj models need at least 1024 image tokens for reliable
+     * reading/grounding; -1 keeps the mmproj metadata defaults.
+     */
+    val imageMinTokens: Int = -1,
+    val imageMaxTokens: Int = -1,
+    /** Initial image scale before the user overrides it in Model Management. */
+    val defaultImageScaleFactor: Float = 0.5f,
     val expertsDirectory: String? = null,
     /** Number of tiled expert layer files (`layer_NNN.bin`) in [expertsDirectory]. */
     val expertsLayerCount: Int = 40,
@@ -99,9 +108,15 @@ data class ModelInfo(
     val supportsVideo: Boolean
         get() = id == "minicpm-v-4_7"
 
-    /** MiniCPM5 (text), MiniCPM-V-4.6, Qwen3.5 and Sage-A1.5 expose a thinking toggle. */
+    /**
+     * Models whose bundled chat template actually consumes `enable_thinking`.
+     * Qwen3-VL-4B-Instruct's template does not expose this switch.
+     */
     val supportsThinking: Boolean
-        get() = isTextOnly || id == "minicpm-v-4_6-instruct" || id == "qwen35-35b-a3b" || id == "sage-a1.5"
+        get() = id == "qwen35-35b-a3b" ||
+            id == "sage-a1.5" ||
+            id == "qwen3-30b-a3b" ||
+            id == "minicpm-v-4_7"
 
     fun getDescription(context: Context): String {
         val resId = context.resources.getIdentifier(descriptionResName, "string", context.packageName)
@@ -135,6 +150,69 @@ data class ModelInfo(
         // The upstream demo's other variants (V-4, V-4.6, MiniCPM5-1B/2B,
         // VoxCPM2) are intentionally not offered here.
         val AVAILABLE_MODELS = listOf(
+            // MiniCPM-V 4.7 is the default and appears first in every selector.
+            ModelInfo(
+                id = "minicpm-v-4_7",
+                displayName = "MiniCPM-V-4.7 35B-A3B (Q3, NPU)",
+                descriptionResName = "model_desc_v47_npu",
+                ggufFileName = "minicpm47-les-hexagon.gguf",
+                mmprojFileName = "mmproj-MiniCPM-V-4_7-real-f16-pad4320.gguf",
+                expertsDirectory = "experts-htp-tiled",
+                msRepo = "fengerhu1/MiniCPM-V-4.7-35B-A3B-gguf-hexagon",
+                bundleManifestFile = "SHA256SUMS",
+                draftFileName = "dspark-MiniCPM-V-4_7-q8_0.gguf",
+                totalBytes = 19_315_173_512L
+            ),
+            // Sage-A1.5 35B-A3B (qwen35moe) Hexagon bundle: vision + text
+            // agentic MoE with a 41st MTP expert layer, no speculative draft.
+            // Same hexagon-tiled-v1 expert layout as the Qwen3.5 bundle.
+            ModelInfo(
+                id = "sage-a1.5",
+                displayName = "Sage-A1.5 35B-A3B (Q4_K_M, NPU)",
+                descriptionResName = "model_desc_sage_a1_5",
+                ggufFileName = "models/sage-a1.5-les-hexagon.gguf",
+                mmprojFileName = "models/Sage-A1.5-mmproj.gguf",
+                expertsDirectory = "experts-htp-tiled",
+                expertsLayerCount = 41,
+                msRepo = "fengerhu1/Sage-A1.5-gguf-hexagon",
+                bundleManifestFile = "SHA256SUMS",
+                imageMinTokens = 1024,
+                imageMaxTokens = 1024,
+                defaultImageScaleFactor = 1.0f,
+                totalBytes = 24_632_376_251L
+            ),
+            // Qwen3.5-35B-A3B (qwen35moe) Hexagon bundle: text-only, same
+            // tiled-expert layout as the MiniCPM 4.7 bundle.  Main GGUF and the
+            // DFlash draft live under `models/`, experts under
+            // `experts-htp-tiled/`; all enumerated by the SHA256SUMS manifest.
+            ModelInfo(
+                id = "qwen35-35b-a3b",
+                displayName = "Qwen3.5-35B-A3B (Q4_K_M, NPU)",
+                descriptionResName = "model_desc_qwen35_35b",
+                ggufFileName = "models/qwen35-les-hexagon.gguf",
+                mmprojFileName = "models/mmproj-Qwen3.5-35B-A3B-Q8_0.gguf",
+                expertsDirectory = "experts-htp-tiled",
+                draftFileName = "models/Qwen3.5-35B-A3B-DFlash-Q8_0.gguf",
+                msRepo = "fengerhu1/Qwen3.5-35B-A3B-gguf-hexagon",
+                bundleManifestFile = "SHA256SUMS",
+                imageMinTokens = 1024,
+                imageMaxTokens = 1024,
+                defaultImageScaleFactor = 1.0f,
+                totalBytes = 25_064_701_899L
+            ),
+            // Qwen3-30B-A3B (qwen3moe) Hexagon bundle: text-only MoE, no draft and
+            // no mmproj. Same hexagon-tiled-v1 expert layout (48 layers).
+            ModelInfo(
+                id = "qwen3-30b-a3b",
+                displayName = "Qwen3-30B-A3B (Q4_K_M, NPU)",
+                descriptionResName = "model_desc_qwen3_30b",
+                ggufFileName = "models/qwen3-30b-a3b-les-hexagon.gguf",
+                expertsDirectory = "experts-htp-tiled",
+                expertsLayerCount = 48,
+                msRepo = "fengerhu1/Qwen3-30B-A3B-gguf-hexagon",
+                bundleManifestFile = "SHA256SUMS",
+                totalBytes = 20_331_058_440L
+            ),
             // Qwen3-VL-4B-Instruct: vision-language model served from
             // ModelScope only (Qwen/Qwen3-VL-4B-Instruct-GGUF). No HuggingFace
             // mirror is registered, so the downloader falls back to a single
@@ -150,69 +228,6 @@ data class ModelInfo(
                 ggufBytes = 2_497_281_664L,
                 mmprojBytes = 836_180_256L,
                 totalBytes = 3_333_461_920L
-            ),
-            // MiniCPM-V 4.7 35B-A3B Hexagon bundle (NPU). Not a single GGUF:
-            // it ships a mixed-Q3 main model, a padded F16 mmproj, a Q8_0
-            // DSpark draft and 40 tiled expert layers. Served from ModelScope;
-            // the per-file list (and SHA-256s) come from the repo's
-            // SHA256SUMS manifest so the 40 expert files stay out of the
-            // client source. The repo is laid out so each entry's relative
-            // path already matches the on-device per-model layout.
-            // Qwen3.5-35B-A3B (qwen35moe) Hexagon bundle: text-only, same
-            // tiled-expert layout as the MiniCPM 4.7 bundle.  Main GGUF and the
-            // DFlash draft live under `models/`, experts under
-            // `experts-htp-tiled/`; all enumerated by the SHA256SUMS manifest.
-            ModelInfo(
-                id = "qwen35-35b-a3b",
-                displayName = "Qwen3.5-35B-A3B (Q4_K_M, NPU)",
-                descriptionResName = "model_desc_qwen35_35b",
-                ggufFileName = "models/qwen35-les-hexagon.gguf",
-                mmprojFileName = "models/mmproj-Qwen3.5-35B-A3B-Q8_0.gguf",
-                expertsDirectory = "experts-htp-tiled",
-                draftFileName = "models/Qwen3.5-35B-A3B-DFlash-Q8_0.gguf",
-                msRepo = "fengerhu1/Qwen3.5-35B-A3B-gguf-hexagon",
-                bundleManifestFile = "SHA256SUMS",
-                totalBytes = 25_064_701_899L
-            ),
-            // Sage-A1.5 35B-A3B (qwen35moe) Hexagon bundle: vision + text
-            // agentic MoE with a 41st MTP expert layer, no speculative draft.
-            // Same hexagon-tiled-v1 expert layout as the Qwen3.5 bundle.
-            ModelInfo(
-                id = "sage-a1.5",
-                displayName = "Sage-A1.5 35B-A3B (Q4_K_M, NPU)",
-                descriptionResName = "model_desc_sage_a1_5",
-                ggufFileName = "models/sage-a1.5-les-hexagon.gguf",
-                mmprojFileName = "models/Sage-A1.5-mmproj.gguf",
-                expertsDirectory = "experts-htp-tiled",
-                expertsLayerCount = 41,
-                msRepo = "fengerhu1/Sage-A1.5-gguf-hexagon",
-                bundleManifestFile = "SHA256SUMS",
-                totalBytes = 24_632_376_251L
-            ),
-            // Qwen3-30B-A3B (qwen3moe) Hexagon bundle: text-only MoE, no draft and
-            // no mmproj. Same hexagon-tiled-v1 expert layout (48 layers).
-            ModelInfo(
-                id = "qwen3-30b-a3b",
-                displayName = "Qwen3-30B-A3B (Q4_K_M, NPU)",
-                descriptionResName = "model_desc_qwen3_30b",
-                ggufFileName = "models/qwen3-30b-a3b-les-hexagon.gguf",
-                expertsDirectory = "experts-htp-tiled",
-                expertsLayerCount = 48,
-                msRepo = "fengerhu1/Qwen3-30B-A3B-gguf-hexagon",
-                bundleManifestFile = "SHA256SUMS",
-                totalBytes = 20_331_058_440L
-            ),
-            ModelInfo(
-                id = "minicpm-v-4_7",
-                displayName = "MiniCPM-V-4.7 35B-A3B (Q3, NPU)",
-                descriptionResName = "model_desc_v47_npu",
-                ggufFileName = "minicpm47-les-hexagon.gguf",
-                mmprojFileName = "mmproj-MiniCPM-V-4_7-real-f16-pad4320.gguf",
-                expertsDirectory = "experts-htp-tiled",
-                msRepo = "fengerhu1/MiniCPM-V-4.7-35B-A3B-gguf-hexagon",
-                bundleManifestFile = "SHA256SUMS",
-                draftFileName = "dspark-MiniCPM-V-4_7-q8_0.gguf",
-                totalBytes = 19_315_173_512L
             )
         )
 

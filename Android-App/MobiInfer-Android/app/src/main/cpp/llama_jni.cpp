@@ -220,6 +220,8 @@ Java_com_mobiinfer_demo_LlamaEngine_readPerformanceStatsNative(
 // persisted preference, so this only matters for the very first
 // setImageMaxSliceNumsNative call before mmproj is loaded.
 static int                                g_image_max_slice_nums = 9;
+static int                                g_image_min_tokens = -1;
+static int                                g_image_max_tokens = -1;
 
 // Effective n_ctx used to create g_context.  Set by prepare(); reads by
 // the few stay-under-context guards scattered through this file.  Kept
@@ -379,7 +381,9 @@ Java_com_mobiinfer_demo_LlamaEngine_load(JNIEnv *env, jobject, jstring jmodel_pa
 
     if (g_moe) {
         try {
-            g_moe_runtime = std::make_unique<MiniCPM47Runtime>(model_path, g_experts_path, memory_budget_mb, g_requested_context_size);
+            g_moe_runtime = std::make_unique<MiniCPM47Runtime>(
+                model_path, g_experts_path, memory_budget_mb, g_requested_context_size,
+                g_image_min_tokens, g_image_max_tokens);
         } catch (const std::exception & e) {
             LOGe("MiniCPM47 configuration failed: %s", e.what());
             env->ReleaseStringUTFChars(jmodel_path, model_path);
@@ -432,7 +436,8 @@ Java_com_mobiinfer_demo_LlamaEngine_loadMmproj(JNIEnv *env, jobject,
     mparams.image_max_slice_nums = g_image_max_slice_nums;
 
     mparams.n_threads = N_THREADS;
-    if (g_moe) mparams.image_max_tokens = 64;
+    if (g_image_min_tokens > 0) mparams.image_min_tokens = g_image_min_tokens;
+    if (g_image_max_tokens > 0) mparams.image_max_tokens = g_image_max_tokens;
 
     g_ctx_vision = mtmd_init_from_file(mmproj_path, g_model, mparams);
     env->ReleaseStringUTFChars(jmmproj_path, mmproj_path);
@@ -503,6 +508,17 @@ Java_com_mobiinfer_demo_LlamaEngine_setEnableThinkingNative(JNIEnv * /*env*/,
     g_enable_thinking = (bool) jenable;
     if (g_moe_runtime) g_moe_runtime->setThinking(g_enable_thinking);
     LOGi("%s: enable_thinking=%d", __func__, (int) g_enable_thinking);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_mobiinfer_demo_LlamaEngine_setImageTokenLimitsNative(JNIEnv * /*env*/,
+                                                              jobject,
+                                                              jint min_tokens,
+                                                              jint max_tokens) {
+    g_image_min_tokens = (int) min_tokens;
+    g_image_max_tokens = (int) max_tokens;
+    LOGi("%s: image_tokens=%d..%d", __func__, g_image_min_tokens, g_image_max_tokens);
 }
 
 static llama_context *init_context(llama_model *model, const int n_ctx = DEFAULT_CONTEXT_SIZE) {

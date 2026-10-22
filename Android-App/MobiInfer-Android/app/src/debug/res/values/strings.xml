@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="debug_log_viewer_title">调试日志</string>
+    <string name="debug_log_viewer_hint">包含应用日志及上次异常退出记录。可长按选择文本，或点“复制全部”。</string>
+    <string name="debug_log_copy">复制全部</string>
+    <string name="debug_log_copied">日志已复制到剪贴板</string>
+    <string name="debug_log_empty">暂无日志。请先在设置中开启“调试日志”，然后复现问题。</string>
+    <string name="debug_log_clear_title">清空调试日志</string>
+    <string name="debug_log_clear_message">清空后无法恢复，是否继续？</string>
+    <string name="debug_log_clear_action">清空</string>
+</resources>

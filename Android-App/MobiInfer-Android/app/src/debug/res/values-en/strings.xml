@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="debug_log_viewer_title">Debug logs</string>
+    <string name="debug_log_viewer_hint">Includes app logs and the latest abnormal-exit report. Long-press to select text, or tap “Copy all”.</string>
+    <string name="debug_log_copy">Copy all</string>
+    <string name="debug_log_copied">Log copied to clipboard</string>
+    <string name="debug_log_empty">No logs yet. Enable “Debug logging” in settings, then reproduce the issue.</string>
+    <string name="debug_log_clear_title">Clear debug logs</string>
+    <string name="debug_log_clear_message">This cannot be undone. Continue?</string>
+    <string name="debug_log_clear_action">Clear</string>
+</resources>

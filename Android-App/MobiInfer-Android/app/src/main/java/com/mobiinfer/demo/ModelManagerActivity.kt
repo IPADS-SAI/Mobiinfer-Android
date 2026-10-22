@@ -23,6 +23,7 @@ import androidx.lifecycle.repeatOnLifecycle
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.button.MaterialButton
+import com.google.android.material.materialswitch.MaterialSwitch
 import com.google.android.material.slider.Slider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -87,8 +88,35 @@ class ModelManagerActivity : AppCompatActivity() {
         setupImageScale()
         setupMemoryBudget()
         setupContextSize()
+        setupDebugLogs()
         refreshStates()
         observeDownloads()
+    }
+
+    private fun setupDebugLogs() {
+        val card = findViewById<View>(R.id.card_debug_logs)
+        if (!DebugLogBridge.isAvailable()) {
+            card.visibility = View.GONE
+            return
+        }
+
+        card.visibility = View.VISIBLE
+        val toggle = findViewById<MaterialSwitch>(R.id.switch_debug_logs)
+        toggle.isChecked = DebugLogBridge.isEnabled(this)
+        toggle.setOnCheckedChangeListener { _, enabled ->
+            DebugLogBridge.setEnabled(this, enabled)
+            Toast.makeText(
+                this,
+                if (enabled) R.string.debug_logging_enabled else R.string.debug_logging_disabled,
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+
+        findViewById<MaterialButton>(R.id.btn_open_debug_logs).setOnClickListener {
+            if (!DebugLogBridge.open(this)) {
+                Toast.makeText(this, R.string.debug_logs_unavailable, Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     private fun setupImageScale() {

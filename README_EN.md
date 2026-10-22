@@ -1,10 +1,14 @@
 <div align="center">
 
-# MobiInfer · Android
+<h1 align="center">
+  <img src="Android-App/MobiInfer-Android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.webp" width="64" height="64" alt="MobiInfer App icon" />
+  MobiInfer · Android
+</h1>
 
 
 **Running a 35B-class MoE locally on a phone**
 
+[![Release](https://img.shields.io/badge/release-v0.1--alpha-blue)](https://github.com/IPADS-SAI/Mobiinfer-Android/releases)
 [![Platform](https://img.shields.io/badge/platform-Android%20%7C%20Snapdragon-3DDC84)](#)
 [![Backend](https://img.shields.io/badge/backend-Hexagon%20NPU%20(HTP)-blue)](#)
 [![Base](https://img.shields.io/badge/built%20on-llama.cpp--omni-orange)](#)
@@ -16,13 +20,30 @@
 
 ---
 
+## News
+
+- [2026.10.22] 🔥 Day-0 support for InternScience's latest Sage-A1.5 35B-A3B, with 41 expert layers streamed from an HTP-tiled bundle.
+- [2026.10.19] 🛠️ Added support for Qwen3-30B-A3B / Qwen3.5-MoE-35B-A3B, with MoE experts using external slots and LES.
+- [2026.10.17] 🚀 Released MobiInfer-Android v0.1 with model management, one-tap downloads, and on-device NPU inference.
+
+---
+
 ## Introduction
 
 > **A Snapdragon phone running a 35B-A3B-class MoE on the NPU**
 
-MobiInfer-Android ports the full **Qualcomm Hexagon NPU (HTP/HTA DSP) backend** into [llama.cpp-omni](https://github.com/OpenBMB/llama.cpp-omni) and builds a complete on-device path for **large sparse MoE models**: expert weights stay resident in flash, are streamed into the NPU on demand, lookahead scheduling masks the I/O latency, and an adapted **DSpark speculative sampler** pushes decode speed further.
+MobiInfer-Android brings the complete **Qualcomm Hexagon NPU backend** and covers the full **on-device large-MoE** path: expert weights remain in flash, stream into the NPU on demand, lookahead scheduling hides I/O latency, and **DSpark speculative sampling** further accelerates decoding.
 
-The Android app ([`Android-App/`](Android-App/README.md), based on [OpenBMB/MiniCPM-V-Apps](https://github.com/OpenBMB/MiniCPM-V-Apps)) ships with this repo — install it and run directly on the phone.
+The repo provides the [Android APK](https://github.com/IPADS-SAI/Mobiinfer-Android/releases) and source (`Android-App/`); install it and run directly on the phone.
+
+**Supported devices**
+
+
+| SoC | Phone models |
+|--|--|
+| Snapdragon 8 Elite | OnePlus 13, Redmi K80 Pro, Xiaomi 15 / Xiaomi 15 Ultra, realme GT7 Pro, iQOO 13, Red Magic 11S Pro, HONOR Magic7 series, iQOO Neo10 Pro+ |
+| Snapdragon 8 Gen 5 | OnePlus Ace 6T, iQOO Z11 Turbo, vivo S50 Pro mini, Redmi K100 Pro, realme GT8, Lenovo Legion Y70, STEPX Neo Pioneer Edition |
+| Snapdragon 8 Elite Gen 5 | Xiaomi 17 series (including Pro / Pro Max / Ultra), OnePlus 15, realme GT8 Pro, Redmi K90 Pro Max, iQOO 15, HONOR Magic8 series, Samsung Galaxy S26 series, Red Magic gaming phones, vivo X300 series |
 
 ---
 
@@ -50,20 +71,17 @@ The Android app ([`Android-App/`](Android-App/README.md), based on [OpenBMB/Mini
 
 ## Supported models
 
-| Model | Scale | Notes |
-|---|---|---|
-| **MiniCPM-V 4.7 35B-A3B** | 35B total / 3B active | Primary on-device MoE target, multimodal (vision + text) |
-| **Qwen3.5-35B-A3B** | 35B total / 3B active | `qwen35moe`, vision + text, LES + DFlash |
-| **Qwen3-30B-A3B** | 30B total / 3B active | `qwen3moe`, text, LES + external experts |
-| **Sage-A1.5 35B-A3B** | 35B total / 3B active | `qwen35moe`, vision + text (agentic), LES + external experts |
-| **Qwen3-0.6B** | 0.6B (dense) | `qwen3`, text |
-| **Qwen3-1.7B** | 1.7B (dense) | `qwen3`, text |
-| **Qwen3-4B** | 4B (dense) | `qwen3`, text |
-| **Qwen3-VL-2B** | 2B (dense) | `qwen3vl`, vision + text |
-| **Qwen3-VL-4B** | 4B (dense) | `qwen3vl`, vision + text |
-| DFlash / DSpark draft models | — | Speculative sampling (`dflash` / `dspark`) |
+| Model | Scale | Weight size | Notes |
+|---|---|---|---|
+| **[MiniCPM-V 4.7 35B-A3B](https://www.modelscope.cn/models/fengerhu1/MiniCPM-V-4.7-35B-A3B-gguf-hexagon)** | 35B total / 3B active | ~19.3G | Primary on-device MoE target, multimodal (vision + text) |
+| **[Qwen3.5-35B-A3B](https://www.modelscope.cn/models/fengerhu1/Qwen3.5-35B-A3B-gguf-hexagon)** | 35B total / 3B active | ~25.1G | Vision + text, LES + DFlash |
+| **[Qwen3-30B-A3B](https://www.modelscope.cn/models/fengerhu1/Qwen3-30B-A3B-gguf-hexagon)** | 30B total / 3B active | ~20.3G | Text, LES + external experts |
+| **[Sage-A1.5 35B-A3B](https://www.modelscope.cn/models/fengerhu1/Sage-A1.5-gguf-hexagon)** | 35B total / 3B active | ~24.6G | Vision + text (agentic), LES + external experts |
+| **[Qwen3 series](https://www.modelscope.cn/models/Qwen/Qwen3-4B-GGUF)** | 0.6 / 1.7 / 4 B | 0.64 / 1.83 / 2.5 G | `qwen3`, text |
+| **[Qwen3-VL series](https://www.modelscope.cn/models/Qwen/Qwen3-VL-4B-Instruct-GGUF)** | 2 / 4 B | ~1.9 / 3.3 G | `qwen3vl`, vision + text |
+| DFlash / DSpark series | — | ~0.42–0.43 G | Speculative sampling (`dflash` / `dspark`) |
 
-Architecture coverage includes `qwen3`/`qwen3moe`/`qwen3next`, `qwen3vl`/`qwen3vlmoe`, `qwen35moe`, `dflash`, `minicpm` families, and the rest of the common architectures within the llama.cpp ecosystem.
+Architecture coverage includes `qwen3`/`qwen3moe`/`qwen3next`, `qwen3vl`/`qwen3vlmoe`, `qwen35moe`, `dflash`, `minicpm` families, and other common architectures within llama.cpp.
 
 ---
 
@@ -71,13 +89,11 @@ Architecture coverage includes `qwen3`/`qwen3moe`/`qwen3next`, `qwen3vl`/`qwen3v
 
 > 📱 Measured on OnePlus 13 (Snapdragon 8 Elite, HTP0 + HTP1), text-only, 128-token output.
 
-| Model | SoC | Prefill (token/s) | Decode (token/s) |
-|---|---|---:|---:|
-| MiniCPM-V 4.7 35B-A3B (Q3, MoE + LES + DSpark) | Snapdragon 8 Elite | 94.28 | 13.65 |
-| MiniCPM-V 4.7 35B-A3B (same, app, short prompt, 41 tokens) | Snapdragon 8 Elite | 22.02 | 17.98 |
-| Qwen3-VL-4B-Instruct (Q4_K_M) | Snapdragon 8 Elite | 1013.74 | 18.13 |
-
-MiniCPM rows are app measurements: the short prompt uses the Python Fibonacci example without mmproj; the 512-token result is the [median of five runs](docs/app-chunk512-five-runs-20261017.md) with mmproj loaded. Qwen3 is measured with the CLI.
+| Model | Configuration | SoC | Prompt length | Prefill (token/s) | Decode (token/s) |
+|---|---|---|---|---:|---:|
+| MiniCPM-V 4.7 35B-A3B | Q3, LES + DSpark | 8 Elite | 41 | 22.02 | 17.98 |
+| MiniCPM-V 4.7 35B-A3B | Q3, LES + DSpark | 8 Elite | 512 | 94.28 | 13.65 |
+| Qwen3-VL-4B-Instruct | Q4_K_M | 8 Elite | 512 | 1013.74 | 18.13 |
 
 ---
 
@@ -93,9 +109,9 @@ Download the latest Android APK from [Releases](https://github.com/IPADS-SAI/Mob
 adb install -r MobiInfer-Android-<version>.apk
 ```
 
-### 2. Download the model weights (~17 GB)
+### 2. Download the model weights (~19 GB)
 
-Open the app → **Model Manager** → select **MiniCPM-V 4.7 35B-A3B (Q3, NPU)** → **Download**. The app pulls the full bundle (main model + mmproj + DSpark draft + 40-layer tiled experts, ~**17 GB**) from ModelScope and verifies every file against `SHA256SUMS`. Use Wi‑Fi and keep ~17 GB free.
+Open the app → **Model Manager** → select **MiniCPM-V 4.7 35B-A3B (Q3, NPU)** → **Download**. The app pulls the full bundle (main model + mmproj + DSpark draft + 40-layer tiled experts, ~**19 GB**) from ModelScope and verifies every file against `SHA256SUMS`. Use Wi‑Fi and keep ~19 GB free.
 
 ### 3. Run
 

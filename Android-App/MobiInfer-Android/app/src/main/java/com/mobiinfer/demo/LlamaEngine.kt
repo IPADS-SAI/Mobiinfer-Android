@@ -232,9 +232,11 @@ class LlamaEngine private constructor(
             prefs(context).edit().putInt(KEY_IMAGE_MAX_SLICE, clamped).apply()
         }
 
-        fun getImageScaleFactor(context: Context): Float =
-            prefs(context).getFloat(KEY_IMAGE_SCALE_FACTOR, DEFAULT_IMAGE_SCALE_FACTOR)
+        fun getImageScaleFactor(context: Context): Float {
+            val modelDefault = getSelectedModel(context).defaultImageScaleFactor
+            return prefs(context).getFloat(KEY_IMAGE_SCALE_FACTOR, modelDefault)
                 .coerceIn(MIN_IMAGE_SCALE_FACTOR, MAX_IMAGE_SCALE_FACTOR)
+        }
 
         fun setImageScaleFactorPref(context: Context, factor: Float) {
             val clamped = factor.coerceIn(MIN_IMAGE_SCALE_FACTOR, MAX_IMAGE_SCALE_FACTOR)
@@ -1279,6 +1281,7 @@ class LlamaEngine private constructor(
 
     private external fun init(nativeLibDir: String)
     private external fun load(modelPath: String, expertsPath: String?, memoryBudgetMb: Int, contextSize: Int): Int
+    private external fun setImageTokenLimitsNative(minTokens: Int, maxTokens: Int)
     // image_max_slice_nums: 1..9 (or -1 for model default).  See JNI for
     // the semantics; the upper layer should pass MIN_IMAGE_SLICE..MAX_IMAGE_SLICE.
     private external fun loadMmproj(mmprojPath: String, imageMaxSliceNums: Int): Int
@@ -1383,6 +1386,7 @@ class LlamaEngine private constructor(
                         "${modelInfo.displayName} vision weights are missing or unreadable"
                     }
                 }
+                setImageTokenLimitsNative(modelInfo.imageMinTokens, modelInfo.imageMaxTokens)
                 load(pathToModel, expertsPath, getMemoryBudgetMb(context), getContextSize(context)).let {
                     if (it != 0) throw RuntimeException("Failed to load model (code: $it)")
                 }

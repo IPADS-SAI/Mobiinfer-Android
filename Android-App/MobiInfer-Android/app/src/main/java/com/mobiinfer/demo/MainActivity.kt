@@ -52,6 +52,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnImage: ImageButton
     private lateinit var btnThink: MaterialButton
     private lateinit var btnModelManager: ImageButton
+    private lateinit var btnModelSelect: ImageButton
     private lateinit var cardInputBar: View
     private lateinit var appBarLayout: AppBarLayout
     private lateinit var tvTitle: TextView
@@ -94,6 +95,14 @@ class MainActivity : AppCompatActivity() {
     private val messages = mutableListOf<ChatMessage>()
     private var createdWithLocale: String? = null
     private var isLocaleRestart = false
+
+    private data class PreparedImage(
+        val prompt: String,
+        val bytes: ByteArray,
+        val bitmap: Bitmap,
+        val info: String,
+        val preparationMs: Long
+    )
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -158,6 +167,7 @@ class MainActivity : AppCompatActivity() {
         btnImage = findViewById(R.id.btn_image)
         btnThink = findViewById(R.id.btn_think)
         btnModelManager = findViewById(R.id.btn_model_manager)
+        btnModelSelect = findViewById(R.id.btn_model_select)
         cardInputBar = findViewById(R.id.card_input_bar)
         appBarLayout = findViewById(R.id.appBarLayout)
         tvTitle = findViewById(R.id.tv_title)
@@ -445,7 +455,8 @@ class MainActivity : AppCompatActivity() {
                 .show()
         }
         btnSend.setOnClickListener { handleUserInput() }
-        findViewById<ImageButton>(R.id.btn_model_select).setOnClickListener { showModelSelector() }
+        tvTitleModel.setOnClickListener { showModelSelector() }
+        btnModelSelect.setOnClickListener { showModelSelector() }
         btnModelManager.setOnClickListener {
             startActivity(Intent(this, ModelManagerActivity::class.java))
         }
@@ -611,15 +622,18 @@ class MainActivity : AppCompatActivity() {
 
     /**
      * Before any model is loaded we still want the user to type and send, so the
-     * request itself can trigger the download/load flow.  Vision/thinking
-     * affordances stay hidden until a model is ready.
+     * request itself can trigger the download/load flow.  Thinking is stored as
+     * a preference and applied when the selected model is loaded; vision stays
+     * hidden until its mmproj is actually available.
      */
     private fun enableTextInput() {
         etInput.isEnabled = true
         btnSend.isEnabled = true
         btnImage.isEnabled = false
         btnImage.visibility = View.GONE
-        btnThink.visibility = View.GONE
+        val supportsThinking = LlamaEngine.getSelectedModel(applicationContext).supportsThinking
+        btnThink.visibility = if (supportsThinking) View.VISIBLE else View.GONE
+        if (supportsThinking) refreshThinkButton()
     }
 
     private fun shouldRedirectToTts(): Boolean {
@@ -644,7 +658,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun syncSelectedModelUi() {
-        tvTitleModel.text = LlamaEngine.getSelectedModel(applicationContext).displayName
+        val modelName = LlamaEngine.getSelectedModel(applicationContext).displayName
+        val switchHint = getString(R.string.select_model_named, modelName)
+        tvTitleModel.text = getString(R.string.model_label, modelName)
+        tvTitleModel.contentDescription = switchHint
+        btnModelSelect.contentDescription = switchHint
     }
 
     /** Toolbar dropdown that changes [selectedModelId] only (lazy loading). */
@@ -653,7 +671,7 @@ class MainActivity : AppCompatActivity() {
         val selectedId = LlamaEngine.getSelectedModel(this).id
         val labels = models.map { it.displayName }
         val popup = ListPopupWindow(this)
-        popup.anchorView = findViewById<View>(R.id.btn_model_select)
+        popup.anchorView = btnModelSelect
         val popupAdapter = object : ArrayAdapter<String>(
             this, R.layout.item_model_option, R.id.tv_option_text, labels
         ) {
@@ -673,6 +691,12 @@ class MainActivity : AppCompatActivity() {
             if (model.id == LlamaEngine.getSelectedModel(this).id) return@setOnItemClickListener
             LlamaEngine.setSelectedModel(this, model.id)
             syncSelectedModelUi()
+            btnThink.visibility = if (model.supportsThinking) {
+                View.VISIBLE
+            } else {
+                View.GONE
+            }
+            if (model.supportsThinking) refreshThinkButton()
             if (!LlamaEngine.modelsExist(this, model)) {
                 Toast.makeText(this, R.string.model_not_downloaded_hint, Toast.LENGTH_SHORT).show()
             } else if (isModelReady && loadedModelId != model.id) {
@@ -689,7 +713,7 @@ class MainActivity : AppCompatActivity() {
     private fun refreshThinkButton() {
         val on = LlamaEngine.getEnableThinking(this)
         btnThink.isChecked = on
-        btnThink.alpha = if (on) 1f else 0.7f
+        btnThink.alpha = 1f
     }
 
     private fun refreshWelcomeCard(isTextOnly: Boolean) {
@@ -823,92 +847,109 @@ class MainActivity : AppCompatActivity() {
         return false
     }
 
-    private fun handleSelectedImage(uri: Uri) {
+    private fun prepareImage(uri: Uri): PreparedImage {
+        val startNs = System.nanoTime()
+        val prompt = pendingImageQuestion ?: getString(R.string.image_only_prompt)
+        pendingImageQuestion = null
+        val imageData = contentResolver.openInputStream(uri)?.use { input ->
+            val bitmap = BitmapFactory.decodeStream(input)
+                ?: throw RuntimeException(getString(R.string.error_decode_image))
+            val scaleFactor = LlamaEngine.getImageScaleFactor(applicationContext)
+            val scaledWidth = (bitmap.width * scaleFactor).roundToInt().coerceAtLeast(1)
+            val scaledHeight = (bitmap.height * scaleFactor).roundToInt().coerceAtLeast(1)
+            val modelBitmap = if (scaledWidth == bitmap.width && scaledHeight == bitmap.height) {
+                bitmap
+            } else {
+                Bitmap.createScaledBitmap(bitmap, scaledWidth, scaledHeight, true)
+            }
+            val stream = ByteArrayOutputStream()
+            modelBitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
+            if (modelBitmap !== bitmap) modelBitmap.recycle()
+            Triple(stream.toByteArray(), bitmap, Pair(scaledWidth, scaledHeight))
+        } ?: throw RuntimeException(getString(R.string.error_read_image))
+
+        val (bytes, bitmap, scaledSize) = imageData
+        val imageInfo = getString(
+            R.string.image_info_scaled,
+            bitmap.width,
+            bitmap.height,
+            scaledSize.first,
+            scaledSize.second,
+            bytes.size / 1024
+        )
+        return PreparedImage(
+            prompt = prompt,
+            bytes = bytes,
+            bitmap = bitmap,
+            info = imageInfo,
+            preparationMs = (System.nanoTime() - startNs) / 1_000_000
+        )
+    }
+
+    private fun addImageUserMessage(uri: Uri, image: PreparedImage): Long {
+        val msgId = messageIdCounter++
+        messages.add(
+            ChatMessage.UserMessage(
+                id = msgId,
+                text = image.prompt,
+                imageBitmap = image.bitmap,
+                imageInfo = image.info,
+                isPrefilling = true,
+                imageUri = uri.toString()
+            )
+        )
+        chatAdapter.submitList(messages.toList()) {
+            scrollToBottom()
+        }
+        return msgId
+    }
+
+    private fun setImagePrefilling(msgId: Long, prefilling: Boolean) {
+        val index = messages.indexOfFirst { it.id == msgId }
+        if (index < 0) return
+        val message = messages[index] as? ChatMessage.UserMessage ?: return
+        messages[index] = message.copy(isPrefilling = prefilling)
+        chatAdapter.submitList(messages.toList())
+    }
+
+    private fun handleSelectedImage(
+        uri: Uri,
+        preparedImage: PreparedImage? = null,
+        userMessageId: Long? = null
+    ) {
         takePersistableReadPermission(uri)
         lifecycleScope.launch(Dispatchers.IO) {
-            val startNs = System.nanoTime()
+            var msgId = userMessageId
             try {
-                val imageData = contentResolver.openInputStream(uri)?.use { input ->
-                    val bitmap = BitmapFactory.decodeStream(input)
-                        ?: throw RuntimeException(getString(R.string.error_decode_image))
-                    val scaleFactor = LlamaEngine.getImageScaleFactor(applicationContext)
-                    val scaledWidth = (bitmap.width * scaleFactor).roundToInt().coerceAtLeast(1)
-                    val scaledHeight = (bitmap.height * scaleFactor).roundToInt().coerceAtLeast(1)
-                    val modelBitmap = if (scaledWidth == bitmap.width && scaledHeight == bitmap.height) {
-                        bitmap
-                    } else {
-                        Bitmap.createScaledBitmap(bitmap, scaledWidth, scaledHeight, true)
-                    }
-                    val stream = ByteArrayOutputStream()
-                    modelBitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
-                    if (modelBitmap !== bitmap) modelBitmap.recycle()
-                    Pair(stream.toByteArray(), bitmap)
-                } ?: throw RuntimeException(getString(R.string.error_read_image))
-
-                val (imageBytes, bitmap) = imageData
-
-                val imageName = getFileName(uri)
-                val width = bitmap.width
-                val height = bitmap.height
-                val sizeKb = imageBytes.size / 1024
-                val scaleFactor = LlamaEngine.getImageScaleFactor(applicationContext)
-                val scaledWidth = (width * scaleFactor).roundToInt().coerceAtLeast(1)
-                val scaledHeight = (height * scaleFactor).roundToInt().coerceAtLeast(1)
-                val imageInfo = getString(
-                    R.string.image_info_scaled,
-                    width,
-                    height,
-                    scaledWidth,
-                    scaledHeight,
-                    sizeKb
-                )
-                val msgId = messageIdCounter++
-
-                withContext(Dispatchers.Main) {
-                    val imageMessage = ChatMessage.UserMessage(
-                        id = msgId,
-                        text = "",
-                        imageBitmap = bitmap,
-                        imageInfo = imageInfo,
-                        isPrefilling = true,
-                        imageUri = uri.toString()
-                    )
-                    messages.add(imageMessage)
-                    chatAdapter.submitList(messages.toList()) {
-                        scrollToBottom()
+                val image = preparedImage ?: prepareImage(uri)
+                if (msgId == null) {
+                    withContext(Dispatchers.Main) {
+                        msgId = addImageUserMessage(uri, image)
                     }
                 }
 
                 engine.resetPerformanceStats()
-                engine.prefillImage(imageBytes)
-                pendingImageProcessingMs = (System.nanoTime() - startNs) / 1_000_000
+                val prefillStartNs = System.nanoTime()
+                engine.prefillImage(image.bytes)
+                pendingImageProcessingMs = image.preparationMs +
+                    (System.nanoTime() - prefillStartNs) / 1_000_000
 
                 isImagePrefilled = true
 
                 withContext(Dispatchers.Main) {
-                    val index = messages.indexOfFirst { it.id == msgId }
-                    if (index >= 0) {
-                        messages[index] = (messages[index] as ChatMessage.UserMessage).copy(
-                            isPrefilling = false
-                        )
-                        chatAdapter.submitList(messages.toList())
-                    }
+                    msgId?.let { setImagePrefilling(it, false) }
                 }
                 persistCurrentConversation()
 
-                val pending = pendingImageQuestion
-                if (pending != null) {
-                    pendingImageQuestion = null
-                    withContext(Dispatchers.Main) {
-                        etInput.setText(pending)
-                        handleUserInput()
-                    }
+                withContext(Dispatchers.Main) {
+                    sendPrompt(image.prompt, userMessageAlreadyAdded = true)
                 }
             } catch (e: Exception) {
                 pendingImageProcessingMs = null
                 pendingImageQuestion = null
                 Log.e(TAG, "Error processing image", e)
                 withContext(Dispatchers.Main) {
+                    msgId?.let { setImagePrefilling(it, false) }
                     Toast.makeText(this@MainActivity, getString(R.string.toast_image_failed, e.message), Toast.LENGTH_SHORT).show()
                 }
             }
@@ -1242,23 +1283,42 @@ class MainActivity : AppCompatActivity() {
         (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
             .hideSoftInputFromWindow(etInput.windowToken, 0)
 
-        // Show the user's message first, then the "thinking" placeholder used as
-        // the model-load indicator, so the order matches the already-loaded path.
-        if (pendingText != null) {
-            messages.add(ChatMessage.UserMessage(id = messageIdCounter++, text = pendingText))
-        }
-        val placeholderId = messageIdCounter++
-        messages.add(ChatMessage.AiMessage(id = placeholderId, text = "", isGenerating = true, isLoadingPlaceholder = true))
-        chatAdapter.setActiveAiMessage(placeholderId)
-        chatAdapter.submitList(messages.toList()) {
-            scrollToBottom()
-        }
-
         val ggufFile = File(LlamaEngine.modelPath(applicationContext))
         val mmprojFile = LlamaEngine.mmprojPath(applicationContext)?.let { File(it) }
 
         lifecycleScope.launch(Dispatchers.IO) {
+            var placeholderId = -1L
+            var imageMessageId: Long? = null
             try {
+                val preparedImage = mediaUri?.let { prepareImage(it) }
+
+                // Show the selected image/question before model loading starts.
+                // The loading placeholder follows the user's turn so the chat
+                // order matches the already-loaded path.
+                withContext(Dispatchers.Main) {
+                    when {
+                        pendingText != null -> {
+                            messages.add(ChatMessage.UserMessage(id = messageIdCounter++, text = pendingText))
+                        }
+                        mediaUri != null && preparedImage != null -> {
+                            imageMessageId = addImageUserMessage(mediaUri, preparedImage)
+                        }
+                    }
+                    placeholderId = messageIdCounter++
+                    messages.add(
+                        ChatMessage.AiMessage(
+                            id = placeholderId,
+                            text = "",
+                            isGenerating = true,
+                            isLoadingPlaceholder = true
+                        )
+                    )
+                    chatAdapter.setActiveAiMessage(placeholderId)
+                    chatAdapter.submitList(messages.toList()) {
+                        scrollToBottom()
+                    }
+                }
+
                 // A different model may still be loaded (selection is lazy), so
                 // drop it before loading the newly selected one.
                 if (isModelReady) {
@@ -1280,15 +1340,15 @@ class MainActivity : AppCompatActivity() {
                 withContext(Dispatchers.Main) {
                     isInlineModelLoad = false
                     chatAdapter.clearActiveAiMessage()
-                    removeMessage(placeholderId)
+                    if (placeholderId >= 0) removeMessage(placeholderId)
                     isModelReady = true
                     loadedModelId = LlamaEngine.getSelectedModel(applicationContext).id
                     updateUIForModelType()
                     pendingPrompt = null
                     enableInput(true)
-                    if (mediaUri != null) {
+                    if (mediaUri != null && preparedImage != null) {
                         pendingMediaUri = null
-                        handleSelectedMedia(mediaUri)
+                        handleSelectedImage(mediaUri, preparedImage, imageMessageId)
                     } else if (pendingText != null) {
                         sendPrompt(pendingText, userMessageAlreadyAdded = true)
                     }
@@ -1298,7 +1358,8 @@ class MainActivity : AppCompatActivity() {
                 withContext(Dispatchers.Main) {
                     isInlineModelLoad = false
                     chatAdapter.clearActiveAiMessage()
-                    removeMessage(placeholderId)
+                    if (placeholderId >= 0) removeMessage(placeholderId)
+                    imageMessageId?.let { setImagePrefilling(it, false) }
                     runCatching { engine.resetToInitialized() }
                     isModelReady = false
                     pendingPrompt?.let { etInput.setText(it) }

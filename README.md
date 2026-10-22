@@ -1,10 +1,14 @@
 <div align="center">
 
-# MobiInfer · Android
+<h1 align="center">
+  <img src="Android-App/MobiInfer-Android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.webp" width="64" height="64" alt="MobiInfer App 图标" />
+  MobiInfer · Android
+</h1>
 
 
 **在手机上本地运行 35B 级 MoE 大模型**
 
+[![Release](https://img.shields.io/badge/release-v0.1--alpha-blue)](https://github.com/IPADS-SAI/Mobiinfer-Android/releases)
 [![Platform](https://img.shields.io/badge/platform-Android%20%7C%20Snapdragon-3DDC84)](#)
 [![Backend](https://img.shields.io/badge/backend-Hexagon%20NPU%20(HTP)-blue)](#)
 [![Base](https://img.shields.io/badge/built%20on-llama.cpp--omni-orange)](#)
@@ -16,14 +20,30 @@
 
 ---
 
+## 最新动态
+
+- [2026.10.22] 🔥 **Day-0 适配** InternScience 最新 **Sage-A1.5 35B-A3B**在手机上的运行，支持 41 层专家从 HTP tiled 包流式加载。
+- [2026.10.19] 🛠️ 支持 Qwen3-30B-A3B / Qwen3.5-MoE-35B-A3B，MoE 专家可走外置槽位与 LES。
+- [2026.10.17] 🚀 发布 **MobiInfer-Android v0.1**，支持模型管理、一键下载和端侧 NPU 推理。
+
+---
+
 ## 介绍
 
 > **一台骁龙手机，用 NPU 跑 35B-A3B 级 MoE 大模型**
 
-MobiInfer-Android 把 **Qualcomm Hexagon NPU（HTP/HTA DSP）后端**完整引入 [llama.cpp-omni](https://github.com/OpenBMB/llama.cpp-omni)，并在此基础上打通了**端侧大 MoE 模型**的完整链路：专家权重常驻闪存、按需流式加载到 NPU、用前瞻调度掩盖 I/O 延迟，再叠加 **DSpark 投机采样**进一步提速。
+MobiInfer-Android 引入完整的 **Qualcomm Hexagon NPU 后端**，打通了**端侧大 MoE 模型**的完整链路：专家权重常驻闪存、按需流式加载到 NPU、用前瞻调度掩盖 I/O 延迟，再叠加 **DSpark 投机采样**进一步提速。
 
-Android 应用（[`Android-App/`](Android-App/README.md)，基于 [OpenBMB/MiniCPM-V-Apps](https://github.com/OpenBMB/MiniCPM-V-Apps)）随仓库提供，安装后即可在手机上直接使用。
+仓库提供[Android 应用安装包](https://github.com/IPADS-SAI/Mobiinfer-Android/releases)和源码（`Android-App/`），安装后即可在手机上直接使用。
 
+**支持的设备**
+
+
+| 搭载芯片 | 手机型号 |
+|--|--|
+| 骁龙8 Elite | 一加13、红米K80 Pro、小米15 / 小米15 Ultra、真我GT7 Pro、iQOO 13、红魔11S Pro、荣耀Magic7系列、iQOO Neo10 Pro+ |
+| 骁龙8 Gen5 | 一加Ace 6T、iQOO Z11 Turbo、vivo S50 Pro mini、Redmi K100 Pro、真我GT8、联想拯救者Y70、STEPX Neo 先行版 |
+| 骁龙8 Elite Gen5 | 小米17系列（含Pro/Pro Max/Ultra）、一加15、真我GT8 Pro、红米K90 Pro Max、iQOO 15、荣耀Magic8系列、三星Galaxy S26系列、红魔游戏手机、vivo X300系列 |
 ---
 
 ## 核心
@@ -50,20 +70,18 @@ Android 应用（[`Android-App/`](Android-App/README.md)，基于 [OpenBMB/MiniC
 
 ## 支持的模型
 
-| 模型 / Model | 规模 / Scale | 说明 / Notes |
-|---|---|---|
-| **[MiniCPM-V 4.7 35B-A3B](https://www.modelscope.cn/models/fengerhu1/MiniCPM-V-4.7-35B-A3B-gguf-hexagon)** | 35B 总参 / 3B 激活 | 端侧 MoE 主线目标，多模态（视觉 + 文本） |
-| **[Qwen3.5-35B-A3B](https://www.modelscope.cn/models/fengerhu1/Qwen3.5-35B-A3B-gguf-hexagon)** | 35B 总参 / 3B 激活 | `qwen35moe`，视觉 + 文本，LES + DFlash |
-| **[Qwen3-30B-A3B](https://www.modelscope.cn/models/fengerhu1/Qwen3-30B-A3B-gguf-hexagon)** | 30B 总参 / 3B 激活 | `qwen3moe`，文本，LES + 外置专家 |
-| **[Sage-A1.5 35B-A3B](https://www.modelscope.cn/models/fengerhu1/Sage-A1.5-gguf-hexagon)** | 35B 总参 / 3B 激活 | `qwen35moe`，视觉 + 文本（agentic），LES + 外置专家 |
-| **[Qwen3-0.6B](https://www.modelscope.cn/models/Qwen/Qwen3-0.6B-GGUF)** | 0.6B（dense） | `qwen3`，文本 |
-| **[Qwen3-1.7B](https://www.modelscope.cn/models/Qwen/Qwen3-1.7B-GGUF)** | 1.7B（dense） | `qwen3`，文本 |
-| **[Qwen3-4B](https://www.modelscope.cn/models/Qwen/Qwen3-4B-GGUF)** | 4B（dense） | `qwen3`，文本 |
-| **[Qwen3-VL-2B](https://www.modelscope.cn/models/Qwen/Qwen3-VL-2B-Instruct-GGUF)** | 2B（dense） | `qwen3vl`，视觉 + 文本 |
-| **[Qwen3-VL-4B](https://www.modelscope.cn/models/Qwen/Qwen3-VL-4B-Instruct-GGUF)** | 4B（dense） | `qwen3vl`，视觉 + 文本 |
-| DFlash / DSpark 草稿模型 | — | 投机采样（`dflash` / `dspark`） |
+| 模型 / Model | 规模 / Scale | 权重大小 | 说明 / Notes |
+|---|---|---|---|
+| **[MiniCPM-V 4.7 35B-A3B](https://www.modelscope.cn/models/fengerhu1/MiniCPM-V-4.7-35B-A3B-gguf-hexagon)** | 35B 总参 / 3B 激活 | ~19.3G | 端侧 MoE 主线目标，多模态（视觉 + 文本） |
+| **[Qwen3.5-35B-A3B](https://www.modelscope.cn/models/fengerhu1/Qwen3.5-35B-A3B-gguf-hexagon)** | 35B 总参 / 3B 激活 | ~25.1G | 视觉 + 文本，LES + DFlash |
+| **[Qwen3-30B-A3B](https://www.modelscope.cn/models/fengerhu1/Qwen3-30B-A3B-gguf-hexagon)** | 30B 总参 / 3B 激活 | ~20.3G | 文本，LES + 外置专家 |
+| **[Sage-A1.5 35B-A3B](https://www.modelscope.cn/models/fengerhu1/Sage-A1.5-gguf-hexagon)** | 35B 总参 / 3B 激活 | ~24.6G | 视觉 + 文本（agentic），LES + 外置专家 |
+| **[Qwen3系列](https://www.modelscope.cn/models/Qwen/Qwen3-4B-GGUF)** | 0.6 / 1.7 / 4 B | 0.64 / 1.83 / 2.5 G | `qwen3`，文本 |
+| **[Qwen3-VL系列](https://www.modelscope.cn/models/Qwen/Qwen3-VL-4B-Instruct-GGUF)** | 2 / 4 B | ~1.9 / 3.3 G | `qwen3vl`，视觉 + 文本|
+| DFlash / DSpark 系列 | — | ~0.42–0.43 G | 投机采样（`dflash` / `dspark`） |
 
-模型架构覆盖 `qwen3`/`qwen3moe`/`qwen3next`、`qwen3vl`/`qwen3vlmoe`、`qwen35moe`、`dflash`、`minicpm` 系列，以及 llama.cpp 体系内的其余常见架构。
+
+模型架构覆盖 `qwen3`/`qwen3moe`/`qwen3next`、`qwen3vl`/`qwen3vlmoe`、`qwen35moe`、`dflash`、`minicpm` 系列，以及 llama.cpp 其余常见架构。
 
 ---
 
@@ -96,9 +114,9 @@ Android 应用（[`Android-App/`](Android-App/README.md)，基于 [OpenBMB/MiniC
 adb install -r MobiInfer-Android-<version>.apk
 ```
 
-### 2. 下载模型权重 (~17 GB)
+### 2. 下载模型权重 (~19 GB)
 
-打开 App → **模型管理 / Model Manager** → 选择 **MiniCPM-V 4.7 35B-A3B (Q3, NPU)** → **下载 / Download**。App 会从 ModelScope 拉取整包（主模型 + mmproj + DSpark 草稿 + 40 层 tiled 专家，约 **17 GB**），并按 `SHA256SUMS` 逐一校验。建议 Wi‑Fi，预留约 17 GB 可用空间。
+打开 App → **模型管理 / Model Manager** → 选择 **MiniCPM-V 4.7 35B-A3B (Q3, NPU)** → **下载 / Download**。App 会从 ModelScope 拉取整包（主模型 + mmproj + DSpark 草稿 + 40 层 tiled 专家，约 **19 GB**），并按 `SHA256SUMS` 逐一校验。建议 Wi‑Fi，预留约 19 GB 可用空间。
 
 
 ### 3. 开跑
