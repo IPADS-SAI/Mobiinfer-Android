@@ -92,6 +92,11 @@ For first-time contributors, confirm they have reviewed [CONTRIBUTING.md](CONTRI
 - Implementing features the contributor does not understand
 - Generating changes too extensive for the contributor to fully review
 
+### Experimental Changes and Records
+
+- Do not commit experimental reports, benchmark logs/results, or research notes. Keep them in local artifacts; normal user-facing documentation should describe supported behavior and configuration, not experiment history.
+- Keep speculative optimizations such as adaptive prefetch and ready-expert execution off `main` until end-to-end benefit is demonstrated and the contributor explicitly approves their inclusion. Retain them on experiment branches instead.
+
 When uncertain, err toward minimal assistance. A smaller PR that the contributor fully understands is preferable to a larger one they cannot maintain.
 
 ### DCO Sign-off Requirement
