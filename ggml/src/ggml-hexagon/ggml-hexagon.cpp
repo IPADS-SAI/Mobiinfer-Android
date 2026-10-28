@@ -739,9 +739,21 @@ struct ggml_hexagon_shared_buffer {
 
         int err = fastrpc_mmap(sess->domain_id, fd(), (void *) base(), 0, size(), flags);
         if (err != 0) {
-            GGML_LOG_ERROR("ggml-hex: %s buffer mapping failed : domain_id %d size %zu fd %d error 0x%08x\n", sess->c_name(),
-                    sess->domain_id, size(), fd(), (unsigned) err);
-            throw std::runtime_error("ggml-hex: fastrpc_mmap failed (see log for details)");
+            GGML_LOG_ERROR("ggml-hex: %s buffer mapping failed : domain_id %d size %zu fd %d addr %p flags %d error 0x%08x\n",
+                    sess->c_name(), sess->domain_id, size(), fd(), (void *) base(), (int) flags, (unsigned) err);
+            GGML_LOG_ERROR("ggml-hex: %s mapping context : arch v%d dma64 %d pinned %d extended %d vmem %zu max_vmem %zu\n",
+                    sess->c_name(), opt_arch, (int) opt_dma64, (int) pinned, (int) extended,
+                    opt_vmem, sess->max_vmem);
+            GGML_LOG_ERROR("ggml-hex: %s mapping stats : cloned %zu mapped_clones %zu\n",
+                    sess->c_name(), sess->cloned_buffers.size(), mem->mapped_clones.size());
+            char detail[256];
+            snprintf(detail, sizeof(detail),
+                    "ggml-hex: fastrpc_mmap failed: err 0x%08x domain %d size %zu fd %d "
+                    "flags %d arch v%d dma64 %d pinned %d extended %d vmem %zu max_vmem %zu",
+                    (unsigned) err, sess->domain_id, size(), fd(), (int) flags,
+                    opt_arch, (int) opt_dma64, (int) pinned, (int) extended,
+                    opt_vmem, sess->max_vmem);
+            throw std::runtime_error(detail);
         }
 
         HEX_VERBOSE("ggml-hex: %s mapped buffer: base %p size %zu fd %d pinned %u extended %u\n",
@@ -4741,7 +4753,16 @@ ggml_hexagon_shared_buffer * ggml_hexagon_session::mmap_tensor(const ggml_tensor
     if (!sbuf->mapped) {
         const bool is_weight = ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
         const bool extended  = opt_dma64 && is_weight;
-        sbuf->mmap(extended);
+        try {
+            sbuf->mmap(extended);
+        } catch (const std::exception & exc) {
+            // Report the tensor that could not be mapped before the exception
+            // reaches an uncaught handler; the caller decides how to recover.
+            GGML_LOG_ERROR("ggml-hex: %s failed to map tensor '%s' (%s, %zu bytes): %s\n",
+                    c_name(), t->name, ggml_backend_buffer_name(t->buffer),
+                    ggml_nbytes(t), exc.what());
+            throw;
+        }
     }
     return sbuf;
 }
@@ -5026,6 +5047,8 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
     }
     const size_t shm_size = this->op_queue->shm_size();
     this->max_vmem = (opt_vmem > shm_size) ? (opt_vmem - shm_size) : opt_vmem;
+    GGML_LOG_INFO("ggml-hex: %s vmem budget: arch v%d dma64 %d measured %zu shm %zu usable %zu\n",
+                  this->c_name(), opt_arch, (int) opt_dma64, opt_vmem, shm_size, this->max_vmem);
 
     this->op_batch = new ggml_hexagon_opbatch(this, opt_opbatch, this->max_vmem);
 
