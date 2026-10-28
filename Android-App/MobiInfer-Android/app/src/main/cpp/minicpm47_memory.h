@@ -10,7 +10,7 @@ struct MiniCPM47MemoryConfig {
     static constexpr int min_mb = 5200;
     static constexpr int max_mb = 13000;
     static constexpr int batch = 512;
-    static constexpr int draft = 1;
+    static constexpr int draft = 3;
     static constexpr bool phase_reuse = true;
     static constexpr int64_t slot_bytes = 40LL * 1572864;
     // Qwen35MoE in this bundle has 256 experts per layer. A wider per-layer
@@ -34,9 +34,10 @@ inline MiniCPM47MemoryConfig minicpm47_memory_config(int budget_mb) {
     // buys one slot per layer. Changing profiles at 5.9 GB previously made
     // the slot count fall when the user increased the slider.
     // The shared phase pool permits a larger prompt chunk without reserving
-    // a second full expert bank. A short draft keeps verify in the decode
-    // window at the upper budgets; draft3/8 spill into the bank and reread it.
-    // Calibration includes eager vision + Q8 draft1 and phase reuse.
+    // a second full expert bank. Draft3 verification needs capacity for up to
+    // 32 distinct experts per layer; smaller windows fall back to the bank.
+    // Existing calibration used eager vision + Q8 draft1 and phase reuse;
+    // the draft3 default has not been remeasured against that calibration.
     const int bank = 256;
     const int ubatch = 128;
     const int prefetch = 0;
