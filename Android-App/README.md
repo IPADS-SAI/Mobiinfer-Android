@@ -15,7 +15,7 @@ The on-device **Android** app shipped with **MobiInfer-Android**. It runs large 
 | Fully on-device inference | ✅ No remote server; all inference runs on the phone |
 | **Qualcomm Hexagon NPU (HTP)** acceleration | ✅ LLM **and** vision encoder run on the NPU |
 | **MiniCPM-V 4.7 35B-A3B** (MoE) on-device | ✅ Routed experts streamed from flash on demand (LES) |
-| **DSpark** speculative decoding | ✅ Q8_0 draft, up to 3 draft tokens (enabled by default) |
+| **DSpark** speculative decoding | ✅ Q8_0 draft, up to 1 draft token by default (enabled by default) |
 | Multimodal I/O | ✅ Text chat + image Q&A |
 | In-app **Model Manager** | ✅ Downloads model bundles from ModelScope with `SHA256SUMS` verification |
 | Qwen3-VL-4B (HTP) | ✅ Available as a second model |

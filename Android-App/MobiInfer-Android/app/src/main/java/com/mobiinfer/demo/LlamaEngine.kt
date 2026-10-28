@@ -86,7 +86,7 @@ class LlamaEngine private constructor(
         private const val KEY_RUNTIME_RELOAD = "minicpm47_memory_budget_reload_pending"
         private const val KEY_CONTEXT_SIZE = "context_size_tokens"
         const val MIN_MEMORY_BUDGET_MB = 5200
-        const val DEFAULT_MEMORY_BUDGET_MB = 6000
+        const val DEFAULT_MEMORY_BUDGET_MB = 8000
         const val ABSOLUTE_MAX_MEMORY_BUDGET_MB = 13000
         private const val MEMORY_RESERVE_MB = 3072
 
