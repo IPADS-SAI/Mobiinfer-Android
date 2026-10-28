@@ -1441,7 +1441,9 @@ class LlamaEngine private constructor(
                     }
                 }
                 setImageTokenLimitsNative(modelInfo.imageMinTokens, modelInfo.imageMaxTokens)
-                load(pathToModel, expertsPath, getMemoryBudgetMb(context), getContextSize(context)).let {
+                withNativeTimeout("load model", LOAD_TIMEOUT_SECONDS) {
+                    load(pathToModel, expertsPath, getMemoryBudgetMb(context), getContextSize(context))
+                }.let {
                     if (it != 0) throw RuntimeException("Failed to load model (code: $it)")
                 }
 
@@ -1455,7 +1457,9 @@ class LlamaEngine private constructor(
 
                     val sliceCap = getImageMaxSliceNums(context)
                     Log.i(TAG, "Loading mmproj (image_max_slice_nums=$sliceCap)... \n$pathToMmproj")
-                    loadMmproj(pathToMmproj, sliceCap).let {
+                    withNativeTimeout("load mmproj", LOAD_TIMEOUT_SECONDS) {
+                        loadMmproj(pathToMmproj, sliceCap)
+                    }.let {
                         if (it != 0) {
                             if (modelInfo.mmprojFileName != null) throw RuntimeException("Failed to load ${modelInfo.displayName} vision weights (code: $it)")
                             Log.w(TAG, "Failed to load mmproj (code: $it), continuing without vision support")
@@ -1475,7 +1479,7 @@ class LlamaEngine private constructor(
                     }
                 }
 
-                prepare().let {
+                withNativeTimeout("prepare resources", PREPARE_TIMEOUT_SECONDS) { prepare() }.let {
                     if (it != 0) throw RuntimeException("Failed to prepare resources (code: $it)")
                 }
                 Log.i(TAG, "Model loaded!")
