@@ -3192,8 +3192,11 @@ struct ggml_hexagon_opbatch {
         h_ops.resize(n_ops_max);
 
         b_map.reserve(n_bufs_max);
-        t_map.reserve(n_tens_max);
-        d_map.reserve(n_tens_max);
+        // Small batches should not clear maps sized for the largest graph on
+        // every submission. Larger batches can grow these maps as needed.
+        const size_t initial_tensors = std::min<size_t>(32, n_tens_max);
+        t_map.reserve(initial_tensors);
+        d_map.reserve(initial_tensors);
 
         GGML_LOG_INFO("ggml-hex: %s op batching: n-bufs %u n-tensors %u n-ops %u vmem %zu\n",
                 sess->c_name(), n_bufs_max, n_tens_max, n_ops_max, b_vmem_max);
@@ -4206,7 +4209,10 @@ struct ggml_hexagon_opqueue {
         req.n_tensors = op_batch->n_tens;
         req.n_ops     = op_batch->n_ops;
 
-        op_cache[slot]   = op_batch->ops;
+        // Keep active nodes alive until this queue slot can be reused, without
+        // copying the unused entries in the maximum-sized batch storage.
+        GGML_ASSERT(op_batch->n_ops <= op_batch->ops.size());
+        op_cache[slot].assign(op_batch->ops.begin(), op_batch->ops.begin() + op_batch->n_ops);
         start_usec[slot] = ggml_time_us();
 
         const size_t b_size = sizeof(htp_buf_desc)  * req.n_bufs;
