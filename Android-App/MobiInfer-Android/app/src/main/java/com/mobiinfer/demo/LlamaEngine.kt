@@ -86,11 +86,15 @@ class LlamaEngine private constructor(
         private const val KEY_RUNTIME_RELOAD = "minicpm47_memory_budget_reload_pending"
         private const val KEY_CONTEXT_SIZE = "context_size_tokens"
         const val MIN_MEMORY_BUDGET_MB = 5200
-        const val DEFAULT_MEMORY_BUDGET_MB = 8000
-        // Device-independent safety ceiling. The real ceiling is derived from
-        // the device's physical RAM by getMaxMemoryBudgetMb().
-        const val ABSOLUTE_MAX_MEMORY_BUDGET_MB = 32768
+        const val DEFAULT_MEMORY_BUDGET_MB = 6000
+        const val ABSOLUTE_MAX_MEMORY_BUDGET_MB = 13000
         private const val MEMORY_RESERVE_MB = 3072
+
+        // Hard deadlines for the blocking native load path. Mapping the ~19 GB
+        // bundle over slow UFS plus DSP setup is normally well under a minute;
+        // these only trip when the backend hangs on a rejected layout.
+        const val LOAD_TIMEOUT_SECONDS = 180L
+        const val PREPARE_TIMEOUT_SECONDS = 120L
 
         const val MIN_CONTEXT_SIZE = 1024
         const val DEFAULT_CONTEXT_SIZE = 4096
@@ -102,8 +106,7 @@ class LlamaEngine private constructor(
          *
          * The model, vision encoder, context and expert cache all live in this
          * budget, so we leave a reserve for Android, the UI and the HTP driver.
-         * A 24 GB device therefore tops out around 20 GB instead of trying to
-         * use the whole physical RAM (which would be killed by LMKD).
+         * The product ceiling is 13 decimal GB, including on larger devices.
          */
         fun getMaxMemoryBudgetMb(context: Context): Int {
             val am = context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
@@ -113,16 +116,27 @@ class LlamaEngine private constructor(
             val reserveMb = maxOf(MEMORY_RESERVE_MB, totalMb / 5)
             val usableMb = ((totalMb - reserveMb) / 100) * 100
             return usableMb
-                .coerceAtLeast(DEFAULT_MEMORY_BUDGET_MB)
+                .coerceAtLeast(MIN_MEMORY_BUDGET_MB)
                 .coerceAtMost(ABSOLUTE_MAX_MEMORY_BUDGET_MB)
         }
 
         fun getMemoryBudgetMb(context: Context): Int {
             val maxMb = getMaxMemoryBudgetMb(context)
-            return prefs(context)
-                .getInt(KEY_MEMORY_BUDGET_MB, DEFAULT_MEMORY_BUDGET_MB)
-                .coerceIn(MIN_MEMORY_BUDGET_MB, maxMb)
+            val preferences = prefs(context)
+            val stored = preferences.getInt(KEY_MEMORY_BUDGET_MB, DEFAULT_MEMORY_BUDGET_MB)
+            val bounded = stored.coerceIn(MIN_MEMORY_BUDGET_MB, maxMb)
+            if (stored != bounded) {
+                preferences.edit().putInt(KEY_MEMORY_BUDGET_MB, bounded)
+                    .putBoolean(KEY_RUNTIME_RELOAD, true).apply()
+            }
+            return bounded
         }
+
+        // Settings preview of minicpm47_memory.h's fixed-profile mapping.
+        // Decimal bytes; one slot in each of 40 layers costs 62,914,560 B.
+        fun getExpertCacheSlots(memoryBudgetMb: Int): Int =
+            ((memoryBudgetMb.toLong() * 1_000_000L - 4_650_000_000L) / 62_914_560L)
+                .toInt().coerceIn(8, 256)
 
         fun setMemoryBudgetMb(context: Context, value: Int) {
             val maxMb = getMaxMemoryBudgetMb(context)
@@ -135,12 +149,15 @@ class LlamaEngine private constructor(
             editor.apply()
         }
 
+        fun getMaxContextSize(context: Context): Int =
+            if (getSelectedModel(context).id == "minicpm-v-4_7") 4096 else MAX_CONTEXT_SIZE
+
         fun getContextSize(context: Context): Int = prefs(context)
             .getInt(KEY_CONTEXT_SIZE, DEFAULT_CONTEXT_SIZE)
-            .coerceIn(MIN_CONTEXT_SIZE, MAX_CONTEXT_SIZE)
+            .coerceIn(MIN_CONTEXT_SIZE, getMaxContextSize(context))
 
         fun setContextSize(context: Context, value: Int) {
-            require(value in MIN_CONTEXT_SIZE..MAX_CONTEXT_SIZE && value % CONTEXT_SIZE_STEP == 0)
+            require(value in MIN_CONTEXT_SIZE..getMaxContextSize(context) && value % CONTEXT_SIZE_STEP == 0)
             val current = getContextSize(context)
             val editor = prefs(context).edit().putInt(KEY_CONTEXT_SIZE, value)
             if (value != current) editor.putBoolean(KEY_RUNTIME_RELOAD, true)
@@ -1269,6 +1286,43 @@ class LlamaEngine private constructor(
     @ExperimentalCoroutinesApi
     private val llamaDispatcher = Dispatchers.IO.limitedParallelism(1)
     private val llamaScope = CoroutineScope(llamaDispatcher + SupervisorJob())
+
+    /**
+     * Run a blocking native call with a hard wall-clock deadline.
+     *
+     * The Hexagon backend can hang forever inside sched_reserve()/fastrpc_mmap
+     * when the DSP rejects the memory layout (e.g. on Hexagon v73 where a
+     * single mapping exceeds the 32-bit window). Without a deadline the UI
+     * stays on "loading model" with no way out. A stuck FastRPC ioctl cannot
+     * be cancelled, so on timeout the worker thread is left behind and the app
+     * is marked unusable for inference until restarted — but the user at least
+     * gets an error instead of an endless spinner.
+     */
+    private fun <T> withNativeTimeout(
+        what: String,
+        timeoutSeconds: Long,
+        block: () -> T,
+    ): T {
+        val worker = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "native-$what").apply { isDaemon = true }
+        }
+        return try {
+            val future = worker.submit<T> { block() }
+            try {
+                future.get(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS)
+            } catch (e: java.util.concurrent.TimeoutException) {
+                future.cancel(true)
+                throw RuntimeException(
+                    "$what timed out after ${timeoutSeconds}s. The Hexagon DSP likely " +
+                    "rejected the memory layout (device may need a smaller memory budget " +
+                    "or is unsupported). Please restart the app.", e)
+            } catch (e: java.util.concurrent.ExecutionException) {
+                throw (e.cause as? Exception) ?: e
+            }
+        } finally {
+            worker.shutdown()
+        }
+    }
 
     private val _state = MutableStateFlow<LlamaState>(LlamaState.Uninitialized)
     val state: StateFlow<LlamaState> = _state.asStateFlow()

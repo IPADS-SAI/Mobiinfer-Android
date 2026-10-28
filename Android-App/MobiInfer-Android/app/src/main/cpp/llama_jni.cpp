@@ -138,6 +138,45 @@ extern "C" int mobiinfer_htp_session_count() {
     return g_htp_sessions;
 }
 
+// Map ro.soc.model to the Hexagon DSP architecture version. Used only to pick
+// a safe default memory layout before the backend is up: Hexagon v73 and older
+// (SM8550 / 8 Gen 2 and earlier) are limited to a 32-bit HAP_mmap of ~2.3 GiB
+// per session, so the full 35B-A3B layout (~2.9 GiB) cannot be mapped there.
+// Returns 0 when the SoC is unknown, meaning "use the normal layout".
+static int detect_hexagon_arch(const char * soc) {
+    // prefix, hexagon version
+    struct { const char * soc; int arch; } table[] = {
+        {"SM8550", 73}, {"SM8450", 73}, {"SM8475", 73},  // 8 Gen 2 / 8 Gen 1
+        {"SM8650", 75}, {"SM8635", 75},                  // 8 Gen 3 / 8s Gen 3
+        {"SM8750", 79},                                   // 8 Elite (8 Gen 4)
+        {"SM8850", 81},                                   // 8 Elite Gen 5
+    };
+    for (const auto & e : table) {
+        if (strncmp(soc, e.soc, strlen(e.soc)) == 0) {
+            return e.arch;
+        }
+    }
+    return 0;
+}
+
+// True when the device's HTP needs a reduced layout to fit in the per-session
+// mapping window. Overridable with MOBIINFER_LOW_VMEM=0/1 for A/B testing.
+extern "C" int mobiinfer_low_vmem_required() {
+    const char * override = getenv("MOBIINFER_LOW_VMEM");
+    if (override && *override) {
+        return *override != '0';
+    }
+    char soc[PROP_VALUE_MAX] = {0};
+    __system_property_get("ro.soc.model", soc);
+    const int arch = detect_hexagon_arch(soc);
+    LOGi("Hexagon arch for %s: v%d%s", soc, arch,
+         (arch > 0 && arch <= 73) ? " (low-vmem layout required)" : "");
+    if (arch <= 0) {
+        return 0; // unknown SoC: keep the normal layout
+    }
+    return arch <= 73 ? 1 : 0;
+}
+
 // Inference parameters mirror the iOS demo defaults (MTMDParams.swift / mtmd-ios.cpp):
 //   nThreads=4, nCtx=4096 (8192 for MiniCPM-V-4.6 to fit video frames),
 //   nBatch=2048, temperature=0.7, top_k=0, top_p=1.0, penalty_repeat=1.0,

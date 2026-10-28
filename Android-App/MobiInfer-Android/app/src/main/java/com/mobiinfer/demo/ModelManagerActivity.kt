@@ -134,11 +134,11 @@ class ModelManagerActivity : AppCompatActivity() {
         val slider = findViewById<Slider>(R.id.slider_memory_budget)
         val valueView = findViewById<TextView>(R.id.tv_memory_budget_value)
         fun showValue(mb: Int) {
-            valueView.text = getString(R.string.memory_budget_value, mb / 1000f)
+            valueView.text = getString(R.string.memory_budget_value, mb / 1000f,
+                LlamaEngine.getExpertCacheSlots(mb))
         }
-        // The ceiling depends on the device's physical RAM: a 24 GB phone can
-        // cache many more experts than the old fixed 8 GB cap allowed.
         val maxMb = LlamaEngine.getMaxMemoryBudgetMb(this)
+        slider.valueFrom = LlamaEngine.MIN_MEMORY_BUDGET_MB / 1000f
         slider.valueTo = maxMb / 1000f
         val budget = LlamaEngine.getMemoryBudgetMb(this).coerceIn(LlamaEngine.MIN_MEMORY_BUDGET_MB, maxMb)
         slider.value = budget / 1000f
@@ -149,6 +149,8 @@ class ModelManagerActivity : AppCompatActivity() {
             if (fromUser) LlamaEngine.setMemoryBudgetMb(this, mb)
         }
         findViewById<MaterialButton>(R.id.btn_memory_budget_max).setOnClickListener {
+            // Programmatic slider changes have fromUser=false.
+            LlamaEngine.setMemoryBudgetMb(this, maxMb)
             slider.value = slider.valueTo
         }
         updateMemoryBudgetVisibility()
@@ -161,7 +163,7 @@ class ModelManagerActivity : AppCompatActivity() {
             valueView.text = getString(R.string.context_size_value, tokens)
         }
         slider.valueFrom = LlamaEngine.MIN_CONTEXT_SIZE.toFloat()
-        slider.valueTo = LlamaEngine.MAX_CONTEXT_SIZE.toFloat()
+        slider.valueTo = LlamaEngine.getMaxContextSize(this).toFloat()
         slider.stepSize = LlamaEngine.CONTEXT_SIZE_STEP.toFloat()
         val size = LlamaEngine.getContextSize(this)
         slider.value = size.toFloat()
@@ -176,6 +178,12 @@ class ModelManagerActivity : AppCompatActivity() {
     private fun updateMemoryBudgetVisibility() {
         findViewById<View>(R.id.card_memory_budget).visibility =
             if (LlamaEngine.getSelectedModel(this).expertsDirectory != null) View.VISIBLE else View.GONE
+        findViewById<Slider>(R.id.slider_context_size).let { slider ->
+            val maxSize = LlamaEngine.getMaxContextSize(this).toFloat()
+            if (slider.value > maxSize) slider.value = maxSize
+            slider.valueTo = maxSize
+            slider.value = LlamaEngine.getContextSize(this).toFloat()
+        }
     }
 
     private fun setupModelList() {

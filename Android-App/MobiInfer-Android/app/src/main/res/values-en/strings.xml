@@ -210,8 +210,8 @@
     <string name="tts_baselm_missing">BaseLM GGUF file missing, please download</string>
     <string name="tts_acoustic_missing">Acoustic GGUF file missing, please download</string>
     <string name="memory_budget_title">Runtime memory budget</string>
-    <string name="memory_budget_description">For MiniCPM-V 4.7; applies on the next model load. A lower budget adjusts the expert cache and prompt chunk size. 1 GB = 1 billion bytes; actual usage varies with input. The upper limit is derived from device RAM with a reserve for the system.</string>
-    <string name="memory_budget_value">%1$.1f GB</string>
+    <string name="memory_budget_description">For MiniCPM-V 4.7; applies on the next model load. A lower budget adjusts the expert cache and prompt chunk size. 1 GB = 1 billion bytes; actual usage varies with input. The budget is capped at 6.0 GB with room reserved for the system; it is not an OS-enforced process memory limit.</string>
+    <string name="memory_budget_value">%1$.1f GB · %2$d expert slots per layer</string>
     <string name="memory_budget_use_max">Use device maximum</string>
     <string name="context_size_title">Context length</string>
     <string name="context_size_description">Maximum tokens per request (prompt, history, images and reply all count). Defaults to 4096; larger values use more memory. Generation stops when the limit is reached.</string>
