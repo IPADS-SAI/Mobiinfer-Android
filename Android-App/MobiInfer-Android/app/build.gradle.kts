@@ -222,8 +222,84 @@ tasks.register("buildGgmlCpu_v86") {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Hexagon DSP skels. The ggml-hexagon CMakeLists declares the HTP skels as
+// ExternalProject targets and only installs them via `cmake --install`, which
+// the Android Gradle Plugin never runs. So `:app:assemble*` alone produces an
+// APK with the host-side libggml-hexagon.so but NO libggml-htp-v*.so, and the
+// DSP fails to open a session at load time (AEE_EUNABLETOLOAD 0x80000406).
+// Build the skels here and drop them into jniLibs so they ship in the APK.
+// Override versions with -PhtpSkels=v79 (comma separated) to trim build time.
+// ---------------------------------------------------------------------------
+
+val htpSkels: List<String> =
+    (project.findProperty("htpSkels") as String?)?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }
+        ?: listOf("v73", "v75", "v79", "v81")
+
+tasks.register("buildHtpSkels") {
+    group = "native"
+    description = "Build libggml-htp-v*.so DSP skels and stage them in jniLibs"
+
+    val hexagonSdk = System.getenv("HEXAGON_SDK_ROOT")
+        ?: error("Set HEXAGON_SDK_ROOT to the Hexagon SDK installation directory")
+    val hexagonTools = System.getenv("HEXAGON_TOOLS_ROOT")
+        ?: File(hexagonSdk, "tools/HEXAGON_Tools")
+            .listFiles { file -> file.isDirectory }
+            ?.maxByOrNull { it.name }
+            ?.absolutePath
+        ?: error("Set HEXAGON_TOOLS_ROOT to the Hexagon tools directory")
+
+    val htpSrc = file("../../../ggml/src/ggml-hexagon/htp").canonicalFile
+    val destDir = file("src/main/jniLibs/arm64-v8a")
+    val outputsList = htpSkels.map { destDir.resolve("libggml-htp-$it.so") }
+
+    inputs.dir(htpSrc)
+    inputs.property("htpSkels", htpSkels)
+    inputs.property("hexagonSdk", File(hexagonSdk).canonicalPath)
+    inputs.property("hexagonTools", File(hexagonTools).canonicalPath)
+    outputs.files(outputsList)
+
+    doLast {
+        val cmake = "$sdkRoot/cmake/4.1.2/bin/cmake"
+        destDir.mkdirs()
+        val selected = htpSkels.map { "libggml-htp-$it.so" }.toSet()
+        destDir.listFiles { file ->
+            file.isFile && file.name.startsWith("libggml-htp-") &&
+                file.extension == "so" && file.name !in selected
+        }?.forEach { stale ->
+            stale.delete()
+            logger.lifecycle("Removed stale HTP skel ${stale.absolutePath}")
+        }
+        for (ver in htpSkels) {
+            val bd = File(project.layout.buildDirectory.asFile.get(), "htp-cmake/$ver")
+            bd.mkdirs()
+            runCmd(
+                cmake,
+                "-S", htpSrc.absolutePath,
+                "-B", bd.absolutePath,
+                "-DCMAKE_TOOLCHAIN_FILE=${htpSrc.absolutePath}/cmake-toolchain.cmake",
+                "-DCMAKE_BUILD_TYPE=Release",
+                "-DDSP_VERSION=$ver",
+                "-DPREBUILT_LIB_DIR=toolv19_$ver",
+                "-DHEXAGON_SDK_ROOT=$hexagonSdk",
+                "-DHEXAGON_TOOLS_ROOT=$hexagonTools",
+            )
+            runCmd(
+                cmake,
+                "--build", bd.absolutePath,
+                "-j", Runtime.getRuntime().availableProcessors().toString(),
+            )
+            val builtSo = fileTree(bd).matching { include("**/libggml-htp-$ver.so") }.singleFile
+            val destSo = destDir.resolve("libggml-htp-$ver.so")
+            builtSo.copyTo(destSo, overwrite = true)
+            logger.lifecycle("Copied $ver HTP skel -> ${destSo.absolutePath} (${destSo.length() / 1024}K)")
+        }
+    }
+}
+
 afterEvaluate {
     listOf("Debug", "Release").forEach { buildType ->
         tasks.findByName("merge${buildType}JniLibFolders")?.dependsOn("buildGgmlCpu_v86")
+        tasks.findByName("merge${buildType}JniLibFolders")?.dependsOn("buildHtpSkels")
     }
 }

@@ -8,11 +8,10 @@
 // Decimal MB/GB; this is not an allocator-enforced process limit.
 struct MiniCPM47MemoryConfig {
     static constexpr int min_mb = 5200;
-    // Device RAM is the real limit; the Kotlin layer derives a per-device
-    // ceiling and passes it in. This is only a defensive absolute bound.
-    static constexpr int max_mb = 32768;
+    static constexpr int max_mb = 13000;
     static constexpr int batch = 512;
     static constexpr int draft = 3;
+    static constexpr bool phase_reuse = true;
     static constexpr int64_t slot_bytes = 40LL * 1572864;
     // Qwen35MoE in this bundle has 256 experts per layer. A wider per-layer
     // decode window cannot hold more distinct experts, so RAM above this is
@@ -29,17 +28,20 @@ struct MiniCPM47MemoryConfig {
 
 inline MiniCPM47MemoryConfig minicpm47_memory_config(int budget_mb) {
     if (budget_mb < MiniCPM47MemoryConfig::min_mb || budget_mb > MiniCPM47MemoryConfig::max_mb) {
-        throw std::invalid_argument("MiniCPM-V 4.7 memory budget must be 5200..32768 MB");
+        throw std::invalid_argument("MiniCPM-V 4.7 memory budget must be 5200..13000 MB");
     }
-    // Smaller budgets must also reduce the prefill bank and graph reservation.
-    // Fixed terms include the resident model, draft, eager vision, context and
-    // a reserve for UI/variation. A different bundle needs new calibration.
-    const bool low = budget_mb < 5900;
-    const bool medium = budget_mb < 6500;
-    const int bank = low ? 32 : medium ? 128 : 256;
-    const int ubatch = low ? 4 : medium ? 16 : 128;
-    const int prefetch = low ? 0 : 4;
-    const int64_t fixed_bytes = low ? 4650000000LL : medium ? 5050000000LL : 5700000000LL;
+    // Keep the graph/bank profile fixed so every additional 62.9 decimal MB
+    // buys one slot per layer. Changing profiles at 5.9 GB previously made
+    // the slot count fall when the user increased the slider.
+    // The shared phase pool permits a larger prompt chunk without reserving
+    // a second full expert bank. Draft3 verification needs capacity for up to
+    // 32 distinct experts per layer; smaller windows fall back to the bank.
+    // Existing calibration used eager vision + Q8 draft1 and phase reuse;
+    // the draft3 default has not been remeasured against that calibration.
+    const int bank = 256;
+    const int ubatch = 128;
+    const int prefetch = 0;
+    const int64_t fixed_bytes = 4650000000LL;
     const int total_slots = int(std::min<int64_t>(
         (int64_t(budget_mb) * 1000000 - fixed_bytes) / MiniCPM47MemoryConfig::slot_bytes,
         MiniCPM47MemoryConfig::max_useful_slots));
@@ -48,4 +50,27 @@ inline MiniCPM47MemoryConfig minicpm47_memory_config(int budget_mb) {
     }
     return {budget_mb, bank, ubatch, prefetch, total_slots - prefetch,
             fixed_bytes + total_slots * MiniCPM47MemoryConfig::slot_bytes};
+}
+
+// Low-VMEM variant for Hexagon v73 and older (Snapdragon 8 Gen 2 / 8 Gen 1).
+// Those parts map the DSP session through a 32-bit HAP_mmap with a ~2 GiB
+// single-block limit, and `ndev` is forced to 1, so the whole session must fit
+// under that. The normal layout needs ~2.9 GiB (weights 1.41 G + bank 0.53 G +
+// vision 0.39 G + decode window 0.40 G + KV/RS 0.29 G) and fails to map.
+// This variant shrinks the expert bank and ubatch. The caller must additionally
+// run vision on the CPU and disable speculative decoding (ubatch=1..2 conflicts
+// with the draft-length assertion); see minicpm47_runtime.cpp.
+inline MiniCPM47MemoryConfig minicpm47_low_vmem_config(int budget_mb) {
+    if (budget_mb < MiniCPM47MemoryConfig::min_mb || budget_mb > MiniCPM47MemoryConfig::max_mb) {
+        throw std::invalid_argument("MiniCPM-V 4.7 memory budget must be 5200..13000 MB");
+    }
+    // Small fixed bank: the DSP mapping is the constraint here, not host RAM.
+    // bank=16 with ubatch=2 keeps the published `ubatch <= bank / 8` rule.
+    const int bank = 16;
+    const int ubatch = 2;
+    const int prefetch = 0;
+    const int cache_slots = 8;
+    const int64_t fixed_bytes = 4650000000LL;
+    return {budget_mb, bank, ubatch, prefetch, cache_slots - prefetch,
+            fixed_bytes + (int64_t) cache_slots * MiniCPM47MemoryConfig::slot_bytes};
 }

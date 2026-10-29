@@ -15,7 +15,7 @@
 | 完全端侧推理 | ✅ 无远程服务器，全部在手机上运行 |
 | **高通 Hexagon NPU（HTP）**加速 | ✅ 语言模型 **和** 视觉编码器都跑在 NPU |
 | **MiniCPM-V 4.7 35B-A3B**（MoE）端侧运行 | ✅ 路由专家按需从闪存流式加载（LES） |
-| **DSpark** 投机采样 | ✅ Q8_0 草稿，最多 3 个草稿 token（默认启用） |
+| **DSpark** 投机采样 | ✅ Q8_0 草稿，默认最多 3 个草稿 token（默认启用） |
 | 多模态输入 | ✅ 文本对话 + 图片问答 |
 | App 内 **模型管理** | ✅ 从 ModelScope 下载整包并按 `SHA256SUMS` 校验 |
 | Qwen3-VL-4B（HTP） | ✅ 作为第二个模型提供 |
@@ -74,7 +74,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 推理引擎位于父仓库根目录，各端通过相对路径（`-DLLAMA_SRC`）直接引用，**不再使用 submodule 或软链**，无需 `git submodule update`。
 
 - Application ID / 包名：**`com.mobiinfer.demo`**
-- 原生库：`libmobiinfer.so`（宿主侧 Hexagon 驱动 + `libggml-htp-v79.so` DSP skel）
+- 原生库：`libmobiinfer.so`（宿主侧 Hexagon 驱动 + `libggml-htp-v73/v75/v79/v81.so` DSP skel；可用 `-PhtpSkels=v79` 只构建指定版本）
 
 ## 仓库结构
 

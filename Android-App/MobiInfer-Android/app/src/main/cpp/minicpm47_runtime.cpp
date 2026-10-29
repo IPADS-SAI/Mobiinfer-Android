@@ -18,6 +18,10 @@
 // (1 on single-NSP SoCs, 2 where a second NSP is available).
 extern "C" int mobiinfer_htp_session_count();
 
+// Defined in llama_jni.cpp: non-zero when the device's HTP needs a reduced
+// memory layout (Hexagon v73 and older with a 32-bit HTP mapping window).
+extern "C" int mobiinfer_low_vmem_required();
+
 static const std::string kThinkOpen = "\x3Cthink\x3E";
 static const std::string kThinkClose = "\x3C/think\x3E";
 
@@ -111,7 +115,19 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
     auto & p = impl->params;
     impl->image_min_tokens = image_min_tokens;
     impl->image_max_tokens = image_max_tokens;
-    const auto memory = minicpm47_memory_config(memory_budget_mb);
+    // Hexagon v73 and older (8 Gen 2 / 8 Gen 1) map the DSP session through a
+    // 32-bit window; the normal layout does not fit. Pick the low-VMEM defaults
+    // first, then let runtime.json override them explicitly.
+    const bool low_vmem = mobiinfer_low_vmem_required() != 0;
+    const auto memory = low_vmem ? minicpm47_low_vmem_config(memory_budget_mb)
+                                 : minicpm47_memory_config(memory_budget_mb);
+    if (low_vmem) {
+        // Vision on the CPU frees ~394 MiB of DSP mapping, and DSpark must be
+        // off so ubatch can drop to the small-bank value. (Applied before the
+        // runtime.json fallbacks so an explicit file can still override.)
+        impl->vision_htp = false;
+        impl->dspark = false;
+    }
     impl->memory_budget_mb = memory.budget_mb;
     impl->cache_slots = memory.cache_slots;
     int prefetch = memory.prefetch;
@@ -125,12 +141,13 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
     int cfg_batch       = 0;
     std::string cfg_layer_windows;
     std::string cfg_prewarm;
+    bool phase_reuse = memory.phase_reuse;
     // Optional local benchmark overrides. Normal use defaults to HTP + DSpark.
     std::ifstream config_file(dir + "/runtime.json");
     if (config_file) {
         const auto config = nlohmann::json::parse(config_file);
-        impl->vision_htp = config.value("vision_htp", true);
-        impl->dspark = config.value("dspark", true);
+        impl->vision_htp = config.value("vision_htp", impl->vision_htp);
+        impl->dspark = config.value("dspark", impl->dspark);
         impl->label = config.value("label", std::string());
         impl->benchmark_max_tokens = config.value("max_tokens", 0);
         impl->benchmark_eager_mmproj = config.value("eager_mmproj", true);
@@ -138,6 +155,7 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
         cfg_batch       = config.value("batch", 0);
         cfg_layer_windows = config.value("layer_windows", std::string());
         cfg_prewarm     = config.value("prewarm", std::string());
+        phase_reuse    = config.value("phase_reuse", phase_reuse);
         prefetch = config.value("prefetch", prefetch);
         io_threads = config.value("io_threads", io_threads);
         benchmark_cache_slots = config.value("cache_slots", -1);
@@ -279,6 +297,7 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
         }
     }
     setenv("LLAMA_MOE_DECODE_WINDOW", std::to_string(impl->cache_slots).c_str(), 1);
+    setenv("LLAMA_MOE_PHASE_REUSE", phase_reuse ? "1" : "0", 1);
     // Optional per-layer decode windows ("llama,windows" style: "0:16,1:19,...").
     // Overrides the uniform DECODE_WINDOW above; needed to reallocate the same
     // RAM across layers (dispersed early layers need bigger windows than

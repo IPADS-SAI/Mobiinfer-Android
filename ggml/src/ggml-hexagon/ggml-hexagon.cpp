@@ -739,9 +739,21 @@ struct ggml_hexagon_shared_buffer {
 
         int err = fastrpc_mmap(sess->domain_id, fd(), (void *) base(), 0, size(), flags);
         if (err != 0) {
-            GGML_LOG_ERROR("ggml-hex: %s buffer mapping failed : domain_id %d size %zu fd %d error 0x%08x\n", sess->c_name(),
-                    sess->domain_id, size(), fd(), (unsigned) err);
-            throw std::runtime_error("ggml-hex: fastrpc_mmap failed (see log for details)");
+            GGML_LOG_ERROR("ggml-hex: %s buffer mapping failed : domain_id %d size %zu fd %d addr %p flags %d error 0x%08x\n",
+                    sess->c_name(), sess->domain_id, size(), fd(), (void *) base(), (int) flags, (unsigned) err);
+            GGML_LOG_ERROR("ggml-hex: %s mapping context : arch v%d dma64 %d pinned %d extended %d vmem %zu max_vmem %zu\n",
+                    sess->c_name(), opt_arch, (int) opt_dma64, (int) pinned, (int) extended,
+                    opt_vmem, sess->max_vmem);
+            GGML_LOG_ERROR("ggml-hex: %s mapping stats : cloned %zu mapped_clones %zu\n",
+                    sess->c_name(), sess->cloned_buffers.size(), mem->mapped_clones.size());
+            char detail[256];
+            snprintf(detail, sizeof(detail),
+                    "ggml-hex: fastrpc_mmap failed: err 0x%08x domain %d size %zu fd %d "
+                    "flags %d arch v%d dma64 %d pinned %d extended %d vmem %zu max_vmem %zu",
+                    (unsigned) err, sess->domain_id, size(), fd(), (int) flags,
+                    opt_arch, (int) opt_dma64, (int) pinned, (int) extended,
+                    opt_vmem, sess->max_vmem);
+            throw std::runtime_error(detail);
         }
 
         HEX_VERBOSE("ggml-hex: %s mapped buffer: base %p size %zu fd %d pinned %u extended %u\n",
@@ -3180,8 +3192,11 @@ struct ggml_hexagon_opbatch {
         h_ops.resize(n_ops_max);
 
         b_map.reserve(n_bufs_max);
-        t_map.reserve(n_tens_max);
-        d_map.reserve(n_tens_max);
+        // Small batches should not clear maps sized for the largest graph on
+        // every submission. Larger batches can grow these maps as needed.
+        const size_t initial_tensors = std::min<size_t>(32, n_tens_max);
+        t_map.reserve(initial_tensors);
+        d_map.reserve(initial_tensors);
 
         GGML_LOG_INFO("ggml-hex: %s op batching: n-bufs %u n-tensors %u n-ops %u vmem %zu\n",
                 sess->c_name(), n_bufs_max, n_tens_max, n_ops_max, b_vmem_max);
@@ -4194,7 +4209,10 @@ struct ggml_hexagon_opqueue {
         req.n_tensors = op_batch->n_tens;
         req.n_ops     = op_batch->n_ops;
 
-        op_cache[slot]   = op_batch->ops;
+        // Keep active nodes alive until this queue slot can be reused, without
+        // copying the unused entries in the maximum-sized batch storage.
+        GGML_ASSERT(op_batch->n_ops <= op_batch->ops.size());
+        op_cache[slot].assign(op_batch->ops.begin(), op_batch->ops.begin() + op_batch->n_ops);
         start_usec[slot] = ggml_time_us();
 
         const size_t b_size = sizeof(htp_buf_desc)  * req.n_bufs;
@@ -4741,7 +4759,16 @@ ggml_hexagon_shared_buffer * ggml_hexagon_session::mmap_tensor(const ggml_tensor
     if (!sbuf->mapped) {
         const bool is_weight = ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
         const bool extended  = opt_dma64 && is_weight;
-        sbuf->mmap(extended);
+        try {
+            sbuf->mmap(extended);
+        } catch (const std::exception & exc) {
+            // Report the tensor that could not be mapped before the exception
+            // reaches an uncaught handler; the caller decides how to recover.
+            GGML_LOG_ERROR("ggml-hex: %s failed to map tensor '%s' (%s, %zu bytes): %s\n",
+                    c_name(), t->name, ggml_backend_buffer_name(t->buffer),
+                    ggml_nbytes(t), exc.what());
+            throw;
+        }
     }
     return sbuf;
 }
@@ -5026,6 +5053,8 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
     }
     const size_t shm_size = this->op_queue->shm_size();
     this->max_vmem = (opt_vmem > shm_size) ? (opt_vmem - shm_size) : opt_vmem;
+    GGML_LOG_INFO("ggml-hex: %s vmem budget: arch v%d dma64 %d measured %zu shm %zu usable %zu\n",
+                  this->c_name(), opt_arch, (int) opt_dma64, opt_vmem, shm_size, this->max_vmem);
 
     this->op_batch = new ggml_hexagon_opbatch(this, opt_opbatch, this->max_vmem);
 
@@ -9908,8 +9937,16 @@ static size_t ggml_backend_hexagon_pack_moe_expert(void * dst, const void * src,
     return bytes;
 }
 
+static int ggml_backend_hexagon_get_arch(ggml_backend_reg_t reg) {
+    GGML_UNUSED(reg);
+    return opt_arch;
+}
+
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_hexagon_get_arch") == 0) {
+        return (void *) ggml_backend_hexagon_get_arch;
+    }
     if (strcmp(name, "ggml_backend_pack_moe_expert") == 0) {
         return (void *) ggml_backend_hexagon_pack_moe_expert;
     }

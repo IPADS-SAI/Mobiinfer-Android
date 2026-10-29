@@ -138,6 +138,36 @@ extern "C" int mobiinfer_htp_session_count() {
     return g_htp_sessions;
 }
 
+// True when the device's HTP needs a reduced layout to fit in the per-session
+// mapping window. Overridable with MOBIINFER_LOW_VMEM=0/1 for A/B testing.
+extern "C" int mobiinfer_low_vmem_required() {
+    const char * override = getenv("MOBIINFER_LOW_VMEM");
+    if (override && *override) {
+        return *override != '0';
+    }
+
+    using get_arch_fn = int (*)(ggml_backend_reg_t);
+    get_arch_fn get_arch = nullptr;
+    const auto reg = ggml_backend_reg_by_name("HTP");
+    if (reg) {
+        get_arch = reinterpret_cast<get_arch_fn>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_get_arch"));
+    }
+    if (!get_arch) {
+        LOGw("Hexagon arch unavailable; using the conservative low-vmem layout");
+        return 1;
+    }
+
+    const int arch = get_arch(reg);
+    LOGi("Hexagon arch v%d%s", arch,
+         arch > 0 && arch < 75 ? " (low-vmem layout required)" : "");
+    if (arch <= 0) {
+        LOGw("Hexagon arch query returned v%d; using the conservative low-vmem layout", arch);
+        return 1;
+    }
+    return arch < 75 ? 1 : 0;
+}
+
 // Inference parameters mirror the iOS demo defaults (MTMDParams.swift / mtmd-ios.cpp):
 //   nThreads=4, nCtx=4096 (8192 for MiniCPM-V-4.6 to fit video frames),
 //   nBatch=2048, temperature=0.7, top_k=0, top_p=1.0, penalty_repeat=1.0,

@@ -190,23 +190,20 @@ object DebugLogStore {
     }
 
     private fun captureCrashBuffer(context: Context) {
-        val output = try {
-            val process = ProcessBuilder(
-                "logcat",
-                "-d",
-                "-b",
-                "crash",
-                "-v",
-                "threadtime"
-            ).redirectErrorStream(true).start()
-            val text = process.inputStream.bufferedReader().use { it.readText() }
-            process.waitFor()
-            text
-        } catch (error: Throwable) {
-            Log.w(TAG, "Unable to read crash log buffer", error)
-            return
-        }
-        if (!output.contains(context.packageName)) return
+        val main = readLogcat("-b", "main")
+        val crash = readLogcat("-b", "crash")
+
+        // The main buffer carries the ggml/fastrpc diagnostics that precede a
+        // native abort. Both buffers are filtered down to this process: the
+        // device emits thousands of framework lines per launch, which would
+        // otherwise consume the whole record budget before the real failure.
+        val appLines = (main + crash)
+            .lineSequence()
+            .filter { it.contains(context.packageName) || it.contains("ggml") || it.contains("llama") }
+            .toList()
+
+        val output = if (appLines.isEmpty()) "" else appLines.joinToString("\n")
+        if (output.isBlank()) return
 
         val hash = MessageDigest.getInstance("SHA-256")
             .digest(output.toByteArray(Charsets.UTF_8))
@@ -224,6 +221,19 @@ object DebugLogStore {
         )
         prefs.edit().putString(KEY_LAST_CRASH_HASH, hash).apply()
     }
+
+    private fun readLogcat(vararg args: String): String =
+        try {
+            val process = ProcessBuilder("logcat", "-d", *args, "-v", "threadtime")
+                .redirectErrorStream(true)
+                .start()
+            val text = process.inputStream.bufferedReader().use { it.readText() }
+            process.waitFor()
+            text
+        } catch (error: Throwable) {
+            Log.w(TAG, "Unable to read logcat buffer ${args.joinToString(" ")}", error)
+            ""
+        }
 
     private fun isReportableExit(reason: Int): Boolean =
         reason == ApplicationExitInfo.REASON_CRASH ||
@@ -265,9 +275,11 @@ object DebugLogStore {
         collectorThread = Thread(
             {
                 try {
+                    val fold = RepeatingLineFold()
                     process.inputStream.bufferedReader().useLines { lines ->
-                        lines.forEach { line -> append(context, line) }
+                        lines.forEach { line -> fold.accept(line)?.let { append(context, it) } }
                     }
+                    fold.flush()?.let { append(context, it) }
                 } catch (_: Throwable) {
                     // Process destruction during shutdown is expected.
                 } finally {
@@ -280,6 +292,113 @@ object DebugLogStore {
             start()
         }
     }
+
+    /**
+     * Drops logcat noise emitted by the platform (view system, insets, BLAST
+     * buffer plumbing, HyperOS helpers) and folds runs of identical messages
+     * into one line plus a repeat count, so the 512 KB file holds real signal.
+     */
+    internal class RepeatingLineFold {
+        private var lastRecord: String? = null
+        private var lastMessage: String? = null
+        private var lastTimestamp: String? = null
+        private var repeated = 0
+
+        internal fun accept(line: String): String? {
+            val parsed = parse(line) ?: return line
+            if (isNoiseTag(parsed.tag, parsed.message)) return null
+            if (parsed.message == lastMessage) {
+                repeated++
+                return null
+            }
+            val flushed = flush()
+            lastRecord = parsed.record
+            lastMessage = parsed.message
+            lastTimestamp = parsed.timestamp
+            repeated = 0
+            return flushed
+        }
+
+        internal fun flush(): String? {
+            val record = lastRecord ?: return null
+            val timestamp = lastTimestamp
+            lastRecord = null
+            lastMessage = null
+            lastTimestamp = null
+            val count = repeated
+            repeated = 0
+            if (count == 0 || timestamp == null) return record
+            return record + "\n" + timestamp + "     DEBUG repeating line $count more time(s)"
+        }
+
+        private fun parse(line: String): ParsedLine? {
+            // threadtime format: MM-DD HH:MM:SS.mmm  PID  TID L TAG     : message
+            if (line.length < 40) return null
+            val timestampEnd = 18
+            if (line.getOrNull(2) != '-' || line.getOrNull(5) != ' ') return null
+            val messageSeparator = line.indexOf(": ")
+            if (messageSeparator < 0) return null
+            var pos = timestampEnd
+            fun skipSpaces() {
+                while (pos < messageSeparator && line[pos] == ' ') pos++
+            }
+            fun skipToken() {
+                while (pos < messageSeparator && line[pos] != ' ') pos++
+            }
+
+            // Skip the PID and TID columns. Parsing their values is unnecessary,
+            // but consuming both tokens puts us at the severity column.
+            repeat(2) {
+                skipSpaces()
+                skipToken()
+                if (pos >= messageSeparator) return null
+            }
+            skipSpaces()
+            val level = line.getOrNull(pos) ?: return null
+            if (level !in 'A'..'Z') return null
+            if (line.getOrNull(++pos) != ' ') return null
+            skipSpaces()
+            if (pos >= messageSeparator) return null
+            return ParsedLine(
+                record = line,
+                timestamp = line.substring(0, timestampEnd),
+                tag = line.substring(pos, messageSeparator).trim(),
+                message = line.substring(messageSeparator + 2)
+            )
+        }
+
+        private fun isNoiseTag(tag: String?, text: String): Boolean {
+            if (tag == null) return false
+            if (tag in NOISE_TAGS) return true
+            if (NOISE_TAG_PREFIXES.any { tag.startsWith(it) }) return true
+            return text.contains("getMiuiFreeformStackInfo")
+        }
+    }
+
+    private class ParsedLine(
+        val record: String,
+        val timestamp: String,
+        val tag: String,
+        val message: String
+    )
+
+    private val NOISE_TAGS = setOf(
+        "Activity",
+        "InsetsSource",
+        "InsetsController",
+        "DecorViewImmersiveImpl",
+        "HandWritingStubImpl",
+        "ImeTracker",
+        "HWUI",
+        "libEGL",
+        "ContentCatcher_TaplusBlackListHelper"
+    )
+
+    private val NOISE_TAG_PREFIXES = listOf(
+        "VRI[",
+        "BufferQueue",
+        "MiuiMultiWindow"
+    )
 
     @Synchronized
     private fun stopCollector() {
