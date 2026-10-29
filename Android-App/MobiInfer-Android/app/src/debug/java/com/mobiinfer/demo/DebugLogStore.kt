@@ -298,14 +298,14 @@ object DebugLogStore {
      * buffer plumbing, HyperOS helpers) and folds runs of identical messages
      * into one line plus a repeat count, so the 512 KB file holds real signal.
      */
-    private class RepeatingLineFold {
+    internal class RepeatingLineFold {
         private var lastRecord: String? = null
         private var lastMessage: String? = null
         private var lastTimestamp: String? = null
         private var repeated = 0
 
-        fun accept(line: String): String? {
-            val parsed = parse(line) ?: return line.takeUnless { isNoiseTag(null, line) }
+        internal fun accept(line: String): String? {
+            val parsed = parse(line) ?: return line
             if (isNoiseTag(parsed.tag, parsed.message)) return null
             if (parsed.message == lastMessage) {
                 repeated++
@@ -319,7 +319,7 @@ object DebugLogStore {
             return flushed
         }
 
-        fun flush(): String? {
+        internal fun flush(): String? {
             val record = lastRecord ?: return null
             val timestamp = lastTimestamp
             lastRecord = null
@@ -338,17 +338,31 @@ object DebugLogStore {
             if (line.getOrNull(2) != '-' || line.getOrNull(5) != ' ') return null
             val messageSeparator = line.indexOf(": ")
             if (messageSeparator < 0) return null
-            val tagPart = line.substring(0, messageSeparator)
-            val tagStart = tagPart.lastIndexOf("  ") + 2
-            if (tagStart <= 0 || tagStart >= tagPart.length) return null
-            val header = tagPart.substring(0, tagStart)
-            val levelField = header.trimEnd()
-            val level = levelField.lastOrNull() ?: return null
+            var pos = timestampEnd
+            fun skipSpaces() {
+                while (pos < messageSeparator && line[pos] == ' ') pos++
+            }
+            fun skipToken() {
+                while (pos < messageSeparator && line[pos] != ' ') pos++
+            }
+
+            // Skip the PID and TID columns. Parsing their values is unnecessary,
+            // but consuming both tokens puts us at the severity column.
+            repeat(2) {
+                skipSpaces()
+                skipToken()
+                if (pos >= messageSeparator) return null
+            }
+            skipSpaces()
+            val level = line.getOrNull(pos) ?: return null
             if (level !in 'A'..'Z') return null
+            if (line.getOrNull(++pos) != ' ') return null
+            skipSpaces()
+            if (pos >= messageSeparator) return null
             return ParsedLine(
                 record = line,
                 timestamp = line.substring(0, timestampEnd),
-                tag = tagPart.substring(tagStart).trim(),
+                tag = line.substring(pos, messageSeparator).trim(),
                 message = line.substring(messageSeparator + 2)
             )
         }

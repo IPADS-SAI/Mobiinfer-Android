@@ -9937,8 +9937,16 @@ static size_t ggml_backend_hexagon_pack_moe_expert(void * dst, const void * src,
     return bytes;
 }
 
+static int ggml_backend_hexagon_get_arch(ggml_backend_reg_t reg) {
+    GGML_UNUSED(reg);
+    return opt_arch;
+}
+
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_hexagon_get_arch") == 0) {
+        return (void *) ggml_backend_hexagon_get_arch;
+    }
     if (strcmp(name, "ggml_backend_pack_moe_expert") == 0) {
         return (void *) ggml_backend_hexagon_pack_moe_expert;
     }

@@ -74,7 +74,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 推理引擎位于父仓库根目录，各端通过相对路径（`-DLLAMA_SRC`）直接引用，**不再使用 submodule 或软链**，无需 `git submodule update`。
 
 - Application ID / 包名：**`com.mobiinfer.demo`**
-- 原生库：`libmobiinfer.so`（宿主侧 Hexagon 驱动 + `libggml-htp-v79.so` DSP skel）
+- 原生库：`libmobiinfer.so`（宿主侧 Hexagon 驱动 + `libggml-htp-v73/v75/v79/v81.so` DSP skel；可用 `-PhtpSkels=v79` 只构建指定版本）
 
 ## 仓库结构
 

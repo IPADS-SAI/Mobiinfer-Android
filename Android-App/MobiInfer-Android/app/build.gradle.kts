@@ -243,16 +243,33 @@ tasks.register("buildHtpSkels") {
     val hexagonSdk = System.getenv("HEXAGON_SDK_ROOT")
         ?: error("Set HEXAGON_SDK_ROOT to the Hexagon SDK installation directory")
     val hexagonTools = System.getenv("HEXAGON_TOOLS_ROOT")
+        ?: File(hexagonSdk, "tools/HEXAGON_Tools")
+            .listFiles { file -> file.isDirectory }
+            ?.maxByOrNull { it.name }
+            ?.absolutePath
         ?: error("Set HEXAGON_TOOLS_ROOT to the Hexagon tools directory")
 
     val htpSrc = file("../../../ggml/src/ggml-hexagon/htp").canonicalFile
     val destDir = file("src/main/jniLibs/arm64-v8a")
     val outputsList = htpSkels.map { destDir.resolve("libggml-htp-$it.so") }
+
+    inputs.dir(htpSrc)
+    inputs.property("htpSkels", htpSkels)
+    inputs.property("hexagonSdk", File(hexagonSdk).canonicalPath)
+    inputs.property("hexagonTools", File(hexagonTools).canonicalPath)
     outputs.files(outputsList)
 
     doLast {
         val cmake = "$sdkRoot/cmake/4.1.2/bin/cmake"
         destDir.mkdirs()
+        val selected = htpSkels.map { "libggml-htp-$it.so" }.toSet()
+        destDir.listFiles { file ->
+            file.isFile && file.name.startsWith("libggml-htp-") &&
+                file.extension == "so" && file.name !in selected
+        }?.forEach { stale ->
+            stale.delete()
+            logger.lifecycle("Removed stale HTP skel ${stale.absolutePath}")
+        }
         for (ver in htpSkels) {
             val bd = File(project.layout.buildDirectory.asFile.get(), "htp-cmake/$ver")
             bd.mkdirs()

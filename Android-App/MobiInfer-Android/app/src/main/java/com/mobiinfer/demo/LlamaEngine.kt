@@ -132,12 +132,6 @@ class LlamaEngine private constructor(
             return bounded
         }
 
-        // Settings preview of minicpm47_memory.h's fixed-profile mapping.
-        // Decimal bytes; one slot in each of 40 layers costs 62,914,560 B.
-        fun getExpertCacheSlots(memoryBudgetMb: Int): Int =
-            ((memoryBudgetMb.toLong() * 1_000_000L - 4_650_000_000L) / 62_914_560L)
-                .toInt().coerceIn(8, 256)
-
         fun setMemoryBudgetMb(context: Context, value: Int) {
             val maxMb = getMaxMemoryBudgetMb(context)
             require(value in MIN_MEMORY_BUDGET_MB..maxMb && value % 100 == 0)
@@ -1283,9 +1277,17 @@ class LlamaEngine private constructor(
     @Volatile
     private var _mmprojLoaded = false
 
+    @Volatile
+    private var _nativeCallTimedOut = false
+
     @ExperimentalCoroutinesApi
     private val llamaDispatcher = Dispatchers.IO.limitedParallelism(1)
     private val llamaScope = CoroutineScope(llamaDispatcher + SupervisorJob())
+
+    private class NativeCallTimeoutException(
+        message: String,
+        cause: Throwable,
+    ) : RuntimeException(message, cause)
 
     /**
      * Run a blocking native call with a hard wall-clock deadline.
@@ -1312,7 +1314,10 @@ class LlamaEngine private constructor(
                 future.get(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS)
             } catch (e: java.util.concurrent.TimeoutException) {
                 future.cancel(true)
-                throw RuntimeException(
+                // The native call may still be running and cannot be interrupted.
+                // Poison the engine so no later load/unload races with that worker.
+                _nativeCallTimedOut = true
+                throw NativeCallTimeoutException(
                     "$what timed out after ${timeoutSeconds}s. The Hexagon DSP likely " +
                     "rejected the memory layout (device may need a smaller memory budget " +
                     "or is unsupported). Please restart the app.", e)
@@ -1414,6 +1419,9 @@ class LlamaEngine private constructor(
             check(_state.value is LlamaState.Initialized) {
                 "Cannot load model in ${_state.value.javaClass.simpleName}!"
             }
+            check(!_nativeCallTimedOut) {
+                "A previous native call timed out. Restart the app before loading a model."
+            }
             try {
                 Log.i(TAG, "Checking access to model file... \n$pathToModel")
                 File(pathToModel).let {
@@ -1490,7 +1498,9 @@ class LlamaEngine private constructor(
                 _state.value = LlamaState.ModelReady
             } catch (e: Exception) {
                 Log.e(TAG, (e.message ?: "Error loading model") + "\n" + pathToModel, e)
-                unload()
+                if (e !is NativeCallTimeoutException) {
+                    unload()
+                }
                 loadedModelId = null
                 _mmprojLoaded = false
                 _state.value = LlamaState.Error(e)
@@ -1793,6 +1803,10 @@ class LlamaEngine private constructor(
     }
 
     suspend fun unloadModel() = withContext(llamaDispatcher) {
+        if (_nativeCallTimedOut) {
+            Log.w(TAG, "Skipping unload after native timeout; restart the app")
+            return@withContext
+        }
         if (_state.value is LlamaState.ModelReady || _state.value is LlamaState.Error) {
             Log.i(TAG, "Unloading model...")
             _readyForSystemPrompt = false
@@ -1810,11 +1824,20 @@ class LlamaEngine private constructor(
         _mmprojLoaded = false
         _readyForSystemPrompt = false
         _cancelGeneration = false
-        _state.value = LlamaState.Initialized
+        _state.value = if (_nativeCallTimedOut) {
+            LlamaState.Error(RuntimeException(
+                "A native call timed out. Restart the app before loading a model."))
+        } else {
+            LlamaState.Initialized
+        }
     }
 
     fun cleanUp() {
         _cancelGeneration = true
+        if (_nativeCallTimedOut) {
+            Log.w(TAG, "Skipping native cleanup after timeout; restart the app")
+            return
+        }
         runBlocking(llamaDispatcher) {
             when (val state = _state.value) {
                 is LlamaState.ModelReady -> {
@@ -1841,6 +1864,11 @@ class LlamaEngine private constructor(
 
     fun destroy() {
         _cancelGeneration = true
+        if (_nativeCallTimedOut) {
+            Log.w(TAG, "Skipping native destroy after timeout; restart the app")
+            llamaScope.cancel()
+            return
+        }
         runBlocking(llamaDispatcher) {
             _readyForSystemPrompt = false
             _mmprojLoaded = false

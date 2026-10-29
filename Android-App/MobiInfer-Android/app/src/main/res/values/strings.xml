@@ -217,8 +217,8 @@
     <string name="tts_baselm_missing">BaseLM GGUF 文件不存在，请下载模型</string>
     <string name="tts_acoustic_missing">Acoustic GGUF 文件不存在，请下载模型</string>
     <string name="memory_budget_title">运行内存预算</string>
-    <string name="memory_budget_description">MiniCPM-V 4.7 专用，修改后会在下次发送消息时自动重新加载模型。默认预算为8.0 GB（普通布局每层53个专家槽），调低预算会减少专家缓存。1 GB = 10亿字节；实际占用随输入变化。上限按设备物理内存计算并为系统预留空间，最高13.0 GB；这不是操作系统强制的进程内存限制。</string>
-    <string name="memory_budget_value">%1$.1f GB · 每层 %2$d 个专家槽</string>
+    <string name="memory_budget_description">MiniCPM-V 4.7 专用，修改后会在下次发送消息时自动重新加载模型。默认预算为8.0 GB，调低预算会减少专家缓存；低 VMEM Hexagon 设备使用固定的紧凑缓存。1 GB = 10亿字节；实际占用随输入变化。上限按设备物理内存计算并为系统预留空间，最高13.0 GB；这不是操作系统强制的进程内存限制。</string>
+    <string name="memory_budget_value">%1$.1f GB</string>
     <string name="memory_budget_use_max">使用设备最大</string>
     <string name="context_size_title">上下文长度</string>
     <string name="context_size_description">单次请求可用的最大 token 数（提示词、历史、图片和回复都算在内）。默认 4096，越大越占内存；超出后会停止生成。</string>

@@ -77,7 +77,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 The inference engine lives at the top of the enclosing repository and is reached directly by relative path — there is **no** `llama.cpp-omni` submodule or symlink here, and no `git submodule update` is needed.
 
 - Application ID / package: **`com.mobiinfer.demo`**
-- Native library: `libmobiinfer.so` (host-side Hexagon driver + `libggml-htp-v79.so` DSP skeleton)
+- Native library: `libmobiinfer.so` (host-side Hexagon driver + `libggml-htp-v73/v75/v79/v81.so` DSP skeletons; use `-PhtpSkels=v79` to build only the selected version)
 
 ## Repository layout
 

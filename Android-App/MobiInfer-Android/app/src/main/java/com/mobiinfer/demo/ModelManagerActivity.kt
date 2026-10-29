@@ -134,8 +134,7 @@ class ModelManagerActivity : AppCompatActivity() {
         val slider = findViewById<Slider>(R.id.slider_memory_budget)
         val valueView = findViewById<TextView>(R.id.tv_memory_budget_value)
         fun showValue(mb: Int) {
-            valueView.text = getString(R.string.memory_budget_value, mb / 1000f,
-                LlamaEngine.getExpertCacheSlots(mb))
+            valueView.text = getString(R.string.memory_budget_value, mb / 1000f)
         }
         val maxMb = LlamaEngine.getMaxMemoryBudgetMb(this)
         slider.valueFrom = LlamaEngine.MIN_MEMORY_BUDGET_MB / 1000f
