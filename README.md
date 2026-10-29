@@ -8,7 +8,7 @@
 
 **在手机上本地运行 35B 级 MoE 大模型**
 
-[![Release](https://img.shields.io/badge/release-v0.1--alpha-blue)](https://github.com/IPADS-SAI/Mobiinfer-Android/releases)
+[![Release](https://img.shields.io/badge/release-v0.3.1--alpha-blue)](https://github.com/IPADS-SAI/Mobiinfer-Android/releases)
 [![Platform](https://img.shields.io/badge/platform-Android%20%7C%20Snapdragon-3DDC84)](#)
 [![Backend](https://img.shields.io/badge/backend-Hexagon%20NPU%20(HTP)-blue)](#)
 [![Base](https://img.shields.io/badge/built%20on-llama.cpp--omni-orange)](#)
@@ -22,6 +22,7 @@
 
 ## 最新动态
 
+- [2026.10.29] 🛠️ 发布 **MobiInfer-Android v0.3.1-alpha**，改进 Hexagon 内存布局与加载超时处理，补充 v73 skel，并增强映射失败和调试日志诊断。
 - [2026.10.22] 🔥 **Day-0 适配** InternScience 最新 **Sage-A1.5 35B-A3B**在手机上的运行，支持 41 层专家从 HTP tiled 包流式加载。
 - [2026.10.19] 🛠️ 支持 Qwen3-30B-A3B / Qwen3.5-MoE-35B-A3B，MoE 专家可走外置槽位与 LES。
 - [2026.10.17] 🚀 发布 **MobiInfer-Android v0.1**，支持模型管理、一键下载和端侧 NPU 推理。
