@@ -315,4 +315,10 @@
     <string name="image_load_failed">Could not load the image model</string>
     <string name="image_copy_error">Copy error</string>
     <string name="image_error_copied">Copied</string>
+    <string name="image_stage_loading">Preparing the model…</string>
+    <string name="image_stage_encoding">Reading your prompt…</string>
+    <string name="image_stage_step">Step %1$d of %2$d</string>
+    <string name="image_stage_decoding">Decoding the image…</string>
+    <string name="image_stage_sampling">Drawing the picture…</string>
+    <string name="image_stage_loading_progress">Loading model %1$d / %2$d</string>
 </resources>

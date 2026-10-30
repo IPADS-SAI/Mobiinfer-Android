@@ -43,23 +43,24 @@
                 android:layout_height="wrap_content"
                 android:orientation="vertical"
                 android:gravity="center"
-                android:padding="16dp"
+                android:padding="12dp"
                 android:visibility="gone">
 
-                <com.google.android.material.progressindicator.CircularProgressIndicator
-                    android:layout_width="32dp"
-                    android:layout_height="32dp"
-                    android:indeterminate="true"
-                    app:indicatorSize="28dp"
-                    app:indicatorInset="2dp"
-                    app:trackThickness="3dp" />
+                <com.google.android.material.progressindicator.LinearProgressIndicator
+                    android:id="@+id/progress_image_gen"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:indeterminate="false"
+                    android:max="100"
+                    app:trackThickness="4dp" />
 
                 <TextView
                     android:id="@+id/tv_image_progress"
-                    android:layout_width="wrap_content"
+                    android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="10dp"
-                    android:text="@string/image_generating"
+                    android:layout_marginTop="8dp"
+                    android:gravity="center"
+                    android:text="@string/image_stage_loading"
                     android:textColor="?attr/colorOnSurfaceVariant"
                     android:textSize="13sp"
                     android:accessibilityLiveRegion="polite" />

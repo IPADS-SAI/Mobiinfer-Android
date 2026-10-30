@@ -45,6 +45,10 @@ class ChatAdapter(
     private var activeAiId: Long = -1L
     private var activeDownloadHolder: DownloadPromptViewHolder? = null
     private var activeDownloadId: Long = -1L
+    // Row currently showing an in-flight image; progress and preview frames
+    // are pushed straight into it instead of re-submitting the list.
+    private var activeImageHolder: ImageResultViewHolder? = null
+    private var activeImageId: Long = -1L
 
     fun setOnSuggestionClick(listener: (String) -> Unit) {
         onSuggestionClick = listener
@@ -119,6 +123,26 @@ class ChatAdapter(
         }
     }
 
+    /**
+     * In-place progress update for the image bubble. Re-submitting the list
+     * would rebind every row and restart the bar animation on each step.
+     */
+    fun notifyImageProgress(id: Long, fraction: Float, stage: String?) {
+        if (id == activeImageId) {
+            activeImageHolder?.updateProgress(fraction, stage)
+        }
+    }
+
+    /**
+     * Swaps in a live preview frame. Returns false when the row is no longer
+     * bound, so the caller can recycle the bitmap.
+     */
+    fun showImagePreview(id: Long, bitmap: Bitmap): Boolean {
+        val holder = activeImageHolder
+        if (id != activeImageId || holder == null) return false
+        return holder.showPreview(bitmap)
+    }
+
     fun updateStreamingText(id: Long, text: String) {
         if (id == activeAiId) {
             activeAiHolder?.updateText(text)
@@ -190,7 +214,17 @@ class ChatAdapter(
                     activeDownloadHolder = promptHolder
                 }
             }
-            is ChatMessage.ImageResult -> (holder as ImageResultViewHolder).bind(item)
+            is ChatMessage.ImageResult -> {
+                val imageHolder = holder as ImageResultViewHolder
+                imageHolder.bind(item)
+                if (item.isGenerating) {
+                    activeImageHolder = imageHolder
+                    activeImageId = item.id
+                } else if (item.id == activeImageId) {
+                    activeImageHolder = null
+                    activeImageId = -1L
+                }
+            }
         }
     }
 
@@ -200,6 +234,10 @@ class ChatAdapter(
         }
         if (holder is DownloadPromptViewHolder && holder == activeDownloadHolder) {
             activeDownloadHolder = null
+        }
+        if (holder is ImageResultViewHolder && holder == activeImageHolder) {
+            activeImageHolder = null
+            activeImageId = -1L
         }
     }
 
@@ -311,6 +349,7 @@ class ChatAdapter(
         private val tvError: TextView = itemView.findViewById(R.id.tv_image_error)
         private val tvParams: TextView = itemView.findViewById(R.id.tv_image_params)
         private val tvHint: TextView = itemView.findViewById(R.id.tv_image_hint)
+        private val progressBar: LinearProgressIndicator = itemView.findViewById(R.id.progress_image_gen)
         // The model that drew this picture is recorded on the message itself
         // (the selection may have changed since), but ImageResult carries no
         // model name; the label is therefore only shown while generating.
@@ -335,10 +374,16 @@ class ChatAdapter(
             when {
                 item.isGenerating -> {
                     layoutProgress.visibility = View.VISIBLE
-                    tvProgress.setText(R.string.image_generating)
-                    ivResult.visibility = View.GONE
-                    tvHint.visibility = View.GONE
                     tvError.visibility = View.GONE
+                    tvHint.visibility = View.GONE
+                    updateProgress(item.progress, item.stage)
+                    val preview = item.previewBitmap
+                    if (preview != null) {
+                        ivResult.setImageBitmap(preview)
+                        ivResult.visibility = View.VISIBLE
+                    } else {
+                        ivResult.visibility = View.GONE
+                    }
                 }
                 item.error != null -> {
                     layoutProgress.visibility = View.GONE
@@ -383,6 +428,25 @@ class ChatAdapter(
             }
         }
 
+        fun updateProgress(fraction: Float, stage: String?) {
+            layoutProgress.visibility = View.VISIBLE
+            if (fraction < 0f) {
+                progressBar.isIndeterminate = true
+            } else {
+                progressBar.isIndeterminate = false
+                // No animation: a 500 ms cross-fade per step reads as jitter
+                // while the bar is being restarted every step.
+                progressBar.setProgressCompat((fraction * 100f).toInt().coerceIn(0, 100), false)
+            }
+            stage?.let { tvProgress.text = it }
+        }
+
+        /** Shows a step preview in place of the (not yet existing) result. */
+        fun showPreview(bitmap: Bitmap): Boolean {
+            ivResult.setImageBitmap(bitmap)
+            ivResult.visibility = View.VISIBLE
+            return true
+        }
         private fun formatDuration(milliseconds: Long): String =
             String.format(java.util.Locale.getDefault(), "%.1fs", milliseconds / 1000.0)
     }
@@ -588,6 +652,9 @@ class ChatAdapter(
                             oldItem.isImageMode == newItem.isImageMode
                 oldItem is ChatMessage.ImageResult && newItem is ChatMessage.ImageResult ->
                     oldItem.isGenerating == newItem.isGenerating &&
+                            oldItem.progress == newItem.progress &&
+                            oldItem.stage == newItem.stage &&
+                            oldItem.previewBitmap === newItem.previewBitmap &&
                             oldItem.pngPath == newItem.pngPath &&
                             oldItem.error == newItem.error &&
                             oldItem.paramsText == newItem.paramsText &&

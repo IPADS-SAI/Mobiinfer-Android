@@ -323,4 +323,10 @@
     <string name="image_load_failed">文生图模型加载失败</string>
     <string name="image_copy_error">复制错误信息</string>
     <string name="image_error_copied">已复制</string>
+    <string name="image_stage_loading">准备模型…</string>
+    <string name="image_stage_encoding">理解提示词中…</string>
+    <string name="image_stage_step">第 %1$d / %2$d 步</string>
+    <string name="image_stage_decoding">正在解码图片…</string>
+    <string name="image_stage_sampling">正在生成画面…</string>
+    <string name="image_stage_loading_progress">加载模型 %1$d / %2$d</string>
 </resources>

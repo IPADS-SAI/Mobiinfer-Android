@@ -56,7 +56,14 @@ sealed class ChatMessage {
         val elapsedMs: Long? = null,
         // Set when the image was requested by the language model through the
         // generate_image tool rather than by the image-mode switch.
-        val requestedByModel: Boolean = false
+        val requestedByModel: Boolean = false,
+        // 0..1 while generating. -1 means "unknown" (indeterminate spinner).
+        val progress: Float = -1f,
+        // Human readable stage, e.g. "理解提示词中…" or "第 3/8 步".
+        val stage: String? = null,
+        // Latest low-resolution preview of the latent, replaced every step.
+        // In-memory only: it is a transient frame, never persisted.
+        val previewBitmap: Bitmap? = null
     ) : ChatMessage()
 
     data class WelcomeCard(
