@@ -44,6 +44,9 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.takeWhile
 import kotlinx.coroutines.flow.onCompletion
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
@@ -88,6 +91,9 @@ class MainActivity : AppCompatActivity() {
     // loaded the first time the user actually generates an image.
     private var imageEngine: ImageEngine? = null
     private var imageJob: Job? = null
+    // Scope that owns the image flow started from a tool call; independent of
+    // generationJob (cancelled before the image work starts).
+    private var imageJobScope: CoroutineScope? = null
     // Bumped for every image request so a late result from an abandoned or
     // superseded request cannot overwrite a newer one.
     private var imageGenerationToken = 0
@@ -330,6 +336,8 @@ class MainActivity : AppCompatActivity() {
             imageJob?.cancel()
             imageGenerationToken++
         }
+        imageJobScope?.cancel()
+        imageJobScope = null
         imageJob = null
     }
 
@@ -875,6 +883,7 @@ class MainActivity : AppCompatActivity() {
         isImageModelLoaded = false
         loadedImageModelId = null
         destroyed?.destroy()
+        destroyed?.shutdownThread()
     }
 
     /**
@@ -1134,7 +1143,7 @@ class MainActivity : AppCompatActivity() {
 
                 updateAiStatus(resultId, getString(R.string.image_generating))
                 CriticalLog.log("image", "generate start: native heap ${nativeHeapMb()} MB")
-                val usedSeed = withContext(Dispatchers.IO) {
+                val usedSeed = withContext(NonCancellable) {
                     imageEngine.generate(
                         prompt = request.prompt,
                         negativePrompt = request.negativePrompt,
@@ -1301,11 +1310,18 @@ class MainActivity : AppCompatActivity() {
             return false
         }
         if (!messages.any { it.id == aiMsgId }) return false
+        CriticalLog.log("image", "prepare returned a loaded engine (isLoaded=${imageEngine.isLoaded})")
 
         updateAiStatus(aiMsgId, getString(R.string.tool_generating_image, prompt))
         Log.i(TAG, "Image tool: drawing ${request.width}x${request.height} steps=${request.steps} cfg=${request.cfg}")
         CriticalLog.log("image", "tool generate start: native heap ${nativeHeapMb()} MB")
-        val usedSeed = withContext(Dispatchers.IO) {
+        CriticalLog.log("image", "calling imageEngine.generate(...)")
+        // NonCancellable: the tool flow is owned by a fresh scope, but the
+        // llama stream that produced the call is still being torn down around
+        // it and would otherwise cancel the generate() coroutine right here
+        // (observed: "tool flow ended: JobCancellationException" one ms after
+        // the call).
+        val usedSeed = withContext(NonCancellable) {
             imageEngine.generate(
                 prompt = request.prompt,
                 negativePrompt = request.negativePrompt,
@@ -2282,22 +2298,35 @@ class MainActivity : AppCompatActivity() {
                     setAiText(aiMsgId, visible, isGenerating = true)
                     persistCurrentConversation()
                 }
-                val handled = withContext(Dispatchers.Main) {
-                    runImageGenerationForTool(aiMsgId, call)
+                // Dedicated scope: generationJob is cancelled above, and a
+                // coroutine started from it (or from a NonCancellable block
+                // whose parent is still that job) silently never resumes after
+                // a suspension point -- this is the "generating image" that
+                // never finishes. The image job owns its own parent.
+                val imageOwner = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+                imageJobScope = imageOwner
+                imageJob = imageOwner.launch {
+                    val ok = runImageGenerationForTool(aiMsgId, call)
+                    Log.i(TAG, "Image tool finished: served=$ok")
+                    CriticalLog.log("image", "tool flow finished: served=$ok")
+                }.apply {
+                    invokeOnCompletion { cause ->
+                        imageJobScope = null
+                        imageOwner.cancel()
+                        // A cancellation here is routine: the streaming job
+                        // that produced this call is cancelled on purpose once
+                        // the tool fires, and leaving the screen cancels the
+                        // image job as well. Only real failures are worth a
+                        // line; the served= line above already records the rest.
+                        if (cause != null && cause !is kotlinx.coroutines.CancellationException) {
+                            CriticalLog.log("image", "tool flow failed: ${cause.javaClass.simpleName}: ${cause.message}")
+                        }
+                    }
                 }
-                if (handled) return@launch
-                // The request could not be served (cancelled, failed): name
-                // the reason instead of a bare "failed".
-                withContext(Dispatchers.Main) {
-                    appendAiText(
-                        aiMsgId,
-                        getString(
-                            R.string.tool_image_failed,
-                            lastImagePreparationError ?: getString(R.string.image_generate_failed)
-                        )
-                    )
-                    updateAiStatus(aiMsgId, null)
-                }
+                // Wait for the image flow here so the outer coroutine keeps
+                // its lifecycle (it is cancelled when the screen goes away,
+                // which also cancels the image job through cancelActiveGeneration).
+                imageJob?.join()
             }
             if (!toolInvoked) {
                 // Any stray protocol text must never reach the screen.

@@ -35,7 +35,10 @@ object CriticalLog {
     }
 
     fun log(component: String, message: String) {
-        val line = "${format.format(Date())} ${android.os.Process.myPid()} [$component] $message"
+        val stackTop = Throwable().stackTrace
+            .firstOrNull { it.className != CriticalLog::class.java.name }
+            ?.let { "${it.fileName}:${it.lineNumber}" } ?: "?"
+        val line = "${format.format(Date())} ${android.os.Process.myPid()} [$component] $message @$stackTop"
         Log.i(TAG, line)
         val ctx = context ?: return
         synchronized(lock) {

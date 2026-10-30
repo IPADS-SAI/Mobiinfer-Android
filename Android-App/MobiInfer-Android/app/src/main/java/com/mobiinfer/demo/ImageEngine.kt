@@ -1,9 +1,13 @@
 package com.mobiinfer.demo
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.Executors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -36,6 +40,8 @@ class ImageEngine private constructor(
     companion object {
         private val TAG = ImageEngine::class.java.simpleName
 
+        private const val INIT_TIMEOUT_MS = 30_000L
+
         @Volatile
         private var instance: ImageEngine? = null
 
@@ -45,7 +51,15 @@ class ImageEngine private constructor(
             }
     }
 
-    private val imageDispatcher = Dispatchers.IO.limitedParallelism(1)
+    // Dedicated single thread: native work must stay serialised, but it must
+    // not share Dispatchers.IO's pool. limitedParallelism(1) still queues
+    // behind every IO task scheduled before it, and nativeGenerate() is a
+    // blocking multi-second call - a queued compute is invisible from the
+    // outside, which is exactly how "generating image…" could hang forever.
+    private val imageExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "imagegen-native").apply { isDaemon = true }
+    }
+    private val imageDispatcher = imageExecutor.asCoroutineDispatcher()
     private val imageScope = CoroutineScope(imageDispatcher + SupervisorJob())
 
     private val _state = MutableStateFlow<ImageState>(ImageState.Uninitialized)
@@ -108,7 +122,14 @@ class ImageEngine private constructor(
     }
 
     private suspend fun awaitInitialized(): Boolean {
-        val ok = initialized.await()
+        // Bounded wait with an explicit reason: a build without
+        // libimagegen.so, or a dlopen that died, must not leave the caller
+        // hanging on a deferred nobody will complete.
+        val ok = withTimeoutOrNull(INIT_TIMEOUT_MS) { initialized.await() }
+            ?: run {
+                CriticalLog.log("imagegen", "native library init timed out (${INIT_TIMEOUT_MS} ms)")
+                throw IllegalStateException("Imagegen native library did not finish loading")
+            }
         if (!ok) throw IllegalStateException("Imagegen native library failed to load")
         return ok
     }
@@ -160,6 +181,7 @@ class ImageEngine private constructor(
         nThreads: Int = 0,
         backend: String = "diffusion=HTP0,te=cpu,vae=HTP0"
     ): Boolean = withContext(imageDispatcher) {
+        CriticalLog.log("imagegen", "loadModel scheduled on the native thread")
         awaitInitialized()
         check(File(diffusionModelPath).exists()) { "Diffusion model not found: $diffusionModelPath" }
         if (!llmPath.isNullOrBlank()) {
@@ -208,55 +230,6 @@ class ImageEngine private constructor(
         }
     }
 
-    /**
-     * Draws one image and returns the seed used, or null on failure (details
-     * in [lastError]). A negative [seed] asks the engine to pick a random one.
-     */
-    suspend fun generate(
-        prompt: String,
-        negativePrompt: String = "",
-        width: Int = LlamaEngine.DEFAULT_IMAGE_GEN_SIDE,
-        height: Int = LlamaEngine.DEFAULT_IMAGE_GEN_SIDE,
-        steps: Int = LlamaEngine.DEFAULT_IMAGE_GEN_STEPS,
-        cfg: Float = LlamaEngine.DEFAULT_IMAGE_GEN_CFG,
-        seed: Long = LlamaEngine.RANDOM_IMAGE_SEED,
-        outputPath: String
-    ): Long? = withContext(imageDispatcher) {
-        awaitInitialized()
-        check(isLoaded) { "Image engine not loaded" }
-        check(prompt.isNotBlank()) { "Prompt must not be empty" }
-        check(_state.value is ImageState.Ready) { "Engine not ready: ${_state.value}" }
-
-        lastError = null
-        try {
-            _state.value = ImageState.Generating
-            Log.i(TAG, "Generating image: ${width}x$height steps=$steps cfg=$cfg seed=$seed")
-
-            CriticalLog.log(
-                "imagegen",
-                "generate(${width}x$height steps=$steps cfg=$cfg seed=$seed) -> native call"
-            )
-            val usedSeed = nativeGenerate(
-                prompt, negativePrompt, width, height, steps, cfg, seed, outputPath
-            )
-            CriticalLog.log("imagegen", "native call returned seed=$usedSeed")
-            if (usedSeed < 0) {
-                val e = RuntimeException("Image generation failed: ${nativeLastError()}")
-                _state.value = ImageState.Error(e)
-                lastError = e.message
-                return@withContext null
-            }
-            _state.value = ImageState.Ready
-            Log.i(TAG, "Image generated with seed $usedSeed: $outputPath (${File(outputPath).length() / 1024} KB)")
-            return@withContext usedSeed
-        } catch (e: Exception) {
-            Log.e(TAG, "Error during image generation", e)
-            _state.value = ImageState.Error(e)
-            lastError = e.message
-            return@withContext null
-        }
-    }
-
     /** Message of the last failed [loadModel]/[generate], if any. */
     @Volatile
     var lastError: String? = null
@@ -270,6 +243,96 @@ class ImageEngine private constructor(
     var estimatedFootprintBytes: Long = 0L
         private set
 
+    /**
+     * Draws one image and returns the seed used, or null on failure (details
+     * in [lastError]). A negative [seed] asks the engine to pick a random one.
+     */
+    suspend fun generate(
+        prompt: String,
+        negativePrompt: String = "",
+        width: Int = LlamaEngine.DEFAULT_IMAGE_GEN_SIDE,
+        height: Int = LlamaEngine.DEFAULT_IMAGE_GEN_SIDE,
+        steps: Int = LlamaEngine.DEFAULT_IMAGE_GEN_STEPS,
+        cfg: Float = LlamaEngine.DEFAULT_IMAGE_GEN_CFG,
+        seed: Long = LlamaEngine.RANDOM_IMAGE_SEED,
+        outputPath: String
+    ): Long? {
+        // Logged before and after entering the dispatcher: if only the first
+        // line appears, the coroutine never reached the native thread, which
+        // is a queue problem; if both appear and nothing follows, the
+        // blocking native call itself is stuck.
+        CriticalLog.log("imagegen", "generate() entered, waiting for the native thread")
+        val queuedAt = SystemClock.elapsedRealtime()
+        val result = withContext(imageDispatcher) {
+            CriticalLog.log(
+                "imagegen",
+                "generate() running on the native thread after ${SystemClock.elapsedRealtime() - queuedAt} ms"
+            )
+            generateOnNativeThread(prompt, negativePrompt, width, height, steps, cfg, seed, outputPath)
+        }
+        CriticalLog.log("imagegen", "generate() returned ${result ?: "null"}")
+        return result
+    }
+
+    /**
+     * The actual draw, executed on the native thread. Everything critical is
+     * logged from a finally block: any failure (check, exception, return)
+     * leaves exactly one line that says how it ended.
+     */
+    private fun generateOnNativeThread(
+        prompt: String,
+        negativePrompt: String,
+        width: Int,
+        height: Int,
+        steps: Int,
+        cfg: Float,
+        seed: Long,
+        outputPath: String
+    ): Long? {
+        var outcome = "not started"
+        try {
+            if (!initialized.isCompleted) {
+                outcome = "native library not initialised"
+                throw IllegalStateException("Imagegen native library is not ready")
+            }
+            if (!initialized.getCompleted()) {
+                outcome = "native library load failed"
+                throw IllegalStateException("Imagegen native library failed to load")
+            }
+            check(isLoaded) { "Image engine not loaded" }
+            check(prompt.isNotBlank()) { "Prompt must not be empty" }
+            check(_state.value is ImageState.Ready) { "Engine not ready: ${_state.value}" }
+            lastError = null
+            _state.value = ImageState.Generating
+
+            CriticalLog.log(
+                "imagegen",
+                "generate(${width}x$height steps=$steps cfg=$cfg seed=$seed) -> native call"
+            )
+            val usedSeed = nativeGenerate(
+                prompt, negativePrompt, width, height, steps, cfg, seed, outputPath
+            )
+            if (usedSeed < 0) {
+                outcome = "native failure: ${nativeLastError()}"
+                _state.value = ImageState.Error(RuntimeException(outcome))
+                lastError = outcome
+                return null
+            }
+            outcome = "ok seed=$usedSeed"
+            _state.value = ImageState.Ready
+            Log.i(TAG, "Image generated with seed $usedSeed: $outputPath (${File(outputPath).length() / 1024} KB)")
+            return usedSeed
+        } catch (e: Exception) {
+            outcome = "error: ${e.javaClass.simpleName}: ${e.message}"
+            _state.value = ImageState.Error(e)
+            lastError = e.message
+            Log.e(TAG, "Error during image generation", e)
+            return null
+        } finally {
+            CriticalLog.log("imagegen", "generate finished -> $outcome")
+        }
+    }
+
     fun destroy() {
         imageScope.launch {
             freeNative()
@@ -277,5 +340,10 @@ class ImageEngine private constructor(
         }.invokeOnCompletion {
             imageScope.cancel()
         }
+    }
+
+    /** Releases the dedicated native thread; call when the engine is replaced. */
+    fun shutdownThread() {
+        runCatching { imageExecutor.shutdown() }
     }
 }
