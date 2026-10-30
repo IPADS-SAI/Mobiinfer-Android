@@ -321,6 +321,13 @@ class MainActivity : AppCompatActivity() {
             job.cancel()
         }
         generationJob = null
+        // An image request belongs to the conversation that started it (or is
+        // superseded by a newer one); never let it render into another chat.
+        if (imageJob?.isActive == true) {
+            imageJob?.cancel()
+            imageGenerationToken++
+        }
+        imageJob = null
     }
 
     private fun openConversation(id: String, restoreContext: Boolean) {
