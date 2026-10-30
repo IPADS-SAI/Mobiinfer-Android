@@ -183,6 +183,7 @@ class ImageEngine private constructor(
         try {
             _state.value = ImageState.LoadingModel
             Log.i(TAG, "Initializing imagegen: dit=$diffusionModelPath te=${llmPath ?: "-"} vae=${vaePath ?: "-"} backend=$backend")
+            CriticalLog.log("imagegen", "new_sd_ctx start (footprint ${estimatedFootprintBytes / (1024 * 1024)} MB)")
             val ok = nativeInit(
                 diffusionModelPath, llmPath ?: "", vaePath ?: "",
                 tokenizerPath ?: "", nThreads, backend
@@ -195,6 +196,7 @@ class ImageEngine private constructor(
             }
             isLoaded = true
             modelVersion = runCatching { nativeModelVersion() }.getOrDefault("Unknown")
+            CriticalLog.log("imagegen", "new_sd_ctx done: $modelVersion")
             _state.value = ImageState.Ready
             Log.i(TAG, "Imagegen ready ($modelVersion)")
             return@withContext true
@@ -230,9 +232,14 @@ class ImageEngine private constructor(
             _state.value = ImageState.Generating
             Log.i(TAG, "Generating image: ${width}x$height steps=$steps cfg=$cfg seed=$seed")
 
+            CriticalLog.log(
+                "imagegen",
+                "generate(${width}x$height steps=$steps cfg=$cfg seed=$seed) -> native call"
+            )
             val usedSeed = nativeGenerate(
                 prompt, negativePrompt, width, height, steps, cfg, seed, outputPath
             )
+            CriticalLog.log("imagegen", "native call returned seed=$usedSeed")
             if (usedSeed < 0) {
                 val e = RuntimeException("Image generation failed: ${nativeLastError()}")
                 _state.value = ImageState.Error(e)

@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
@@ -1606,6 +1607,9 @@ class LlamaEngine private constructor(
     // OpenAI-compatible tool schema array for the next system prompt; pass
     // "[]" (or null) to clear. Only tool-aware templates render it.
     private external fun setToolSchemasNative(toolSchemasJson: String?)
+    // Appends a finished text-to-image turn (assistant tool call + tool
+    // result) to the template history used by tool-aware prompts.
+    private external fun recordImageToolTurnNative(prompt: String, fileName: String)
     // Process the system prompt without dropping an existing short-term
     // state. Unlike the single-shot variant used at load time, this can be
     // called mid-conversation so a new system prompt never wipes history.
@@ -1791,6 +1795,12 @@ class LlamaEngine private constructor(
     suspend fun setToolSchemas(schemasJson: String?) = withContext(llamaDispatcher) {
         runCatching { setToolSchemasNative(schemasJson) }
             .onFailure { Log.w(TAG, "setToolSchemas failed", it) }
+    }
+
+    /** Records a generated picture as a generate_image tool turn. */
+    suspend fun recordImageToolTurn(prompt: String, fileName: String) = withContext(llamaDispatcher) {
+        runCatching { recordImageToolTurnNative(prompt, fileName) }
+            .onFailure { Log.w(TAG, "recordImageToolTurn failed", it) }
     }
 
     /** The model's chat template source, or null when it has none. */
@@ -2092,10 +2102,24 @@ class LlamaEngine private constructor(
     val isModelLoaded: Boolean
         get() = _state.value is LlamaState.ModelReady
 
-    suspend fun unloadModel() = withContext(llamaDispatcher) {
+    /**
+     * Frees the model. Runs on a dispatcher that is NOT tied to the caller's
+     * job on purpose: it is routinely called from inside a generation coroutine
+     * that is being cancelled (generate_image frees the chat model before the
+     * image stack loads), and withContext(llamaDispatcher) would abort with
+     * that job's CancellationException before the unload even starts.
+     */
+    suspend fun unloadModel() {
+        // withContext(NonCancellable) keeps the unload running when the caller
+        // happens to be a coroutine that is being cancelled; the explicit
+        // dispatcher keeps it serialised with every other native call.
+        withContext(NonCancellable + llamaDispatcher) { unloadModelInner() }
+    }
+
+    private suspend fun unloadModelInner() {
         if (_nativeCallTimedOut) {
             Log.w(TAG, "Skipping unload after native timeout; restart the app")
-            return@withContext
+            return
         }
         if (_state.value is LlamaState.ModelReady || _state.value is LlamaState.Error) {
             Log.i(TAG, "Unloading model...")

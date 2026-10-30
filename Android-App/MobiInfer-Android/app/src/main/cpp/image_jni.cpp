@@ -17,12 +17,32 @@
 #include <jni.h>
 #include <android/log.h>
 
+#include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 
 #include "imagegen.h"
 
 #define TAG "image_jni"
+
+// Persistent trail: the DSP driver floods logcat while sd runs, so the
+// interesting lines are appended to filesDir/pipeline.log (see
+// com.mobiinfer.demo.CriticalLog) and are readable after a process death.
+static void crit(const char *fmt, ...) {
+    char msg[1024] = {0};
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "%s", msg);
+    const char *path = "/data/user/0/com.mobiinfer.demo/files/pipeline.log";
+    FILE *f = fopen(path, "a");
+    if (f) {
+        fprintf(f, "[image_jni] %s\n", msg);
+        fclose(f);
+    }
+}
 #define LOG_I(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOG_E(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
@@ -117,18 +137,23 @@ Java_com_mobiinfer_demo_ImageEngine_nativeGenerate(
         return -1;
     }
 
+    // Whatever the model wrote ends up here: keep it bounded and one line so
+    // the log stays readable (the scene description can be long).
+    const std::string brief = p.size() > 120 ? p.substr(0, 120) + "..." : p;
+
     imagegen_gen_params gp{};
     gp.prompt          = p.c_str();
     gp.negative_prompt = n.empty() ? nullptr : n.c_str();
     gp.width           = width;
     gp.height          = height;
     gp.steps           = steps;
-    gp.cfg_scale       = cfg;
+    gp.cfg_scale       = cfg;  // <0 -> model default
     gp.seed            = seed;  // <0 -> imagegen picks and reports one
     gp.vae_tiling      = true;  // bound peak memory on mobile
 
-    LOG_I("imagegen generate: %dx%d steps=%d cfg=%.1f seed=%lld -> %s",
-          width, height, steps, cfg, (long long) seed, out.c_str());
+    crit("generate start %dx%d steps=%d cfg=%.1f seed=%lld prompt=\"%.60s\"", width, height, steps, cfg, (long long) seed, brief.c_str());
+    LOG_I("imagegen generate: %dx%d steps=%d cfg=%.1f seed=%lld prompt=\"%s\" -> %s",
+          width, height, steps, cfg, (long long) seed, brief.c_str(), out.c_str());
 
     const char * err = nullptr;
     int64_t used_seed = -1;
@@ -138,6 +163,7 @@ Java_com_mobiinfer_demo_ImageEngine_nativeGenerate(
         LOG_E("imagegen_generate failed: %s", g_last_error.c_str());
         return -1;
     }
+    crit("generate done seed=%lld", (long long) used_seed);
     LOG_I("imagegen generate done: seed=%lld", (long long) used_seed);
     return static_cast<jlong>(used_seed);
 }

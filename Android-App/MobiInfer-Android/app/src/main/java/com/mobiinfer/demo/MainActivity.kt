@@ -924,6 +924,12 @@ class MainActivity : AppCompatActivity() {
             unloadChatModelForImage()
         }
 
+        CriticalLog.log(
+            "image",
+            "loading ${imageModel.id}: native heap ${nativeHeapMb()} MB, " +
+                "free ${MemoryBudget.availableBytes(ctx) / (1024 * 1024)} MB"
+        )
+        val loadStart = SystemClock.elapsedRealtime()
         val ok = withContext(Dispatchers.IO) {
             engine.loadModel(
                 diffusionModelPath = LlamaEngine.modelPath(ctx, imageModel),
@@ -934,6 +940,11 @@ class MainActivity : AppCompatActivity() {
                 backend = "diffusion=HTP0,te=cpu,vae=HTP0"
             )
         }
+        CriticalLog.log(
+            "image",
+            "load ${if (ok) "OK" else "FAILED"} in ${SystemClock.elapsedRealtime() - loadStart} ms, " +
+                "native heap ${nativeHeapMb()} MB" + (engine.lastError?.let { ", error=$it" } ?: "")
+        )
         if (ok) {
             isImageModelLoaded = true
             loadedImageModelId = imageModel.id
@@ -1046,15 +1057,31 @@ class MainActivity : AppCompatActivity() {
         File(LlamaEngine.modelDirFor(applicationContext, model), fileName).length()
 
     private suspend fun unloadChatModelForImage() {
+        val before = nativeHeapMb()
+        Log.i(TAG, "Unloading the chat model for the image stack (native heap ${before} MB)")
+        CriticalLog.log("image", "unload chat model: native heap before = ${before} MB")
         try {
             engine.cancelGeneration()
             engine.unloadModel()
         } catch (e: Exception) {
             Log.w(TAG, "Failed to unload the chat model for the image stack", e)
+            CriticalLog.log("image", "unload FAILED: ${e.javaClass.simpleName}: ${e.message}")
         }
         isModelReady = false
         loadedModelId = null
+        // Give the allocator a chance to hand the freed pages back before a
+        // multi-GB image stack asks for them; the Kotlin heap is small but its
+        // native counterparts (mmap, ggml buffers) are what matters.
+        runCatching {
+            System.gc()
+            Runtime.getRuntime().gc()
+        }
+        val after = nativeHeapMb()
+        Log.i(TAG, "Chat model unloaded: native heap ${before} -> ${after} MB")
+        CriticalLog.log("image", "unload chat model: native heap after = ${after} MB")
     }
+
+    private fun nativeHeapMb(): Long = android.os.Debug.getNativeHeapAllocatedSize() / (1024 * 1024)
 
     /** Home-screen image mode entry point (the switch is on). */
     private fun beginImageGeneration(prompt: String) {
@@ -1106,6 +1133,7 @@ class MainActivity : AppCompatActivity() {
                 if (token != imageGenerationToken) return@launch
 
                 updateAiStatus(resultId, getString(R.string.image_generating))
+                CriticalLog.log("image", "generate start: native heap ${nativeHeapMb()} MB")
                 val usedSeed = withContext(Dispatchers.IO) {
                     imageEngine.generate(
                         prompt = request.prompt,
@@ -1118,6 +1146,7 @@ class MainActivity : AppCompatActivity() {
                         outputPath = outFile.absolutePath
                     )
                 }
+                CriticalLog.log("image", "generate end: seed=$usedSeed, native heap ${nativeHeapMb()} MB")
                 if (token != imageGenerationToken) return@launch
                 if (usedSeed == null) {
                     failImageResult(resultId, imageEngine.lastError ?: getString(R.string.image_generate_failed))
@@ -1185,6 +1214,17 @@ class MainActivity : AppCompatActivity() {
         persistCurrentConversation()
         refreshConversationList()
         pruneUnusedImages()
+        // Tell the native side, so the next prompt sees this turn as a real
+        // generate_image call + tool result (see tool_history_append_image_turn).
+        // Only while a language model is resident: the history it renders is
+        // discarded when that model is unloaded.
+        if (isModelReady) {
+            lifecycleScope.launch(Dispatchers.IO) {
+                runCatching {
+                    engine.recordImageToolTurn(request.prompt, File(pngPath).name)
+                }.onFailure { Log.w(TAG, "recordImageToolTurn failed", it) }
+            }
+        }
     }
 
     /**
@@ -1246,7 +1286,10 @@ class MainActivity : AppCompatActivity() {
         // chat model may be unloaded).
         cancelActiveGeneration()
         val imageEngine = try {
-            prepareImageEngine(imageModel, aiMsgId)
+            // Preparation runs detached: it unloads the chat model (which may
+            // take a while) and must finish even though the stream that
+            // produced this call is being cancelled right above.
+            withContext(NonCancellable) { prepareImageEngine(imageModel, aiMsgId) }
         } catch (e: Exception) {
             Log.e(TAG, "Image tool: preparation failed", e)
             null
@@ -1260,6 +1303,8 @@ class MainActivity : AppCompatActivity() {
         if (!messages.any { it.id == aiMsgId }) return false
 
         updateAiStatus(aiMsgId, getString(R.string.tool_generating_image, prompt))
+        Log.i(TAG, "Image tool: drawing ${request.width}x${request.height} steps=${request.steps} cfg=${request.cfg}")
+        CriticalLog.log("image", "tool generate start: native heap ${nativeHeapMb()} MB")
         val usedSeed = withContext(Dispatchers.IO) {
             imageEngine.generate(
                 prompt = request.prompt,
@@ -1272,6 +1317,7 @@ class MainActivity : AppCompatActivity() {
                 outputPath = outFile.absolutePath
             )
         }
+        CriticalLog.log("image", "tool generate end: seed=$usedSeed, native heap ${nativeHeapMb()} MB")
         if (usedSeed == null) {
             failImageResult(resultId, imageEngine.lastError ?: getString(R.string.image_generate_failed))
             return false
@@ -2159,8 +2205,11 @@ class MainActivity : AppCompatActivity() {
                         withContext(Dispatchers.Main) {
                             val index = messages.indexOfFirst { it.id == aiMsgId }
                             if (index >= 0) {
+                                // Keep whatever the collector last rendered
+                                // (protocol already stripped); a cancelled or
+                                // failed stream must not paint the raw bytes.
                                 messages[index] = (messages[index] as ChatMessage.AiMessage).copy(
-                                    text = fullResponse.toString(),
+                                    text = ImageTool.strip(fullResponse.toString()),
                                     isGenerating = false,
                                     metrics = metrics
                                 )
@@ -2196,17 +2245,20 @@ class MainActivity : AppCompatActivity() {
                 }
                 .collect { token ->
                     fullResponse.append(token)
+                    // The raw stream may already contain a tool call: keep the
+                    // protocol out of the bubble from the first token on (a
+                    // partial call is stripped too), so it never flashes.
+                    val visible = ImageTool.strip(fullResponse.toString())
                     withContext(Dispatchers.Main) {
-                        val currentText = fullResponse.toString()
                         val index = messages.indexOfFirst { it.id == aiMsgId }
                         if (index >= 0) {
                             messages[index] = ChatMessage.AiMessage(
                                 id = aiMsgId,
-                                text = currentText,
+                                text = visible,
                                 isGenerating = true
                             )
                         }
-                        chatAdapter.updateStreamingText(aiMsgId, currentText)
+                        chatAdapter.updateStreamingText(aiMsgId, visible)
                         followStreamingIfAtBottom()
                     }
                     persistDuringStreaming()

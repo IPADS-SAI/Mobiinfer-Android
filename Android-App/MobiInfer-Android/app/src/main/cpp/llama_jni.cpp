@@ -4,6 +4,7 @@
 #include <iomanip>
 #include <cmath>
 #include <cctype>
+#include <optional>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -205,6 +206,14 @@ static common_chat_templates_ptr          g_chat_templates;
 // prompt without tools does not inherit them.
 static std::string                        g_tool_schemas_pending_json;
 static std::string                        g_tool_schemas_json;
+// History replayed after a tool-aware system prompt (model (re)load or a
+// conversation switch). Tool-aware templates are applied to the whole
+// conversation at once, so a generate_image turn can be rendered as a real
+// assistant tool_calls message followed by a tool result - the template has
+// seen that shape during training, while a simulated "<tool_call>" text is
+// something it can only imitate.
+static std::vector<common_chat_msg>       g_tool_history;
+static std::string                        g_system_prompt_text;
 static common_sampler                   * g_sampler;
 static mtmd_context                     * g_ctx_vision;
 // MiniCPM-V family version of the loaded mmproj. 0 = not minicpmv / no mmproj.
@@ -730,17 +739,47 @@ static std::string chat_add_and_format(const std::string &role, const std::strin
         }
     }
     if (role == ROLE_SYSTEM) {
-        // The apply path returns the prompt plus parser metadata; only the
-        // text is decoded here (the tool call is parsed from the output).
+        // Tool-aware turn: render the system message together with the whole
+        // replayed history in one apply() call. Per-message formatting cannot
+        // express tool_calls / tool results, so it is only used without tools.
+        if (!inputs.tools.empty()) {
+            std::vector<common_chat_msg> messages;
+            messages.push_back(new_msg);
+            messages.insert(messages.end(), g_tool_history.begin(), g_tool_history.end());
+            inputs.messages = std::move(messages);
+            inputs.add_generation_prompt = false;
+        }
         const auto applied = common_chat_templates_apply(g_chat_templates.get(), inputs);
         formatted = applied.prompt;
-        LOGi("%s: system turn rendered with %zu tool(s); prompt starts with: %.160s",
-             __func__, inputs.tools.size(), formatted.c_str());
+        LOGi("%s: system turn rendered with %zu tool(s), %zu history message(s); starts with: %.400s",
+             __func__, inputs.tools.size(), inputs.messages.size(), formatted.c_str());
         if (!inputs.tools.empty() && formatted.find("\"generate_image\"") == std::string::npos) {
             LOGe("%s: tool schema was passed but the system block has no generate_image "
                  "definition - this model's template does not render tools; the text "
                  "instructions are the only guidance", __func__);
         }
+    } else if (role == ROLE_USER && !g_tool_schemas_json.empty()) {
+        // Live turn under a tool-aware prompt: the same renderer as above,
+        // otherwise the model would see tool_calls history on reload but a
+        // hand-written "<tool_call>" text during the session.
+        std::vector<common_chat_msg> messages;
+        common_chat_msg system;
+        system.role = ROLE_SYSTEM;
+        system.content = g_system_prompt_text;
+        messages.push_back(std::move(system));
+        messages.insert(messages.end(), g_tool_history.begin(), g_tool_history.end());
+        messages.push_back(new_msg);
+        inputs.messages = std::move(messages);
+        inputs.add_generation_prompt = true;
+        try {
+            const auto parsed_tools = nlohmann::ordered_json::parse(g_tool_schemas_json);
+            inputs.tools = common_chat_tools_parse_oaicompat(parsed_tools);
+        } catch (const std::exception & e) {
+            LOGe("%s: bad tool schema JSON: %s", __func__, e.what());
+        }
+        formatted = common_chat_templates_apply(g_chat_templates.get(), inputs).prompt;
+        LOGi("%s: user turn rendered with %zu tool(s) and %zu history message(s)",
+             __func__, inputs.tools.size(), inputs.messages.size());
     } else {
         formatted = common_chat_format_single(
                 g_chat_templates.get(), chat_msgs, new_msg, role == ROLE_USER, true);
@@ -819,22 +858,17 @@ static int apply_system_prompt(JNIEnv *env, jstring jsystem_prompt, bool keep_st
         // the prompt from the message list, and a stale (or empty) list would
         // drop the system prompt entirely.
         chat_msgs.clear();
-        std::string text = system_prompt;
-        if (!g_tool_schemas_json.empty()) {
-            // Tool-aware template: if it renders `tools`, the tool schema is
-            // part of the system block and the text that only described the
-            // calling convention is redundant. The trigger itself stays: it
-            // is a tool, not a template feature.
-            const char *marker = "## Tool:";
-            const size_t at = text.find(marker);
-            if (at != std::string::npos) {
-                text.resize(at);
-                while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
-                    text.pop_back();
-                }
-            }
-        }
+        // The text carries the instructions for both paths:
+        //  - plain template: it is the system message;
+        //  - tool-aware template: it is rendered as message content, and the
+        //    machine-readable schema is added by the template on top.
+        // Trimming it for tool-aware models left them with the protocol but
+        // without the "call the tool for pictures" instruction (and duplicated
+        // it when the text was prepended again), which is exactly why a model
+        // answered with a picture description instead of calling anything.
+        const std::string text = system_prompt;
         g_tool_schemas_json.swap(g_tool_schemas_pending_json);
+        g_system_prompt_text = text;
         formatted_system_prompt = chat_add_and_format(ROLE_SYSTEM, text);
     }
     env->ReleaseStringUTFChars(jsystem_prompt, system_prompt);
@@ -888,6 +922,70 @@ static int apply_system_prompt(JNIEnv *env, jstring jsystem_prompt, bool keep_st
     }
 
     system_prompt_position = current_position;
+
+    // Tool-aware prompts render the generation header as part of the prompt
+    // text; decode it now, so the model continues an assistant turn instead
+    // of continuing "\n". Without tools the per-message path has already
+    // appended the assistant prefix.
+    if (!g_tool_schemas_json.empty()) {
+        common_chat_templates_inputs inputs;
+        inputs.use_jinja = true;
+        inputs.enable_thinking = g_enable_thinking;
+        inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+        inputs.add_generation_prompt = true;
+        common_chat_msg system;
+        system.role = ROLE_SYSTEM;
+        system.content = g_system_prompt_text;
+        inputs.messages.push_back(std::move(system));
+        try {
+            inputs.tools = common_chat_tools_parse_oaicompat(
+                nlohmann::ordered_json::parse(g_tool_schemas_json));
+        } catch (const std::exception & e) {
+            LOGe("%s: bad tool schema JSON: %s", __func__, e.what());
+        }
+        if (!inputs.tools.empty()) {
+            const auto applied = common_chat_templates_apply(g_chat_templates.get(), inputs);
+            if (applied.prompt.find(formatted_system_prompt) == 0) {
+                const std::string tail = applied.prompt.substr(formatted_system_prompt.size());
+                if (!tail.empty()) {
+                    if (g_ctx_vision) {
+                        mtmd_input_text gen_text;
+                        gen_text.text          = tail.c_str();
+                        gen_text.add_special   = false;
+                        gen_text.parse_special = true;
+                        mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+                        if (mtmd_tokenize(g_ctx_vision, chunks, &gen_text, nullptr, 0) != 0) {
+                            mtmd_input_chunks_free(chunks);
+                            LOGe("%s: mtmd_tokenize failed for the generation prompt", __func__);
+                            return 2;
+                        }
+                        llama_pos new_n_past;
+                        if (mtmd_helper_eval_chunks(g_ctx_vision, g_context, chunks,
+                                                    current_position, 0, g_batch_size,
+                                                    false, &new_n_past)) {
+                            mtmd_input_chunks_free(chunks);
+                            LOGe("%s: failed to decode the generation prompt", __func__);
+                            return 2;
+                        }
+                        current_position = new_n_past;
+                        mtmd_input_chunks_free(chunks);
+                    } else {
+                        const auto tokens = common_tokenize(g_context, tail, false, true);
+                        if (decode_tokens_in_batches(g_context, g_batch, tokens, current_position, false)) {
+                            LOGe("%s: failed to decode the generation prompt", __func__);
+                            return 2;
+                        }
+                        current_position += (int) tokens.size();
+                    }
+                    LOGi("%s: generation prompt decoded at position %d: %.80s",
+                         __func__, current_position, tail.c_str());
+                }
+            } else {
+                LOGw("%s: tool-aware apply() differs from the formatted system turn; "
+                     "keeping the per-message variant", __func__);
+            }
+        }
+    }
     return 0;
 }
 
@@ -1062,6 +1160,7 @@ Java_com_mobiinfer_demo_LlamaEngine_fullReset(JNIEnv *env, jobject) {
     g_chat_templates.reset();
     g_tool_schemas_json.clear();
     g_tool_schemas_pending_json.clear();
+    g_tool_history.clear();
     llama_batch_free(g_batch);
     g_batch = {};
     llama_free(g_context);
@@ -1311,6 +1410,133 @@ static int generic_restore_eval_text(const std::string & formatted) {
     return 0;
 }
 
+// Appends a finished image turn to the template history (assistant tool call
+// plus tool result), so the next tool-aware prompt sees the canonical shape.
+static void tool_history_append_image_turn(const std::string & prompt, const std::string & file_name) {
+    common_chat_tool_call call;
+    call.id        = "call_live_" + std::to_string(g_tool_history.size());
+    call.name      = "generate_image";
+    call.arguments = nlohmann::ordered_json{{"prompt", prompt}}.dump();
+
+    common_chat_msg assistant;
+    assistant.role = ROLE_ASSISTANT;
+    assistant.tool_calls.push_back(call);
+    g_tool_history.push_back(assistant);
+
+    common_chat_msg result;
+    result.role         = "tool";
+    result.tool_call_id = call.id;
+    result.tool_name    = call.name;
+    result.content      = "The image \"" + file_name + "\" was generated and shown to the user.";
+    g_tool_history.push_back(result);
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_mobiinfer_demo_LlamaEngine_recordImageToolTurnNative(
+        JNIEnv *env,
+        jobject /*unused*/,
+        jstring jprompt,
+        jstring jfile_name
+) {
+    if (g_moe_runtime || !g_chat_templates) {
+        return;
+    }
+    const char *prompt = env->GetStringUTFChars(jprompt, nullptr);
+    const char *file   = env->GetStringUTFChars(jfile_name, nullptr);
+    const std::string prompt_text(prompt ? prompt : "");
+    const std::string file_text(file ? file : "");
+    env->ReleaseStringUTFChars(jprompt, prompt);
+    env->ReleaseStringUTFChars(jfile_name, file);
+
+    tool_history_append_image_turn(prompt_text, file_text);
+    LOGi("%s: recorded image turn, history now %zu messages", __func__, g_tool_history.size());
+}
+
+// ---- template history for tool-aware formatting -------------------------
+//
+// A tool-aware template renders the whole conversation at once, so the system
+// prompt prepends history. This mirrors generic_restore()'s loop into
+// g_tool_history, using the assistant's tool_calls message and the tool
+// result message the template renders as the canonical shape.
+// The assistant text the app stores for a finished image turn is produced by
+// ImagePromptMarker/image ack: "[image generated: <prompt>] (<file name>)".
+struct ImageAck {
+    std::string prompt;
+    std::string result;  // what a tool result message says
+};
+
+static std::optional<ImageAck> parse_image_acknowledgement(const std::string & text) {
+    static const std::string prefix = "[image generated: ";
+    const size_t at = text.rfind(prefix);
+    if (at == std::string::npos) {
+        return std::nullopt;
+    }
+    const size_t end = text.find(']', at + prefix.size());
+    if (end == std::string::npos) {
+        return std::nullopt;
+    }
+    ImageAck ack;
+    ack.prompt = text.substr(at + prefix.size(), end - at - prefix.size());
+    ack.result = "The image was generated and shown to the user.";
+    return ack;
+}
+
+static bool tool_history_begin(const std::vector<RestoreTurn> & turns) {
+    g_tool_history.clear();
+    int seq = 0;
+    for (const auto & turn : turns) {
+        if (turn.role == ROLE_SYSTEM) {
+            continue;  // the system prompt is prepended separately
+        }
+        common_chat_msg msg;
+        msg.role = turn.role;
+        const auto parsed = turn.role == ROLE_ASSISTANT
+            ? parse_image_acknowledgement(turn.text)
+            : std::nullopt;
+        if (turn.role == ROLE_ASSISTANT && parsed) {
+            common_chat_tool_call call;
+            ++seq;
+            call.id        = "call_img" + std::to_string(seq);
+            call.name      = "generate_image";
+            call.arguments = nlohmann::ordered_json{{"prompt", parsed->prompt}}.dump();
+            msg.tool_calls.push_back(call);
+            g_tool_history.push_back(msg);
+
+            common_chat_msg result;
+            result.role         = "tool";
+            result.tool_call_id = call.id;
+            result.tool_name    = call.name;
+            result.content      = parsed->result;
+            g_tool_history.push_back(result);
+            continue;
+        }
+        std::string content = turn.text;
+        if (turn.role == ROLE_ASSISTANT) {
+            // Split  thinking...</think> the same way the live path does, so the
+            // template can place reasoning_content where it expects it.
+            const size_t open = content.find("<think" ">");
+            const size_t close = content.find("</think" ">");
+            if (open != std::string::npos && close != std::string::npos && close > open) {
+                msg.reasoning_content = content.substr(open + 7, close - open - 7);
+                content = content.substr(close + 8);
+            }
+        }
+        if (turn.role == ROLE_USER) {
+            if (!turn.images.empty()) {
+                // The template handles text only; drop the picture but say it
+                // was part of the turn instead of replaying a question that
+                // looks self-contained.
+                content = "(a picture was attached) " + content;
+            }
+        }
+        msg.content = std::move(content);
+        g_tool_history.push_back(msg);
+    }
+    LOGi("%s: %zu template message(s) for the tool-aware prompt", __func__, g_tool_history.size());
+    return true;
+}
+
 static int generic_restore(const std::vector<RestoreTurn> & turns) {
     if (!g_context) {
         LOGe("%s: context not initialised", __func__);
@@ -1446,6 +1672,10 @@ Java_com_mobiinfer_demo_LlamaEngine_restoreHistory(
         turns.push_back(std::move(turn));
     }
     if (counts) env->ReleaseIntArrayElements(jimage_counts, counts, JNI_ABORT);
+
+    // Record the turns in template shape first: the next system prompt
+    // prepends them when the model's template renders tools.
+    tool_history_begin(turns);
 
     if (g_moe_runtime) {
         try {
@@ -1610,6 +1840,7 @@ Java_com_mobiinfer_demo_LlamaEngine_unload(JNIEnv * /*env*/, jobject /*unused*/)
     g_chat_templates.reset();
     g_tool_schemas_json.clear();
     g_tool_schemas_pending_json.clear();
+    g_tool_history.clear();
     llama_batch_free(g_batch);
     g_batch = {};
     llama_free(g_context);
