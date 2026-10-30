@@ -3,6 +3,7 @@
 #include <dlfcn.h>
 #include <iomanip>
 #include <cmath>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -12,6 +13,7 @@
 
 #include "logging.h"
 #include "chat.h"
+#include "nlohmann/json.hpp"
 #include "common.h"
 #include "log.h"
 #include "llama.h"
@@ -197,6 +199,12 @@ static std::string                        g_experts_path;
 static int                                g_batch_size = BATCH_SIZE;
 static llama_batch                        g_batch;
 static common_chat_templates_ptr          g_chat_templates;
+// Tool schemas (OpenAI-compatible JSON array) that the next system prompt
+// should expose to a tool-aware chat template. Filled from Kotlin before the
+// system prompt is processed; "pending" is consumed by that call so a later
+// prompt without tools does not inherit them.
+static std::string                        g_tool_schemas_pending_json;
+static std::string                        g_tool_schemas_json;
 static common_sampler                   * g_sampler;
 static mtmd_context                     * g_ctx_vision;
 // MiniCPM-V family version of the loaded mmproj. 0 = not minicpmv / no mmproj.
@@ -669,7 +677,17 @@ static const char * assistant_turn_prefix() {
 }
 
 static void shift_context() {
-    const int n_discard = (current_position - system_prompt_position) / 2;
+    int n_discard = (current_position - system_prompt_position) / 2;
+    // The system block (which carries the tools when a template renders them)
+    // must survive as long as possible: only drop conversation history.
+    if (n_discard < 1 && current_position > system_prompt_position + 1) {
+        n_discard = 1;
+    }
+    if (n_discard < 1) {
+        LOGw("%s: nothing left to discard (position=%d, system ends at %d)",
+             __func__, current_position, system_prompt_position);
+        return;
+    }
     LOGi("%s: Discarding %d tokens", __func__, n_discard);
     llama_memory_seq_rm(llama_get_memory(g_context), 0, system_prompt_position, system_prompt_position + n_discard);
     llama_memory_seq_add(llama_get_memory(g_context), 0, system_prompt_position + n_discard, current_position, -n_discard);
@@ -677,12 +695,56 @@ static void shift_context() {
     LOGi("%s: Context shifting done! Current position: %d", __func__, current_position);
 }
 
-static std::string chat_add_and_format(const std::string &role, const std::string &content) {
+static std::string chat_add_and_format(const std::string &role, const std::string &content,
+                                       bool exclude_from_template = false) {
     common_chat_msg new_msg;
     new_msg.role = role;
     new_msg.content = content;
-    auto formatted = common_chat_format_single(
-            g_chat_templates.get(), chat_msgs, new_msg, role == ROLE_USER, true);
+
+    // Tool schemas are rendered only by common_chat_templates_apply(), so a
+    // tool-aware system turn is formatted through the full apply path. The
+    // formatter derives the whole prompt from the message list, so the new
+    // message must be part of it.
+    common_chat_templates_inputs inputs;
+    inputs.add_generation_prompt = role == ROLE_USER;
+    inputs.use_jinja = true;
+    // Same toggle as assistant_turn_prefix()/the thinking suffix: the
+    // template must agree with the assistant prefix we decode against.
+    inputs.enable_thinking = g_enable_thinking;
+    inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
+    for (const auto & msg : chat_msgs) {
+        inputs.messages.push_back(msg);
+    }
+    if (!exclude_from_template) {
+        inputs.messages.push_back(new_msg);
+    }
+
+    std::string formatted;
+    const bool tools = role == ROLE_SYSTEM && !g_tool_schemas_pending_json.empty();
+    if (tools) {
+        try {
+            const auto parsed = nlohmann::ordered_json::parse(g_tool_schemas_pending_json);
+            inputs.tools = common_chat_tools_parse_oaicompat(parsed);
+        } catch (const std::exception & e) {
+            LOGe("%s: bad tool schema JSON: %s", __func__, e.what());
+        }
+    }
+    if (role == ROLE_SYSTEM) {
+        // The apply path returns the prompt plus parser metadata; only the
+        // text is decoded here (the tool call is parsed from the output).
+        const auto applied = common_chat_templates_apply(g_chat_templates.get(), inputs);
+        formatted = applied.prompt;
+        LOGi("%s: system turn rendered with %zu tool(s); prompt starts with: %.160s",
+             __func__, inputs.tools.size(), formatted.c_str());
+        if (!inputs.tools.empty() && formatted.find("\"generate_image\"") == std::string::npos) {
+            LOGe("%s: tool schema was passed but the system block has no generate_image "
+                 "definition - this model's template does not render tools; the text "
+                 "instructions are the only guidance", __func__);
+        }
+    } else {
+        formatted = common_chat_format_single(
+                g_chat_templates.get(), chat_msgs, new_msg, role == ROLE_USER, true);
+    }
     chat_msgs.push_back(new_msg);
     LOGi("%s: Formatted and added %s message: \n%s\n", __func__, role.c_str(), formatted.c_str());
     return formatted;
@@ -753,7 +815,27 @@ static int apply_system_prompt(JNIEnv *env, jstring jsystem_prompt, bool keep_st
 
     const bool has_chat_template = common_chat_templates_was_explicit(g_chat_templates.get());
     if (has_chat_template) {
-        formatted_system_prompt = chat_add_and_format(ROLE_SYSTEM, system_prompt);
+        // chat_msgs must hold exactly this system turn: the formatter derives
+        // the prompt from the message list, and a stale (or empty) list would
+        // drop the system prompt entirely.
+        chat_msgs.clear();
+        std::string text = system_prompt;
+        if (!g_tool_schemas_json.empty()) {
+            // Tool-aware template: if it renders `tools`, the tool schema is
+            // part of the system block and the text that only described the
+            // calling convention is redundant. The trigger itself stays: it
+            // is a tool, not a template feature.
+            const char *marker = "## Tool:";
+            const size_t at = text.find(marker);
+            if (at != std::string::npos) {
+                text.resize(at);
+                while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
+                    text.pop_back();
+                }
+            }
+        }
+        g_tool_schemas_json.swap(g_tool_schemas_pending_json);
+        formatted_system_prompt = chat_add_and_format(ROLE_SYSTEM, text);
     }
     env->ReleaseStringUTFChars(jsystem_prompt, system_prompt);
 
@@ -829,6 +911,30 @@ Java_com_mobiinfer_demo_LlamaEngine_processSystemPromptKeepStateNative(
         jstring jsystem_prompt
 ) {
     return apply_system_prompt(env, jsystem_prompt, /*keep_state=*/true);
+}
+
+// Declares the tools the next system prompt should expose, as an
+// OpenAI-compatible JSON array of {"type":"function","function":{...}}
+// objects ("[]" clears them). Only tool-aware templates render this.
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_mobiinfer_demo_LlamaEngine_setToolSchemasNative(
+        JNIEnv *env,
+        jobject /*unused*/,
+        jstring jtool_schemas
+) {
+    g_tool_schemas_pending_json.clear();
+    if (jtool_schemas == nullptr) {
+        return;
+    }
+    const char *json = env->GetStringUTFChars(jtool_schemas, nullptr);
+    const std::string text(json);
+    env->ReleaseStringUTFChars(jtool_schemas, json);
+    if (text != "[]" && !text.empty()) {
+        g_tool_schemas_pending_json = text;
+    }
+    LOGi("%s: %zu chars of tool schemas queued for the next system prompt",
+         __func__, g_tool_schemas_pending_json.size());
 }
 
 extern "C"
@@ -954,6 +1060,8 @@ Java_com_mobiinfer_demo_LlamaEngine_fullReset(JNIEnv *env, jobject) {
     common_sampler_free(g_sampler);
     g_sampler = nullptr;
     g_chat_templates.reset();
+    g_tool_schemas_json.clear();
+    g_tool_schemas_pending_json.clear();
     llama_batch_free(g_batch);
     g_batch = {};
     llama_free(g_context);
@@ -1240,7 +1348,7 @@ static int generic_restore(const std::vector<RestoreTurn> & turns) {
                 g_image_prefilled = false;
             } else {
                 const bool has_tmpl = common_chat_templates_was_explicit(g_chat_templates.get());
-                formatted = has_tmpl ? chat_add_and_format(ROLE_USER, content.c_str()) : content;
+                formatted = has_tmpl ? chat_add_and_format(ROLE_USER, content.c_str(), true) : content;
                 apply_minicpm5_thinking_suffix(formatted);
             }
             if (generic_restore_eval_text(formatted) != 0) {
@@ -1262,7 +1370,7 @@ static int generic_restore(const std::vector<RestoreTurn> & turns) {
                 chat_msgs.push_back(msg);
             } else {
                 const bool has_tmpl = common_chat_templates_was_explicit(g_chat_templates.get());
-                formatted = has_tmpl ? chat_add_and_format(ROLE_ASSISTANT, turn.text.c_str()) : turn.text;
+                formatted = has_tmpl ? chat_add_and_format(ROLE_ASSISTANT, turn.text.c_str(), true) : turn.text;
             }
             if (generic_restore_eval_text(formatted) != 0) {
                 return 2;
@@ -1500,6 +1608,8 @@ Java_com_mobiinfer_demo_LlamaEngine_unload(JNIEnv * /*env*/, jobject /*unused*/)
 
     common_sampler_free(g_sampler);
     g_chat_templates.reset();
+    g_tool_schemas_json.clear();
+    g_tool_schemas_pending_json.clear();
     llama_batch_free(g_batch);
     g_batch = {};
     llama_free(g_context);

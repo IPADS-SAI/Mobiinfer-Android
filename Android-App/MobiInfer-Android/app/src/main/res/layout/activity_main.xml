@@ -176,12 +176,14 @@
         android:paddingEnd="12dp"
         android:paddingBottom="12dp">
 
-        <!-- Toggle row: deep thinking (chat models) and text-to-image
-             (image models) share one line, as siblings. -->
+        <!-- Toggle row. Deep thinking is the only occupant today; the row is
+             kept so the button keeps its 6 dp gap below it without shifting
+             the input box. -->
         <LinearLayout
             android:id="@+id/layout_toggles"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
+            android:importantForAccessibility="no"
             android:orientation="horizontal"
             android:gravity="start|center_vertical">
 
@@ -191,7 +193,6 @@
                 android:layout_width="wrap_content"
                 android:layout_height="28dp"
                 android:layout_gravity="center_vertical"
-                android:layout_marginEnd="6dp"
                 android:layout_marginBottom="6dp"
                 android:minWidth="0dp"
                 android:minHeight="0dp"
@@ -211,41 +212,6 @@
                 app:strokeColor="@color/think_toggle_stroke"
                 app:strokeWidth="1dp"
                 android:contentDescription="@string/think_toggle" />
-
-            <!-- Text-to-image switch, same row/level as the deep-thinking toggle.
-                 Only meaningful once a text-to-image model is selected; it turns
-                 the chat input into an image prompt box. -->
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/btn_t2i"
-                style="@style/Widget.Material3.Button.OutlinedButton"
-                android:layout_width="wrap_content"
-                android:layout_height="28dp"
-                android:layout_gravity="center_vertical"
-                android:layout_marginBottom="6dp"
-                android:minWidth="0dp"
-                android:minHeight="0dp"
-                android:insetTop="0dp"
-                android:insetBottom="0dp"
-                android:paddingHorizontal="9dp"
-                android:stateListAnimator="@null"
-                android:text="@string/t2i_toggle"
-                android:textColor="@color/think_toggle_text"
-                android:textSize="11sp"
-                android:visibility="gone"
-                android:checkable="true"
-                android:checked="false"
-                app:backgroundTint="@color/think_toggle_background"
-                app:cornerRadius="14dp"
-                app:icon="@drawable/ic_image"
-                app:iconGravity="textStart"
-                app:iconPadding="4dp"
-                app:iconSize="14dp"
-                app:iconTint="@color/think_toggle_text"
-                app:rippleColor="@android:color/transparent"
-                app:strokeColor="@color/think_toggle_stroke"
-                app:strokeWidth="1dp"
-                android:contentDescription="@string/t2i_toggle" />
-
         </LinearLayout>
 
         <LinearLayout

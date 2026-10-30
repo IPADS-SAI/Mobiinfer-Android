@@ -251,8 +251,8 @@
     <string name="model_desc_moss_q4">MOSS-Image text-to-image, Q4 8-step (smaller/faster, ~9GB)</string>
 
     <!-- Text-to-image UI -->
-    <string name="t2i_toggle">Image</string>
-    <string name="t2i_prompt_download">No text-to-image model downloaded yet. Download and select one in Model Configuration.</string>
+    <string name="image_prompt_hint">Describe the picture, e.g. a ginger cat basking in the sun, photorealistic</string>
+    <string name="image_model_hint">An image model is selected: type a description to draw it. Generation settings live in Model Configuration → Image.</string>
     <string name="t2i_mode_hint">Text-to-image mode</string>
     <string name="welcome_title_image">Create an image</string>
     <string name="welcome_desc_image">Describe what you want and the model draws it right on this device. Size, steps and other options live in Model Configuration.</string>
@@ -311,4 +311,8 @@
     <string name="image_result_seed">seed %1$d</string>
     <string name="config_reload_for_prompt">The image tool setting changed; the language model reloads on your next message.</string>
     <string name="tool_download_image_model_short">Downloading image model %1$s</string>
+    <string name="image_model_download_failed">The image model download did not finish</string>
+    <string name="image_load_failed">Could not load the image model</string>
+    <string name="image_copy_error">Copy error</string>
+    <string name="image_error_copied">Copied</string>
 </resources>

@@ -90,6 +90,28 @@ class ImageToolTest {
     }
 
     @Test
+    fun parsesChinesePunctuation() {
+        // Qwen-style output: full-width colon and Chinese quotes.
+        val text = "好的\uFF1A<tool_call>{\u201Cname\u201D：\u201Cgenerate_image\u201D，\u201Carguments\u201D：" +
+            "{\u201Cprompt\u201D：\u201Ca ginger cat sunbathing on a windowsill\u201D}}</tool_call>"
+        assertEquals("a ginger cat sunbathing on a windowsill", ImageTool.parse(text)?.prompt)
+    }
+
+    @Test
+    fun parsesSingleQuotedJson() {
+        val text = "<tool_call>{'name':'generate_image','arguments':{'prompt':'a red kite'}}</tool_call>"
+        assertEquals("a red kite", ImageTool.parse(text)?.prompt)
+    }
+
+    @Test
+    fun schemaArrayIsAJsonArray() {
+        val json = SystemPrompts.toolSchemasJson(true)
+        assertTrue(json!!.startsWith("[{"))
+        assertTrue(json.endsWith("}]"))
+        assertNull(SystemPrompts.toolSchemasJson(false))
+    }
+
+    @Test
     fun toolSchemaIsWellFormed() {
         val schema = SystemPrompts.toolSchema()
         assertTrue(schema.startsWith("{\"type\":\"function\""))

@@ -122,15 +122,21 @@ object ImageTool {
      * emit, which a strict JSON parser would reject.
      */
     internal fun String.toCall(): Call? {
-        val body = trim().ifBlank { return null }
+        // Small models love full-width punctuation ("prompt"： "…") and
+        // Chinese quotes, which strict JSON rejects. Normalise the delimiter
+        // characters only; the values themselves are left untouched.
+        val normalized = normalizePunctuation(trim())
+        val body = normalized.ifBlank { return null }
         val name = field(body, "name") ?: field(body, "tool") ?: return null
         if (!name.trim().equals(NAME, ignoreCase = true)) return null
         // Look for the prompt first inside an "arguments" object, then at top
         // level. Arguments given as a JSON string are handled by the second
         // pass over the raw body.
-        val argsStart = body.indexOf("\"arguments\"").let { at ->
-            if (at >= 0) body.indexOf('{', at) else -1
-        }
+        val argsAt = listOf("\"arguments\"", "'arguments'", "\"args\"", "'args'")
+            .map { body.indexOf(it) }
+            .filter { it >= 0 }
+            .minOrNull() ?: -1
+        val argsStart = if (argsAt >= 0) body.indexOf('{', argsAt) else -1
         val prompt = if (argsStart >= 0) {
             val argsEnd = matchingBrace(body, argsStart)
             if (argsEnd > argsStart) {
@@ -146,9 +152,39 @@ object ImageTool {
         return if (clean.isBlank()) null else Call(clean)
     }
 
+    /**
+     * Full-width structural punctuation in an otherwise JSON-ish object:
+     * `：` -> `:`, `“”` -> `"`, `，` -> `,`, and full-width braces/brackets.
+     * Content inside a value string is preserved except for the quote
+     * characters, which cannot be told apart cheaply - the cost is a prompt
+     * where a Chinese quotation mark becomes an ASCII one.
+     */
+    internal fun normalizePunctuation(text: String): String {
+        val sb = StringBuilder(text.length)
+        for (c in text) {
+            sb.append(
+                when (c) {
+                    '\uFF1A' -> ':'   // ：
+                    '\uFF0C' -> ','   // ，
+                    '\uFF1B' -> ';'   // ；
+                    '\uFF5B' -> '{'   // ｛
+                    '\uFF5D' -> '}'   // ｝
+                    '\uFF02' -> '"'   // ＂
+                    '\u201C', '\u201D' -> '"' // “ ”
+                    '\u2018', '\u2019' -> '\'' // ‘ ’
+                    else -> c
+                }
+            )
+        }
+        return sb.toString()
+    }
+
     /** Value of the first `"key": "value"` (or unquoted value) pair. */
     private fun field(json: String, key: String): String? {
-        val marker = "\"$key\""
+        return fieldQuoted(json, "\"$key\"") ?: fieldQuoted(json, "'$key'")
+    }
+
+    private fun fieldQuoted(json: String, marker: String): String? {
         var from = 0
         while (true) {
             val at = json.indexOf(marker, from)
@@ -159,8 +195,8 @@ object ImageTool {
                 i++
                 while (i < json.length && json[i].isWhitespace()) i++
                 if (i >= json.length) return null
-                if (json[i] == '"') {
-                    val end = closingQuote(json, i + 1)
+                if (json[i] == '"' || json[i] == '\'') {
+                    val end = closingQuote(json, i + 1, json[i])
                     return json.substring(i + 1, if (end < 0) json.length else end)
                 }
                 val end = json.indexOfAny(charArrayOf(',', '}', '\n'), i).let { if (it < 0) json.length else it }
@@ -170,11 +206,11 @@ object ImageTool {
         }
     }
 
-    private fun closingQuote(text: String, from: Int): Int {
+    private fun closingQuote(text: String, from: Int, quote: Char = '"'): Int {
         var i = from
         while (i < text.length) {
             if (text[i] == '\\') { i += 2; continue }
-            if (text[i] == '"') return i
+            if (text[i] == quote) return i
             i++
         }
         return -1

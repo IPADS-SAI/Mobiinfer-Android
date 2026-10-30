@@ -125,6 +125,9 @@ class ImageEngine private constructor(
     }
 
     private fun freeNative() {
+        // A freed context has no meaningful error left; keeping it would show
+        // a stale message on the next attempt.
+        lastError = null
         if (!isLoaded) return
         runCatching { nativeFree() }
             .onFailure { Log.w(TAG, "nativeFree failed", it) }
@@ -169,6 +172,7 @@ class ImageEngine private constructor(
             check(File(tokenizerPath).exists()) { "Tokenizer not found: $tokenizerPath" }
         }
 
+        lastError = null
         // DiT + text encoder + VAE are mmapped/loaded into RAM by sdcpp; the
         // file sizes are a good enough upper bound for deciding whether the
         // language model must be unloaded first.
@@ -221,6 +225,7 @@ class ImageEngine private constructor(
         check(prompt.isNotBlank()) { "Prompt must not be empty" }
         check(_state.value is ImageState.Ready) { "Engine not ready: ${_state.value}" }
 
+        lastError = null
         try {
             _state.value = ImageState.Generating
             Log.i(TAG, "Generating image: ${width}x$height steps=$steps cfg=$cfg seed=$seed")

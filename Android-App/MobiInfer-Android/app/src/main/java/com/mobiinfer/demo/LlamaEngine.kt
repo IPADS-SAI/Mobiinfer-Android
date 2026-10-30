@@ -300,23 +300,36 @@ class LlamaEngine private constructor(
         }
 
         fun setSelectedModel(context: Context, modelId: String) {
-            prefs(context).edit().putString(KEY_SELECTED_MODEL, modelId).apply()
+            // A manual choice must survive the next default-model rollover.
+            prefs(context).edit()
+                .putString(KEY_SELECTED_MODEL, modelId)
+                .putString(KEY_DEFAULT_MODEL_APPLIED, modelId)
+                .apply()
         }
 
         /**
          * Rolls the stored model selection forward to [ModelInfo.DEFAULT_MODEL]
-         * once per change of the shipped default. Fresh installs and users who
-         * already run the current default are no-ops; only a stale selection
-         * left by an older build (e.g. Qwen before the default moved to
-         * MiniCPM) is overridden, and a later manual choice is preserved.
+         * once, on the first launch of a build that ships it.
+         *
+         * Only a selection that was never made explicitly is overridden: a
+         * fresh install, or a choice rolled forward by an earlier rollover.
+         * A model the user picked by hand (in the toolbar or in the
+         * configuration page) is always preserved - otherwise every rebuild
+         * with a new default would silently switch the user, e.g. away from
+         * the text-to-image checkpoint they are working with.
          */
         fun applyDefaultModelIfNeeded(context: Context) {
             val prefs = prefs(context)
             if (prefs.getString(KEY_DEFAULT_MODEL_APPLIED, null) == ModelInfo.DEFAULT_MODEL.id) return
-            prefs.edit()
-                .putString(KEY_SELECTED_MODEL, ModelInfo.DEFAULT_MODEL.id)
-                .putString(KEY_DEFAULT_MODEL_APPLIED, ModelInfo.DEFAULT_MODEL.id)
-                .apply()
+            val current = prefs.getString(KEY_SELECTED_MODEL, null)
+            val editor = prefs.edit().putString(KEY_DEFAULT_MODEL_APPLIED, ModelInfo.DEFAULT_MODEL.id)
+            // No stored selection at all: a fresh install, take the default.
+            // Anything else is either this rollover's own bookkeeping or a
+            // manual pick (setSelectedModel() records it), which is kept.
+            if (current == null) {
+                editor.putString(KEY_SELECTED_MODEL, ModelInfo.DEFAULT_MODEL.id)
+            }
+            editor.apply()
         }
 
         fun markModelSwitched(context: Context) {
@@ -1590,6 +1603,9 @@ class LlamaEngine private constructor(
     // ships none. Used to expose the generate_image tool in a shape the
     // model's own template understands (tools schema vs. system text).
     private external fun chatTemplateNative(): String?
+    // OpenAI-compatible tool schema array for the next system prompt; pass
+    // "[]" (or null) to clear. Only tool-aware templates render it.
+    private external fun setToolSchemasNative(toolSchemasJson: String?)
     // Process the system prompt without dropping an existing short-term
     // state. Unlike the single-shot variant used at load time, this can be
     // called mid-conversation so a new system prompt never wipes history.
@@ -1765,6 +1781,16 @@ class LlamaEngine private constructor(
         setEnableThinkingPref(context, enable)
         setEnableThinkingNative(enable)
         Log.i(TAG, "enable_thinking=$enable")
+    }
+
+    /**
+     * Declares the tools the model may call. Has to run right before the
+     * system prompt is processed: the prompt it applies to is the only one
+     * that sees them.
+     */
+    suspend fun setToolSchemas(schemasJson: String?) = withContext(llamaDispatcher) {
+        runCatching { setToolSchemasNative(schemasJson) }
+            .onFailure { Log.w(TAG, "setToolSchemas failed", it) }
     }
 
     /** The model's chat template source, or null when it has none. */

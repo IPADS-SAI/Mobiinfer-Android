@@ -17,6 +17,13 @@ object SystemPrompts {
     private const val BASE_ZH = "你是 MobiInfer，一个运行在手机本地的 AI 助手。请用中文回答，简洁准确。"
     private const val BASE_EN = "You are MobiInfer, a helpful assistant running locally on a phone. Answer in the user's language, concisely and accurately."
 
+    /**
+     * The OpenAI-compatible tool array handed to a tool-aware template
+     * (`[{"type":"function", ...}]`), or null when the tool is off.
+     */
+    fun toolSchemasJson(toolEnabled: Boolean): String? =
+        if (toolEnabled) "[${toolSchema()}]" else null
+
     /** The assistant persona without any tool instructions. */
     fun base(isChinese: Boolean): String = if (isChinese) BASE_ZH else BASE_EN
 

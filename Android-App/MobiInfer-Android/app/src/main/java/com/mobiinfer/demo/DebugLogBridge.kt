@@ -68,6 +68,32 @@ object DebugLogBridge {
             false
         }
 
+    /**
+     * Records [text] in the debug log store, tagged [tag]. Used for things the
+     * logcat stream cannot carry reliably (the adsprpc driver floods it with
+     * per-frame messages, so our own lines are rotated away) and that the
+     * user may need to quote in a bug report, e.g. the exact output of a model
+     * that failed to call the generate_image tool. No-op in release builds.
+     *
+     * The store's entry point is looked up reflectively: DebugLogStore only
+     * exists in the debug source set.
+     */
+    fun dump(tag: String, text: String) {
+        // Debug builds also print a short marker to logcat; the full text goes
+        // to the on-device store, which is not drowned by the DSP driver.
+        Log.i(TAG, "[$tag] ${text.take(200).replace('\n', ' ')}")
+        try {
+            // DebugLogStore.dump(tag: String, text: String): Unit
+            invoke(
+                "dump",
+                arrayOf(String::class.java, String::class.java),
+                arrayOf(tag, text)
+            )
+        } catch (error: Throwable) {
+            Log.w(TAG, "Unable to write debug log entry", error)
+        }
+    }
+
     private fun invoke(
         name: String,
         parameterTypes: Array<Class<*>>,

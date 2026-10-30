@@ -39,6 +39,7 @@ class ChatAdapter(
     private var onDownloadResume: (() -> Unit)? = null
     private var onImageClick: ((String) -> Unit)? = null
     private var onImageLongClick: ((String) -> Unit)? = null
+    private var onImageErrorClick: ((String) -> Unit)? = null
 
     private var activeAiHolder: AiMessageViewHolder? = null
     private var activeAiId: Long = -1L
@@ -81,6 +82,11 @@ class ChatAdapter(
     /** Save a generated picture to the gallery. */
     fun setOnImageLongClick(listener: (String) -> Unit) {
         onImageLongClick = listener
+    }
+
+    /** Copy a generation error somewhere the user can paste it. */
+    fun setOnImageErrorClick(listener: (String) -> Unit) {
+        onImageErrorClick = listener
     }
 
     fun setActiveAiMessage(id: Long) {
@@ -339,7 +345,12 @@ class ChatAdapter(
                     ivResult.visibility = View.GONE
                     tvHint.visibility = View.GONE
                     tvError.visibility = View.VISIBLE
-                    tvError.text = ctx.getString(R.string.image_error, item.error)
+                    // Show the engine's own words: "image generation failed"
+                    // alone gives the user (and us) nothing to act on. Tap
+                    // copies it for a bug report.
+                    tvError.text = ctx.getString(R.string.image_error, item.error) +
+                        "\n" + ctx.getString(R.string.image_copy_error)
+                    tvError.setOnClickListener { onImageErrorClick?.invoke(item.error) }
                 }
                 else -> {
                     layoutProgress.visibility = View.GONE

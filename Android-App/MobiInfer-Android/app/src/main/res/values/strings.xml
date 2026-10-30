@@ -259,8 +259,8 @@
     <string name="model_desc_moss_q4">MOSS-Image 文生图，Q4 8 步（更小更快，约 9GB）</string>
 
     <!-- Text-to-image UI -->
-    <string name="t2i_toggle">文生图</string>
-    <string name="t2i_prompt_download">尚未下载文生图模型，请先在模型配置中下载并选择。</string>
+    <string name="image_prompt_hint">描述你想要的画面，例如：一只晒太阳的橘猫，写实风格</string>
+    <string name="image_model_hint">当前为文生图模型，输入描述后直接生成图片；生成参数在「模型配置 → 文生图」中调整。</string>
     <string name="t2i_mode_hint">文生图模式</string>
     <string name="welcome_title_image">开始创作图片</string>
     <string name="welcome_desc_image">输入一句描述，模型会在本机直接生成图片；尺寸、步数等参数可在模型配置中调整。</string>
@@ -319,4 +319,8 @@
     <string name="image_result_seed">种子 %1$d</string>
     <string name="config_reload_for_prompt">已切换生成图片工具，语言模型将在下次对话时重新加载。</string>
     <string name="tool_download_image_model_short">正在下载文生图模型 %1$s</string>
+    <string name="image_model_download_failed">文生图模型下载没有完成</string>
+    <string name="image_load_failed">文生图模型加载失败</string>
+    <string name="image_copy_error">复制错误信息</string>
+    <string name="image_error_copied">已复制</string>
 </resources>
