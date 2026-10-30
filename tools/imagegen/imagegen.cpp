@@ -59,7 +59,6 @@ void announce_stage(imagegen_stage_t stage) {
     }
 }
 thread_local int64_t tls_last_step_us = 0;
-thread_local int tls_pass = 0;
 
 int64_t now_us() {
     return std::chrono::duration_cast<std::chrono::microseconds>(
@@ -106,16 +105,17 @@ DownsampledPreview downsample_rgb(const sd_image_t & img) {
 
 void preview_cb(int step, int frame_count, sd_image_t * frames, bool /*is_noisy*/, void * /*data*/) {
     ++g_preview_calls;
-    const imagegen_gen_params * p = tls_params;
-    if (p == nullptr || p->on_preview == nullptr || frame_count <= 0 || frames == nullptr) {
-        return;
-    }
+    // A preview only exists once the denoising pass runs, so this is the most
+    // reliable end-of-encoding signal even when the listener is not interested
+    // in the frames themselves.
     const int pass = sd_get_preview_info().sample_pass;
-    // The denoising loop is the only thing that produces previews; the first
-    // one marks the end of text encoding.
     if (pass == 1 && !tls_sampling_seen) {
         tls_sampling_seen = true;
         announce_stage(IMAGEGEN_STAGE_SAMPLING);
+    }
+    const imagegen_gen_params * p = tls_params;
+    if (p == nullptr || p->on_preview == nullptr || frame_count <= 0 || frames == nullptr) {
+        return;
     }
     // Pass 1 only: later passes start from noise and would make the thumbnail
     // jump back to an unreadable blur.
@@ -154,12 +154,6 @@ void step_cb(int step, int steps, float /*secs*/, void * /*data*/) {
         }
     }
 }
-
-}  // namespace
-
-
-
-namespace {
 
 // sdcpp's preview and progress callbacks are process-global, so they are
 // installed once and read the per-call parameters from the thread-locals above.
@@ -290,6 +284,9 @@ bool imagegen_generate(imagegen_ctx * ctx,
     g_step_calls    = 0;
     tls_stage       = IMAGEGEN_STAGE_LOADING;
     tls_sampling_seen = false;
+    // A listener that threw on the previous run could leave the byte-progress
+    // flag behind; it would relabel every later denoising step as loading.
+    sd_progress_mark_uploading(false);
     const imagegen_gen_params * prev_params = tls_params;
     imagegen_ctx * const prev_ctx          = g_active_ctx;
     tls_params      = params;
@@ -312,11 +309,14 @@ bool imagegen_generate(imagegen_ctx * ctx,
             free_sd_image_generation_result(result);
         }
         char detail[256];
+        char tail[200] = "";
+        if (!g_last_failure.empty()) {
+            std::snprintf(tail, sizeof(tail), ", %s", g_last_failure.c_str());
+        }
         std::snprintf(detail, sizeof(detail),
                       "generate_image failed (steps seen=%d, previews=%d%s)",
-                      g_step_calls.load(), g_preview_calls.load(),
-                      g_last_failure.empty() ? "" : ", ");
-        g_last_failure.insert(0, detail);
+                      g_step_calls.load(), g_preview_calls.load(), tail);
+        g_last_failure.assign(detail);
         if (err != nullptr) { *err = g_last_failure.c_str(); }
         return false;
     }

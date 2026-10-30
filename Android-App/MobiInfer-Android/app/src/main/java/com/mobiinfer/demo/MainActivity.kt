@@ -1307,10 +1307,12 @@ class MainActivity : AppCompatActivity() {
                     postProgress(SAMPLING_END, getString(R.string.image_stage_decoding))
                 }
                 ImageEngine.STAGE_ENCODING ->
-                    postProgress(0f, getString(R.string.image_stage_encoding))
+                    postProgress(LOADING_END, getString(R.string.image_stage_encoding))
                 else -> Unit
             }
-            return imageJob?.isActive != false
+            // The draw itself is independent of the screen; only an explicit
+            // cancel (new request, another conversation) may stop it.
+            return true
         }
 
         override fun onPreview(samplePass: Int, step: Int, width: Int, height: Int, rgb: ByteArray) {
@@ -1377,7 +1379,7 @@ class MainActivity : AppCompatActivity() {
         elapsedMs: Long
     ) {
         val conversationId = currentConversationId ?: return
-        lifecycleScope.launch(Dispatchers.IO) {
+        imageWorkScope.launch(Dispatchers.IO) {
             runCatching {
                 val saved = ConversationStore.load(applicationContext, conversationId)
                 if (saved.any { it is ChatMessage.ImageResult && it.id == id }) return@runCatching
@@ -1453,8 +1455,11 @@ class MainActivity : AppCompatActivity() {
      * while a generation may still be writing files.
      */
     private fun pruneUnusedImages() {
-        // A generation in flight owns a file that is not referenced yet.
+        // A generation in flight owns a file that is not referenced yet - and
+        // that includes a draw whose Activity is gone, which imageJob still
+        // points at because the job outlives the screen.
         if (imageJob?.isActive == true) return
+        if (imageEngine?.isGenerating == true) return
         lifecycleScope.launch(Dispatchers.IO) {
             val referenced = ConversationStore.allImagePaths(applicationContext)
             ImageOutput.pruneOrphans(applicationContext, referenced)
