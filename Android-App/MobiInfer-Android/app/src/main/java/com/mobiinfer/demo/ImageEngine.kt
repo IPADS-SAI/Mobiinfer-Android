@@ -40,7 +40,20 @@ class ImageEngine private constructor(
     companion object {
         private val TAG = ImageEngine::class.java.simpleName
 
+        // Stages reported by the native step callback (see imagegen_stage_t).
+        // The step/steps pair only makes sense inside one stage.
+        const val STAGE_LOADING = 0
+        const val STAGE_ENCODING = 1
+        const val STAGE_SAMPLING = 2
+        const val STAGE_DECODING = 3
+        const val STAGE_DONE = 4
+
         private const val INIT_TIMEOUT_MS = 30_000L
+
+        // One bridge for the whole process; rebuilt engines re-point it.
+        private val sharedBridge = Bridge(null)
+
+        private fun bridgeFor(engine: ImageEngine): Bridge = sharedBridge.also { it.engine = engine }
 
         @Volatile
         private var instance: ImageEngine? = null
@@ -85,8 +98,70 @@ class ImageEngine private constructor(
         seed: Long, outPngPath: String
     ): Long
     private external fun nativeLastError(): String
+    // Receives onStep/onPreview from the native generation thread.
+    private external fun nativeSetProgressListener(listener: Any?)
     private external fun nativeModelVersion(): String
     private external fun nativeFree()
+
+    /**
+     * Live generation progress. The object is also handed to native code,
+     * which calls [onStep] / [onPreview] on the generation thread; both are
+     * invoked through this interface so the JNI lookup always finds them.
+     */
+    interface ProgressListener {
+        /**
+         * [stage] is one of the STAGE_* constants, and the step/steps pair only
+         * means something inside that stage: loading counts tensors, sampling
+         * counts denoising steps and the tiled VAE decode counts tiles.
+         * [samplePass] numbers the sampling batches of one generate call.
+         * Returns false to cancel the generation.
+         */
+        fun onStep(samplePass: Int, stage: Int, step: Int, steps: Int, elapsedMs: Double): Boolean
+
+        /**
+         * Downscaled RGB preview (width*height*3 bytes) of the current latent.
+         * Only pass 1 is reported: a later pass restarts from noise and would
+         * make the picture jump back to a blur.
+         */
+        fun onPreview(samplePass: Int, step: Int, width: Int, height: Int, rgb: ByteArray)
+    }
+
+    @Volatile
+    private var progressListenerOwner: Long = -1L
+
+    @Volatile
+    var progressListener: ProgressListener? = null
+        private set
+
+    /**
+     * Installs [listener] for the generation identified by [token]. A later
+     * generation replaces it; only the owner may clear it again, which kept a
+     * previous run's cleanup from silencing the next one.
+     */
+    @Synchronized
+    fun setProgressListener(token: Long, listener: ProgressListener?) {
+        if (listener == null) {
+            if (progressListenerOwner != token) return
+            progressListener = null
+            progressListenerOwner = -1L
+            return
+        }
+        progressListener = listener
+        progressListenerOwner = token
+    }
+
+    // Stable JNI target: native keeps a global reference to it for the whole
+    // process, so it must never be replaced by a new engine instance.
+    private val bridge: Bridge = bridgeFor(this)
+
+    /**
+     * True while nativeGenerate() is on the native thread. Freeing the context
+     * underneath a running generate would be a use-after-free, so destroy()
+     * and destroyIfLoaded() wait for it instead.
+     */
+    @Volatile
+    var isGenerating = false
+        private set
 
     // Resolved once the library is loaded (or loading failed). Every native
     // entry point awaits it, so loadModel can never race the initial dlopen.
@@ -108,6 +183,7 @@ class ImageEngine private constructor(
                 nativeSetenv("GGML_HEXAGON_ARCH", hexagonArchForDevice())
                 nativeSetenv("ADSP_LIBRARY_PATH",
                     "${context.applicationInfo.nativeLibraryDir};/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/system/vendor/lib/rfsa/adsp")
+                nativeSetProgressListener(bridge)
                 Log.i(TAG, "Imagegen native library loaded")
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to load native library", e)
@@ -118,6 +194,21 @@ class ImageEngine private constructor(
             job.invokeOnCompletion { cause ->
                 initialized.complete(cause == null && _state.value !is ImageState.Error)
             }
+        }
+    }
+
+    /**
+     * Static JNI target: native holds a reference to this object, not to the
+     * engine, so a recreated engine does not leave a dangling listener.
+     */
+    internal class Bridge(@Volatile var engine: ImageEngine?) {
+        @Suppress("unused")  // called from native
+        fun onStep(pass: Int, stage: Int, step: Int, steps: Int, elapsedMs: Double): Boolean =
+            engine?.progressListener?.onStep(pass, stage, step, steps, elapsedMs) ?: true
+
+        @Suppress("unused")  // called from native
+        fun onPreview(pass: Int, step: Int, width: Int, height: Int, rgb: ByteArray) {
+            engine?.progressListener?.onPreview(pass, step, width, height, rgb)
         }
     }
 
@@ -142,6 +233,8 @@ class ImageEngine private constructor(
      */
     suspend fun destroyIfLoaded() {
         if (!isLoaded) return
+        // Serialised on the native thread: if a generate is running there it
+        // finishes first, because it occupies that same thread.
         withContext(imageDispatcher) { freeNative() }
     }
 
@@ -309,10 +402,17 @@ class ImageEngine private constructor(
                 "imagegen",
                 "generate(${width}x$height steps=$steps cfg=$cfg seed=$seed) -> native call"
             )
-            val usedSeed = nativeGenerate(
-                prompt, negativePrompt, width, height, steps, cfg, seed, outputPath
-            )
+            isGenerating = true
+            val usedSeed = try {
+                nativeGenerate(prompt, negativePrompt, width, height, steps, cfg, seed, outputPath)
+            } finally {
+                isGenerating = false
+            }
             if (usedSeed < 0) {
+                // The context may be damaged (sampler stopped, HTP queue
+                // wedged). The engine is marked Error so the next request
+                // reloads instead of reusing a broken context - the second
+                // picture in one conversation used to fail for that reason.
                 outcome = "native failure: ${nativeLastError()}"
                 _state.value = ImageState.Error(RuntimeException(outcome))
                 lastError = outcome
@@ -335,6 +435,7 @@ class ImageEngine private constructor(
 
     fun destroy() {
         imageScope.launch {
+            // Queued behind any in-flight generate on the same thread.
             freeNative()
             Log.i(TAG, "Image engine destroyed")
         }.invokeOnCompletion {

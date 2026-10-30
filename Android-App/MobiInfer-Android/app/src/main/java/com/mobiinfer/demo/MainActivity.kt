@@ -91,12 +91,16 @@ class MainActivity : AppCompatActivity() {
     // loaded the first time the user actually generates an image.
     private var imageEngine: ImageEngine? = null
     private var imageJob: Job? = null
+    // Image work must not die with the Activity: leaving the screen (settings,
+    // rotation fallback) used to cancel the job and report a failure even
+    // though the native draw was still running. See onStop().
+    private val imageWorkScope: CoroutineScope =
+        CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     // Scope that owns the image flow started from a tool call; independent of
     // generationJob (cancelled before the image work starts).
-    private var imageJobScope: CoroutineScope? = null
     // Bumped for every image request so a late result from an abandoned or
     // superseded request cannot overwrite a newer one.
-    private var imageGenerationToken = 0
+    private var imageGenerationToken = 0L
     private var isImageModelLoaded = false
     private var loadedImageModelId: String? = null
     // Whether the resident chat model was loaded with the generate_image tool
@@ -332,13 +336,11 @@ class MainActivity : AppCompatActivity() {
         generationJob = null
         // An image request belongs to the conversation that started it (or is
         // superseded by a newer one); never let it render into another chat.
-        if (imageJob?.isActive == true) {
-            imageJob?.cancel()
-            imageGenerationToken++
-        }
-        imageJobScope?.cancel()
-        imageJobScope = null
+        // Bumping the token once is enough: it invalidates every callback the
+        // old draw could still deliver, whatever thread it lands on.
+        imageJob?.cancel()
         imageJob = null
+        imageGenerationToken++
     }
 
     private fun openConversation(id: String, restoreContext: Boolean) {
@@ -372,6 +374,20 @@ class MainActivity : AppCompatActivity() {
         if (pendingRestore && ::engine.isInitialized && engine.state.value is LlamaState.ModelReady) {
             restoreCurrentConversationHistory()
         }
+    }
+
+    /**
+     * Persist and wait for the write. Used before maintenance that inspects
+     * the saved files (image pruning, history replay).
+     */
+    private fun persistCurrentConversationBlocking() {
+        val id = currentConversationId ?: return
+        val snapshot = ArrayList<ChatMessage>(messages.size).apply { addAll(messages) }
+        runCatching {
+            kotlinx.coroutines.runBlocking(Dispatchers.IO) {
+                ConversationStore.save(applicationContext, id, snapshot)
+            }
+        }.onFailure { Log.w(TAG, "Synchronous conversation save failed", it) }
     }
 
     private fun persistCurrentConversation() {
@@ -519,6 +535,23 @@ class MainActivity : AppCompatActivity() {
                 collapseAppBar()
                 scrollToBottom()
             }
+        }
+    }
+
+    /**
+     * Rotation restarts the Activity; the image draw lives in the Activity's
+     * scope and in a single native context, so a recreation would lose it.
+     * Pin the screen to its current orientation for the duration instead.
+     */
+    private fun lockOrientationWhileGenerating(lock: Boolean) {
+        requestedOrientation = if (lock) {
+            if (resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE) {
+                android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            } else {
+                android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+            }
+        } else {
+            android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         }
     }
 
@@ -919,7 +952,19 @@ class MainActivity : AppCompatActivity() {
         }
 
         val engine = imageEngine ?: ImageEngine.getInstance(ctx).also { imageEngine = it }
-        if (isImageModelLoaded && loadedImageModelId == imageModel.id) return engine
+        // Reuse only a context that is still healthy: after a failed draw the
+        // native side may have left the model in a bad state, and reusing it
+        // made every following request in the same conversation fail too.
+        val reusable = isImageModelLoaded &&
+            loadedImageModelId == imageModel.id &&
+            engine.isLoaded &&
+            engine.state.value !is ImageState.Error
+        if (reusable) return engine
+        if (isImageModelLoaded && engine.isLoaded &&
+            loadedImageModelId == imageModel.id && engine.state.value is ImageState.Error
+        ) {
+            CriticalLog.log("image", "previous draw left the context in an error state: reloading")
+        }
 
         if (isImageModelLoaded) {
             // Different checkpoint: free the old one before loading the new.
@@ -1116,6 +1161,7 @@ class MainActivity : AppCompatActivity() {
         collapseAppBar()
         autoFollowStreaming = true
 
+        lockOrientationWhileGenerating(true)
         val userMsgId = messageIdCounter++
         messages.add(
             ChatMessage.UserMessage(
@@ -1132,7 +1178,7 @@ class MainActivity : AppCompatActivity() {
         val request = currentImageRequest(prompt, model)
         val outFile = ImageOutput.newOutputFile(ctx)
         val token = ++imageGenerationToken
-        imageJob = lifecycleScope.launch {
+        imageJob = imageWorkScope.launch {
             val startNs = SystemClock.elapsedRealtime()
             try {
                 val imageEngine = prepareImageEngine(model, resultId) ?: run {
@@ -1141,7 +1187,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 if (token != imageGenerationToken) return@launch
 
-                updateAiStatus(resultId, getString(R.string.image_generating))
+                imageEngine.setProgressListener(token, ImageProgressUi(resultId).also { it.onEncoding() })
                 CriticalLog.log("image", "generate start: native heap ${nativeHeapMb()} MB")
                 val usedSeed = withContext(NonCancellable) {
                     imageEngine.generate(
@@ -1171,6 +1217,8 @@ class MainActivity : AppCompatActivity() {
                     failImageResult(resultId, e.message ?: getString(R.string.image_generate_failed))
                 }
             } finally {
+                lockOrientationWhileGenerating(false)
+                imageEngine?.setProgressListener(token, null)
                 if (token == imageGenerationToken) {
                     enableInput(true)
                 }
@@ -1191,10 +1239,163 @@ class MainActivity : AppCompatActivity() {
                 pngPath = null,
                 paramsText = null,
                 isGenerating = true,
-                requestedByModel = requestedByModel
+                requestedByModel = requestedByModel,
+                progress = 0f,
+                stage = getString(R.string.image_stage_loading)
             )
         )
         return id
+    }
+
+    /**
+     * Drives the image bubble's progress bar and replaces its picture with the
+     * per-step latent preview.
+     *
+     * The callbacks arrive on the native generation thread. Everything UI
+     * related is marshalled to the main thread; preview frames are throttled
+     * and replaced in place through the adapter, because re-submitting the
+     * whole list would restart the RecyclerView's animations every step.
+     */
+    private inner class ImageProgressUi(
+        private val resultId: Long
+    ) : ImageEngine.ProgressListener {
+
+        private var lastPreviewStep = -1
+        private var lastPreviewMs = 0L
+        // Last fraction handed to the bar; a phase switch may lower the
+        // "within this phase" value, so the bar is only ever moved forward.
+        private var shownFraction = 0f
+
+        /**
+         * The native wrapper announces the phase explicitly: it emits a
+         * step-less event on every transition and only the denoising phase
+         * carries meaningful step numbers. Tiled VAE decode events (hundreds
+         * of tiles) never move the bar as if they were steps.
+         */
+        override fun onStep(
+            samplePass: Int, stage: Int, step: Int, steps: Int, elapsedMs: Double
+        ): Boolean {
+            when (stage) {
+                ImageEngine.STAGE_LOADING -> {
+                    // Weight/tensor loading shares the native progress channel
+                    // with denoising (426 tensors vs 4 steps). It owns the
+                    // first slice and never looks like a sampling step.
+                    if (steps > 0) {
+                        val within = (step.toFloat() / steps).coerceIn(0f, 1f)
+                        postProgress(
+                            LOADING_END * within,
+                            getString(R.string.image_stage_loading_progress, step, steps)
+                        )
+                    }
+                }
+                ImageEngine.STAGE_SAMPLING -> {
+                    if (steps > 0) {
+                        val within = (step.toFloat() / steps).coerceIn(0f, 1f)
+                        postProgress(
+                            ENCODING_END + (SAMPLING_END - ENCODING_END) * within,
+                            getString(R.string.image_stage_step, step, steps)
+                        )
+                    } else {
+                        // Phase announcement: denoising is about to start.
+                        postProgress(ENCODING_END, getString(R.string.image_stage_sampling))
+                    }
+                }
+                ImageEngine.STAGE_DECODING -> {
+                    // One announcement, then hundreds of tile events. Only the
+                    // first one changes anything; the bar sits at the top of
+                    // the denoising band until the PNG is written.
+                    postProgress(SAMPLING_END, getString(R.string.image_stage_decoding))
+                }
+                ImageEngine.STAGE_ENCODING ->
+                    postProgress(0f, getString(R.string.image_stage_encoding))
+                else -> Unit
+            }
+            return imageJob?.isActive != false
+        }
+
+        override fun onPreview(samplePass: Int, step: Int, width: Int, height: Int, rgb: ByteArray) {
+            // Pass 1 only (the native side filters as well), and never before
+            // the latent has some structure.
+            if (samplePass != 1 || step < PREVIEW_FIRST_STEP || width <= 0 || height <= 0) return
+            // A repeated or older step must not overwrite a newer picture.
+            if (step <= lastPreviewStep) return
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastPreviewMs < PREVIEW_INTERVAL_MS) return
+            lastPreviewStep = step
+            lastPreviewMs = now
+
+            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            val argb = IntArray(width * height)
+            for (i in argb.indices) {
+                val o = i * 3
+                argb[i] = (0xFF shl 24) or
+                    ((rgb[o].toInt() and 0xFF) shl 16) or
+                    ((rgb[o + 1].toInt() and 0xFF) shl 8) or
+                    (rgb[o + 2].toInt() and 0xFF)
+            }
+            bitmap.setPixels(argb, 0, width, 0, 0, width, height)
+            runOnUiThread {
+                if (!chatAdapter.showImagePreview(resultId, bitmap)) bitmap.recycle()
+            }
+        }
+
+        /** Called once the model is in memory and the prompt is being read. */
+        fun onEncoding() {
+            postProgress(LOADING_END, getString(R.string.image_stage_encoding))
+        }
+
+        private fun postProgress(fraction: Float, stage: String) {
+            val clamped = maxOf(shownFraction, fraction.coerceIn(0f, 1f))
+            runOnUiThread {
+                val index = messages.indexOfFirst { it.id == resultId }
+                if (index < 0) return@runOnUiThread
+                val current = messages[index] as? ChatMessage.ImageResult ?: return@runOnUiThread
+                if (!current.isGenerating) return@runOnUiThread
+                // Ignore sub-percent changes: each notification rebinds the row.
+                if (current.stage == stage &&
+                    kotlin.math.abs(current.progress - clamped) < PROGRESS_EPSILON
+                ) {
+                    return@runOnUiThread
+                }
+                shownFraction = clamped
+                messages[index] = current.copy(progress = clamped, stage = stage)
+                chatAdapter.notifyImageProgress(resultId, clamped, stage)
+            }
+        }
+    }
+
+    /**
+     * A draw may finish after the screen is gone. The message list only exists
+     * in memory, so the finished bubble is appended to the saved conversation
+     * directly; otherwise the picture silently disappears from the history.
+     */
+    private fun persistDetachedImageResult(
+        id: Long,
+        pngPath: String,
+        request: ImageRequest,
+        seed: Long,
+        elapsedMs: Long
+    ) {
+        val conversationId = currentConversationId ?: return
+        lifecycleScope.launch(Dispatchers.IO) {
+            runCatching {
+                val saved = ConversationStore.load(applicationContext, conversationId)
+                if (saved.any { it is ChatMessage.ImageResult && it.id == id }) return@runCatching
+                val result = ChatMessage.ImageResult(
+                    id = id,
+                    prompt = request.prompt,
+                    pngPath = pngPath,
+                    paramsText = ImageOutput.paramsText(
+                        applicationContext, request.width, request.height, request.steps, request.cfg, seed
+                    ),
+                    isGenerating = false,
+                    requestedByModel = false,
+                    progress = 1f,
+                    elapsedMs = elapsedMs
+                )
+                ConversationStore.save(applicationContext, conversationId, saved + result)
+            }.onFailure { Log.w(TAG, "Could not persist a detached image result", it) }
+        }
     }
 
     private fun finishImageResult(
@@ -1204,12 +1405,18 @@ class MainActivity : AppCompatActivity() {
         seed: Long,
         elapsedMs: Long
     ) {
+        LlamaEngine.setLastImageSeed(applicationContext, seed)
         val index = messages.indexOfFirst { it.id == id }
-        if (index < 0) return
+        if (index < 0) {
+            // The Activity that started this draw is gone (settings, or the
+            // system reclaimed it). The picture still exists on disk, so put
+            // it in the saved conversation instead of dropping it.
+            persistDetachedImageResult(id, pngPath, request, seed, elapsedMs)
+            return
+        }
         val current = messages[index] as? ChatMessage.ImageResult ?: return
         // A pinned seed keeps producing the same picture; a random one is
         // surfaced as "last seed" so the user can pin it from the config page.
-        LlamaEngine.setLastImageSeed(applicationContext, seed)
         messages[index] = current.copy(
             pngPath = pngPath,
             paramsText = ImageOutput.paramsText(
@@ -1220,7 +1427,11 @@ class MainActivity : AppCompatActivity() {
             elapsedMs = elapsedMs
         )
         submitMessages(scrollToEnd = true)
-        persistCurrentConversation()
+        // Persist synchronously before pruning: save() runs on IO, and pruning
+        // on another IO thread could otherwise see the old messages.json, treat
+        // the fresh PNG as unreferenced and delete it - the history then loses
+        // the picture even though the bubble was shown.
+        persistCurrentConversationBlocking()
         refreshConversationList()
         pruneUnusedImages()
         // Tell the native side, so the next prompt sees this turn as a real
@@ -1242,6 +1453,8 @@ class MainActivity : AppCompatActivity() {
      * while a generation may still be writing files.
      */
     private fun pruneUnusedImages() {
+        // A generation in flight owns a file that is not referenced yet.
+        if (imageJob?.isActive == true) return
         lifecycleScope.launch(Dispatchers.IO) {
             val referenced = ConversationStore.allImagePaths(applicationContext)
             ImageOutput.pruneOrphans(applicationContext, referenced)
@@ -1284,6 +1497,7 @@ class MainActivity : AppCompatActivity() {
         val ctx = applicationContext
         val imageModel = imageModelForTool()
         val prompt = call.prompt
+        lockOrientationWhileGenerating(true)
         val resultId = addImageResultPlaceholder(prompt, requestedByModel = true)
         submitMessages(scrollToEnd = true)
 
@@ -1313,6 +1527,10 @@ class MainActivity : AppCompatActivity() {
         CriticalLog.log("image", "prepare returned a loaded engine (isLoaded=${imageEngine.isLoaded})")
 
         updateAiStatus(aiMsgId, getString(R.string.tool_generating_image, prompt))
+        imageEngine.setProgressListener(
+            imageGenerationToken,
+            ImageProgressUi(resultId).also { it.onEncoding() }
+        )
         Log.i(TAG, "Image tool: drawing ${request.width}x${request.height} steps=${request.steps} cfg=${request.cfg}")
         CriticalLog.log("image", "tool generate start: native heap ${nativeHeapMb()} MB")
         CriticalLog.log("image", "calling imageEngine.generate(...)")
@@ -1333,6 +1551,7 @@ class MainActivity : AppCompatActivity() {
                 outputPath = outFile.absolutePath
             )
         }
+        imageEngine.setProgressListener(imageGenerationToken, null)
         CriticalLog.log("image", "tool generate end: seed=$usedSeed, native heap ${nativeHeapMb()} MB")
         if (usedSeed == null) {
             failImageResult(resultId, imageEngine.lastError ?: getString(R.string.image_generate_failed))
@@ -2303,16 +2522,16 @@ class MainActivity : AppCompatActivity() {
                 // whose parent is still that job) silently never resumes after
                 // a suspension point -- this is the "generating image" that
                 // never finishes. The image job owns its own parent.
-                val imageOwner = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-                imageJobScope = imageOwner
-                imageJob = imageOwner.launch {
-                    val ok = runImageGenerationForTool(aiMsgId, call)
+                imageJob = imageWorkScope.launch {
+                    val ok = try {
+                        runImageGenerationForTool(aiMsgId, call)
+                    } finally {
+                        lockOrientationWhileGenerating(false)
+                    }
                     Log.i(TAG, "Image tool finished: served=$ok")
                     CriticalLog.log("image", "tool flow finished: served=$ok")
                 }.apply {
                     invokeOnCompletion { cause ->
-                        imageJobScope = null
-                        imageOwner.cancel()
                         // A cancellation here is routine: the streaming job
                         // that produced this call is cancelled on purpose once
                         // the tool fires, and leaving the screen cancels the
@@ -2436,13 +2655,25 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onStop() {
+        // The chat stream is tied to this screen: leaving it stops the answer.
         generationJob?.cancel()
-        imageJob?.cancel()
+        // An image draw is not. It runs for a minute on the native thread and
+        // cannot be interrupted; cancelling the job here would report a
+        // failure while the GPU is still working. It keeps running and the
+        // result is written to the history even if we never come back.
         persistCurrentConversation()
         super.onStop()
     }
 
     override fun onDestroy() {
+        // Never let the image stack go away underneath a running draw; the job
+        // outlives this Activity and finishes on the native thread it owns.
+        val imageBusy = imageJob?.isActive == true || imageEngine?.isGenerating == true
+        if (imageBusy) {
+            CriticalLog.log("image", "onDestroy during image generation: keeping the engine alive")
+        } else {
+            releaseImageEngine()
+        }
         if (isFinishing && !isLocaleRestart && ::engine.isInitialized) {
             engine.destroy()
         }
@@ -2455,5 +2686,20 @@ class MainActivity : AppCompatActivity() {
         private const val STATE_CURRENT_CONVERSATION = "state_current_conversation"
         private const val KEY_IMAGE_PROMPTS = "recent_image_prompts"
         private const val MAX_IMAGE_PROMPTS = 10
+        // Share of the bar that belongs to loading + text encoding; the rest
+        // is the denoising loop, which reports its own step counts.
+        // Bar layout: weights 0-40%, encoding 40-45%, denoising 45-90%, VAE
+        // decode 90-100%. The native stages are disjoint, so switching phase
+        // can never move the bar backwards.
+        // The native stages are disjoint, so a phase switch can never move the
+        // bar backwards (that is what produced the 426/426 -> 70/426 jump).
+        private const val LOADING_END = 0.40f
+        private const val ENCODING_END = 0.45f
+        private const val SAMPLING_END = 0.90f
+        private const val PROGRESS_EPSILON = 0.01f
+        private const val PREVIEW_FIRST_STEP = 2
+        // Two previews per second is plenty for a thumbnail and keeps the
+        // downsampled JPEG-free bitmap churn off the UI thread budget.
+        private const val PREVIEW_INTERVAL_MS = 500L
     }
 }
