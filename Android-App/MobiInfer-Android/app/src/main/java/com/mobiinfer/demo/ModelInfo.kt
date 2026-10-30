@@ -94,7 +94,20 @@ data class ModelInfo(
      * This avoids hard-coding a large, volatile file list (e.g. the 4.7
      * Hexagon bundle's 40 tiled expert layers) in the client.
      */
-    val bundleManifestFile: String? = null
+    val bundleManifestFile: String? = null,
+    /**
+     * Additional downloadable files (relative to [msRepo]) beyond
+     * [ggufFileName], fetched into the per-model directory when no bundle
+     * manifest is used. Used by text-to-image models (MOSS-Image) which need
+     * a text encoder, VAE and tokenizer alongside the diffusion checkpoint.
+     */
+    val extraFiles: List<String> = emptyList(),
+    /**
+     * Exact byte lengths for [extraFiles] (keyed by file name). Pinning the
+     * size lets the downloader skip files that are already complete instead of
+     * re-fetching them on every run.
+     */
+    val extraFileBytes: Map<String, Long> = emptyMap()
 ) {
     /** True for text-only models that have no vision projector. */
     val isTextOnly: Boolean
@@ -103,6 +116,14 @@ data class ModelInfo(
     /** True for TTS (text-to-speech) models with acoustic component. */
     val isTts: Boolean
         get() = acousticFileName != null
+
+    /**
+     * True for text-to-image models (stable-diffusion.cpp checkpoints).
+     * Detected by id so registering an image model only needs a matching id
+     * plus its single-file checkpoint in [ggufFileName].
+     */
+    val isImage: Boolean
+        get() = id.startsWith("sd-") || id.contains("stable-diffusion")
 
     /** Only the MiniCPM-V 4.7 bundle has the multi-frame video path. */
     val supportsVideo: Boolean
@@ -228,6 +249,49 @@ data class ModelInfo(
                 ggufBytes = 2_497_281_664L,
                 mmprojBytes = 836_180_256L,
                 totalBytes = 3_333_461_920L
+            ),
+            // MOSS-Image text-to-image, fp16 8-step (best quality). Runs on the
+            // Hexagon NPU via the sdcpp-hexagon fork (libimagegen). ggufFileName
+            // is the DiT; extraFiles carry the text encoder, VAE and tokenizer.
+            ModelInfo(
+                id = "sd-moss-image-fp16",
+                displayName = "MOSS-Image FP16 (8-step)",
+                descriptionResName = "model_desc_moss_fp16",
+                ggufFileName = "moss-sft-official-f16.gguf",
+                msRepo = "YYDH21/moss-image-hexagon",
+                extraFiles = listOf(
+                    "qwen3.5-9b-q4km.gguf",
+                    "flux2-vae.safetensors",
+                    "tokenizer.json"
+                ),
+                ggufBytes = 10_164_640_640L,
+                extraFileBytes = mapOf(
+                    "qwen3.5-9b-q4km.gguf" to 5_680_522_464L,
+                    "flux2-vae.safetensors" to 336_211_292L,
+                    "tokenizer.json" to 19_989_325L
+                ),
+                totalBytes = 16_201_363_721L
+            ),
+            // MOSS-Image q4 8-step (smaller, faster). Same TE/VAE/tokenizer
+            // as the fp16 variant; only the DiT is quantized.
+            ModelInfo(
+                id = "sd-moss-image-q4",
+                displayName = "MOSS-Image Q4 (8-step)",
+                descriptionResName = "model_desc_moss_q4",
+                ggufFileName = "moss-turbo8-q4km-f16t.gguf",
+                msRepo = "YYDH21/moss-image-hexagon",
+                extraFiles = listOf(
+                    "qwen3.5-9b-q4km.gguf",
+                    "flux2-vae.safetensors",
+                    "tokenizer.json"
+                ),
+                ggufBytes = 3_600_669_568L,
+                extraFileBytes = mapOf(
+                    "qwen3.5-9b-q4km.gguf" to 5_680_522_464L,
+                    "flux2-vae.safetensors" to 336_211_292L,
+                    "tokenizer.json" to 19_989_325L
+                ),
+                totalBytes = 9_637_392_649L
             )
         )
 

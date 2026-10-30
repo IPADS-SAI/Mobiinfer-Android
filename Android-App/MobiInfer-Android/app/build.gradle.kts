@@ -297,9 +297,99 @@ tasks.register("buildHtpSkels") {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Text-to-image: build the sdcpp-hexagon fork of stable-diffusion.cpp +
+// the imagegen JNI wrapper as a self-contained set of shared libraries and
+// bundle them into jniLibs.
+//
+// sdcpp-hexagon vendors its own (patched) ggml WITH the ggml-hexagon backend,
+// whose CMake targets collide with the llama.cpp-omni ggml. It is therefore
+// built as a separate CMake project (tools/imagegen) producing
+// libimagegen.so plus its own libstable-diffusion.so (ggml inside) and the
+// libggml-htp-v*.so skels, loaded independently at runtime.
+//
+// Requires HEXAGON_SDK_ROOT / HEXAGON_TOOLS_ROOT (same as the llama hexagon
+// build). Skels are built for the DSP versions we ship (v79 = SM8750, v81 =
+// SM8850); the runtime picks the matching one via GGML_HEXAGON_ARCH.
+// ---------------------------------------------------------------------------
+val buildImageGen = tasks.register("buildImageGen") {
+    group = "native"
+    description = "Build sdcpp-hexagon + imagegen shared libs for arm64-v8a"
+
+    val destDir = file("src/main/jniLibs/arm64-v8a")
+    val repoRoot = file("../../..").absoluteFile
+    val srcDir = File(repoRoot, "tools/imagegen")
+    val sdSrcDir = File(repoRoot, "vendor/sdcpp-hexagon")
+    outputs.dir(destDir)
+
+    doLast {
+        if (!File(sdSrcDir, "CMakeLists.txt").exists()) {
+            logger.lifecycle("Skipping buildImageGen: vendor/sdcpp-hexagon not present")
+            return@doLast
+        }
+        val hexagonSdk = System.getenv("HEXAGON_SDK_ROOT")
+            ?: error("Set HEXAGON_SDK_ROOT to the Hexagon SDK installation directory")
+        val hexagonTools = System.getenv("HEXAGON_TOOLS_ROOT")
+            ?: "$hexagonSdk/tools/HEXAGON_Tools/21.0.04"
+
+        val cmake = "$sdkRoot/cmake/4.1.2/bin/cmake"
+        val toolchain = "$sdkRoot/ndk/27.0.12077973/build/cmake/android.toolchain.cmake"
+        val ndkLibs = "$sdkRoot/ndk/27.0.12077973/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/18/lib/linux/aarch64"
+        val bd = File(project.layout.buildDirectory.asFile.get(), "imagegen-cmake/arm64-v8a")
+        bd.mkdirs()
+
+        runCmd(
+            cmake,
+            "-S", srcDir.absolutePath,
+            "-B", bd.absolutePath,
+            "-DCMAKE_TOOLCHAIN_FILE=$toolchain",
+            "-DANDROID_ABI=arm64-v8a",
+            "-DANDROID_PLATFORM=android-29",
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DSDCPP_SOURCE_DIR=${sdSrcDir.absolutePath}",
+            "-DHEXAGON_SDK_ROOT=$hexagonSdk",
+            "-DHEXAGON_TOOLS_ROOT=$hexagonTools",
+            // SDK 6.7's hexagon_fun.cmake breaks on an empty PREBUILT_LIB_DIR;
+            // any non-empty value works for the top-level configure, the skels
+            // set their own per-DSP value.
+            "-DPREBUILT_LIB_DIR=toolv19_v79",
+        )
+        // Single-job build: stable-diffusion.cpp translation units are very
+        // memory-heavy (each clang peak ~0.8-1.5 GiB) and OOM a 16 GiB host
+        // when several run at once. Override with IMAGEGEN_JOBS if desired.
+        val jobs = System.getenv("IMAGEGEN_JOBS") ?: "1"
+        runCmd(cmake, "--build", bd.absolutePath, "--target", "imagegen", "htp-v79", "htp-v81", "-j", jobs)
+
+        destDir.mkdirs()
+        val soNames = listOf("libimagegen.so", "libstable-diffusion.so")
+        for (name in soNames) {
+            val f = fileTree(bd).matching { include("**/$name") }.files.firstOrNull()
+                ?: error("buildImageGen: missing $name under ${bd.absolutePath}")
+            f.copyTo(File(destDir, name), overwrite = true)
+            logger.lifecycle("Copied $name -> ${File(destDir, name).absolutePath}")
+        }
+        // HTP skels.
+        for (name in listOf("libggml-htp-v79.so", "libggml-htp-v81.so")) {
+            val f = fileTree(bd).matching { include("**/ggml-hexagon/$name") }.files.firstOrNull()
+                ?: error("buildImageGen: missing skel $name under ${bd.absolutePath}")
+            f.copyTo(File(destDir, name), overwrite = true)
+            logger.lifecycle("Copied $name -> ${File(destDir, name).absolutePath}")
+        }
+        // Runtime dep: OpenMP (libstable-diffusion.so NEEDED). The wrapper and
+        // sd lib use the NDK's static libc++ (no libc++_shared dependency), so
+        // we deliberately do NOT stage libc++_shared.so - it would only risk
+        // clashing with the main app's runtime.
+        File("$ndkLibs/libomp.so").takeIf { it.exists() }?.let {
+            it.copyTo(File(destDir, "libomp.so"), overwrite = true)
+            logger.lifecycle("Copied libomp.so from NDK")
+        }
+    }
+}
+
 afterEvaluate {
     listOf("Debug", "Release").forEach { buildType ->
         tasks.findByName("merge${buildType}JniLibFolders")?.dependsOn("buildGgmlCpu_v86")
         tasks.findByName("merge${buildType}JniLibFolders")?.dependsOn("buildHtpSkels")
+        tasks.findByName("merge${buildType}JniLibFolders")?.dependsOn(buildImageGen)
     }
 }

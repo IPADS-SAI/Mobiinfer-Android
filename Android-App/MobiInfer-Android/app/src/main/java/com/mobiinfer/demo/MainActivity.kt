@@ -120,6 +120,12 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        if (shouldRedirectToImage()) {
+            startActivity(Intent(this, ImageActivity::class.java))
+            finish()
+            return
+        }
+
         setContentView(R.layout.activity_main)
 
         // Edge-to-edge: pad the root content for status/nav bars and the IME
@@ -639,6 +645,11 @@ class MainActivity : AppCompatActivity() {
     private fun shouldRedirectToTts(): Boolean {
         val model = LlamaEngine.getSelectedModel(applicationContext)
         return model.isTts
+    }
+
+    private fun shouldRedirectToImage(): Boolean {
+        val model = LlamaEngine.getSelectedModel(applicationContext)
+        return model.isImage
     }
 
     private fun updateUIForModelType() {
@@ -1548,6 +1559,11 @@ class MainActivity : AppCompatActivity() {
         // activity was in the background, redirect to TtsActivity.
         if (shouldRedirectToTts()) {
             startActivity(Intent(this, TtsActivity::class.java))
+            finish()
+            return
+        }
+        if (shouldRedirectToImage()) {
+            startActivity(Intent(this, ImageActivity::class.java))
             finish()
             return
         }

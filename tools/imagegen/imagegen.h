@@ -1,0 +1,81 @@
+#pragma once
+
+// Thin wrapper around the sdcpp-hexagon fork of stable-diffusion.cpp for
+// text-to-image generation on Qualcomm Hexagon (HTP/NPU).
+//
+// This fork vendors its own (patched) ggml with the ggml-hexagon backend, so
+// nothing here touches the llama.cpp-omni ggml or model stack. Everything is
+// opaque and C-friendly so it can be driven from JNI or another host language.
+
+#include <cstdint>
+
+#ifndef IMAGEGEN_API
+#ifdef _WIN32
+#define IMAGEGEN_API __declspec(dllexport)
+#else
+#define IMAGEGEN_API __attribute__((visibility("default")))
+#endif
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+struct imagegen_ctx;
+
+struct imagegen_params {
+    // MOSS-Image needs several files. All are required for MOSS.
+    const char * diffusion_model_path; // DiT, e.g. moss-image-sft-q4k-f16t.gguf (required)
+    const char * llm_path;             // text encoder, e.g. qwen3.5-9b-q4km.gguf (required for MOSS)
+    const char * vae_path;             // e.g. flux2-vae.safetensors (required)
+    const char * tokenizer;            // e.g. tokenizer.json (required)
+
+    int n_threads;                     // <=0 -> physical cores
+    const char * wtype;                // weight type string, e.g. "auto"; NULL -> auto
+    // Per-module backend placement, e.g. "diffusion=HTP0,te=cpu,vae=HTP0".
+    // NULL -> library default (auto). For hexagon the recommended value keeps
+    // the text encoder on CPU and runs DiT + VAE on the NPU.
+    const char * backend;              // e.g. "diffusion=HTP0,te=cpu,vae=HTP0"
+    bool enable_mmap;                  // mmap weights from disk instead of reading
+    // Free the TE params+buffers after the prompt is encoded (saves memory,
+    // re-loads TE on the next prompt). Useful on memory-tight devices.
+    bool release_te_after_encode;
+};
+
+struct imagegen_gen_params {
+    const char * prompt;
+    const char * negative_prompt;      // NULL -> empty
+
+    int width;                         // <=0 -> 512
+    int height;                        // <=0 -> 512
+    int steps;                         // <=0 -> model default (8 for MOSS)
+    float cfg_scale;                   // <=0 -> model default (3.0 for MOSS)
+    int64_t seed;                      // <0 -> random
+
+    bool vae_tiling;                   // enable tiled VAE decode to bound peak memory
+};
+
+// Progress callback: called once before generation starts (step negotiated by
+// the library API has no per-step hook); return false to cancel.
+typedef bool (*imagegen_progress_cb)(int step, int steps, void * user_data);
+
+// Loads the model. Returns NULL on failure.
+IMAGEGEN_API imagegen_ctx * imagegen_init(const imagegen_params * params);
+IMAGEGEN_API void imagegen_free(imagegen_ctx * ctx);
+
+// Generates one image and writes it as PNG to out_png_path.
+// Returns true on success. On failure *err (if non-NULL) receives a short
+// message describing the reason.
+IMAGEGEN_API bool imagegen_generate(imagegen_ctx * ctx,
+                                    const imagegen_gen_params * params,
+                                    const char * out_png_path,
+                                    imagegen_progress_cb cb,
+                                    void * cb_user_data,
+                                    const char ** err);
+
+// Returns the detected model version name, or "Unknown".
+IMAGEGEN_API const char * imagegen_model_version(const imagegen_ctx * ctx);
+
+#ifdef __cplusplus
+}
+#endif

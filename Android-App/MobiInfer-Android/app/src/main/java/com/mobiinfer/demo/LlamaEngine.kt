@@ -24,8 +24,10 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URL
+import java.nio.channels.FileLock
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
@@ -285,6 +287,24 @@ class LlamaEngine private constructor(
             return File(modelDirFor(context, model), acoustic).absolutePath
         }
 
+        // MOSS-Image accessory file paths (derived from extraFiles order:
+        // [text encoder, VAE, tokenizer]). Return null if the model has no
+        // matching extra files configured.
+        fun imageTextEncoderPath(context: Context): String? =
+            imageExtraPath(context, 0)
+
+        fun imageVaePath(context: Context): String? =
+            imageExtraPath(context, 1)
+
+        fun imageTokenizerPath(context: Context): String? =
+            imageExtraPath(context, 2)
+
+        private fun imageExtraPath(context: Context, index: Int): String? {
+            val model = getSelectedModel(context)
+            val name = model.extraFiles.getOrNull(index) ?: return null
+            return File(modelDirFor(context, model), name).absolutePath
+        }
+
         fun modelsExist(context: Context): Boolean =
             modelsExist(context, getSelectedModel(context))
 
@@ -293,6 +313,9 @@ class LlamaEngine private constructor(
             val dir = File(modelDirFor(context, model))
             if (missingExpertFile(context, model) != null) return false
             if (!File(dir, model.ggufFileName).exists()) return false
+            if (model.extraFiles.isNotEmpty()) {
+                return model.extraFiles.all { File(dir, it).let { f -> f.isFile && f.canRead() && f.length() > 0L } }
+            }
             if (model.isTextOnly) return true
             if (model.isTts) {
                 val acoustic = model.acousticFileName ?: return true
@@ -620,6 +643,18 @@ class LlamaEngine private constructor(
             if (!dir.exists()) dir.mkdirs()
             val sink = ProgressSink(context, model.totalBytes, onProgress)
 
+            // Cross-process guard: two app processes (e.g. after the service is
+            // restarted while a background download is still running) must never
+            // write the same per-model directory concurrently - they would each
+            // delete the other's `.tmp` and corrupt/reset the download. An OS
+            // file lock on `<dir>/.download.lock` makes that exclusive.
+            val lock = acquireDownloadLock(dir)
+            if (lock == null) {
+                Log.w(TAG, "Download already in progress for ${model.id} in another process; refusing to start")
+                throw IllegalStateException("该模型正在另一个进程中下载，请稍后再试")
+            }
+            try {
+
             // Bundle models (e.g. the 4.7 Hexagon package) are more than a
             // single gguf/mmproj pair: a ModelScope-hosted checksum manifest
             // enumerates every payload file. Handle them on their own path and
@@ -701,6 +736,23 @@ class LlamaEngine private constructor(
             if (!model.isTextOnly && !model.isTts && model.mmprojFileName != null) {
                 files.add(FileSpec(model.mmprojFileName, mmprojSources, model.mmprojMd5, model.mmprojBytes))
             }
+            // Extra accessory files (e.g. MOSS-Image TE / VAE / tokenizer),
+            // fetched from the ModelScope repo only.
+            if (model.extraFiles.isNotEmpty()) {
+                val msBase = model.msRepo?.takeIf { it.isNotBlank() }
+                    ?.let { "https://www.modelscope.cn/models/$it/resolve/${model.msBranch}" }
+                    ?: throw RuntimeException("Model ${model.id} has extraFiles but no ModelScope repo")
+                for (name in model.extraFiles) {
+                    files.add(
+                        FileSpec(
+                            name,
+                            listOf(FileSource("ModelScope", URL("$msBase/$name"))),
+                            null,
+                            model.extraFileBytes[name],
+                        )
+                    )
+                }
+            }
 
             val racedLabel = files.first().sources.joinToString("+") { it.label }
             sink.message(context.getString(R.string.download_race_start, racedLabel))
@@ -710,6 +762,59 @@ class LlamaEngine private constructor(
             }
 
             sink.message(context.getString(R.string.download_all_complete))
+            } finally {
+                releaseDownloadLock(lock)
+            }
+        }
+
+        // Cross-process download lock, keyed on the per-model directory.
+        // A held lock keeps its RandomAccessFile open; we store it by path so
+        // release can both drop the FileLock and close the RAF (closing alone
+        // would release the OS lock, but we close explicitly for tidiness).
+        private val downloadLocks = ConcurrentHashMap<String, RandomAccessFile>()
+
+        private fun acquireDownloadLock(dir: File): FileLock? {
+            val key = dir.absolutePath
+            val raf = try {
+                RandomAccessFile(File(dir, ".download.lock"), "rw")
+            } catch (e: Exception) {
+                Log.w(TAG, "acquireDownloadLock: cannot open lock file: ${e.message}")
+                return null
+            }
+            return try {
+                val l = raf.channel.tryLock()
+                if (l == null) {
+                    raf.close()
+                    null
+                } else {
+                    downloadLocks[key] = raf
+                    l
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "acquireDownloadLock: tryLock failed: ${e.message}")
+                try { raf.close() } catch (_: Exception) {}
+                null
+            }
+        }
+
+        private fun releaseDownloadLock(lock: FileLock) {
+            try { if (lock.isValid) lock.release() } catch (_: Exception) {}
+            // Close and forget every RAF whose channel no longer holds a lock.
+            val it = downloadLocks.entries.iterator()
+            while (it.hasNext()) {
+                val (_, raf) = it.next()
+                try {
+                    val held = raf.channel.tryLock()
+                    if (held != null) {
+                        held.release()
+                        raf.close()
+                        it.remove()
+                    }
+                } catch (_: Exception) {
+                    try { raf.close() } catch (_: Exception) {}
+                    it.remove()
+                }
+            }
         }
 
         /**
@@ -1000,6 +1105,7 @@ class LlamaEngine private constructor(
             }
 
             val resumeFrom = if (tmpFile.exists()) tmpFile.length() else 0L
+            Log.i(TAG, "$fileName: start, tmpExists=${tmpFile.exists()} resumeFrom=$resumeFrom targetExists=${targetFile.exists()}")
             if (resumeFrom > 0) {
                 val mb = resumeFrom / (1024 * 1024)
                 sink.message(context.getString(R.string.download_resuming_src, source, fileName, mb.toInt()))
@@ -1096,11 +1202,25 @@ class LlamaEngine private constructor(
                     }
                 }
 
-                // Promote .tmp -> final.
+                // Promote .tmp -> final. Be defensive: another process, an OS
+                // cleanup, or a 200-restart may have removed the .tmp between
+                // the write and here. Never let a missing .tmp throw
+                // NoSuchFileException - fall back to an already-complete target
+                // if one exists, else fail with a clear message.
                 if (targetFile.exists()) targetFile.delete()
-                if (!tmpFile.renameTo(targetFile)) {
-                    tmpFile.copyTo(targetFile, overwrite = true)
-                    tmpFile.delete()
+                if (tmpFile.exists()) {
+                    if (!tmpFile.renameTo(targetFile)) {
+                        tmpFile.copyTo(targetFile, overwrite = true)
+                        tmpFile.delete()
+                    }
+                } else if (!targetFile.exists()) {
+                    // Neither .tmp nor final is present. If the server told us
+                    // this was already complete (416) we cannot recover here;
+                    // otherwise it's a genuine failure.
+                    Log.e(TAG, "$fileName: .tmp vanished before finalize (and no final file)")
+                    throw java.io.IOException("$fileName: temporary file disappeared before it could be finalized; will retry from scratch")
+                } else {
+                    Log.w(TAG, "$fileName: .tmp missing but final file already present; using it")
                 }
 
                 verifyOrThrow(context, targetFile, source, expectedMd5, expectedSha256, sink, tmpFile)

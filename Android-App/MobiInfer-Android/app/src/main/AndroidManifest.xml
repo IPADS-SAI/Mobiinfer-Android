@@ -63,6 +63,13 @@
             android:label="@string/tts_title"
             android:parentActivityName=".MainActivity"
             android:windowSoftInputMode="adjustResize" />
+        <activity
+            android:name=".ImageActivity"
+            android:exported="false"
+            android:configChanges="locale|layoutDirection"
+            android:label="@string/image_title"
+            android:parentActivityName=".MainActivity"
+            android:windowSoftInputMode="adjustResize" />
 
         <service
             android:name=".ModelDownloadService"

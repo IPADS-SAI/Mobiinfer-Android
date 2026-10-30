@@ -249,4 +249,26 @@
     <string name="debug_logging_enabled">调试日志已开启</string>
     <string name="debug_logging_disabled">调试日志已关闭</string>
     <string name="debug_logs_unavailable">当前版本不包含调试日志查看器</string>
+
+    <!-- Text-to-image (stable-diffusion.cpp) -->
+    <string name="image_title">文生图 (Stable Diffusion)</string>
+    <string name="image_header_subtitle">输入提示词，在本地生成图片</string>
+    <string name="image_prompt_hint">提示词</string>
+    <string name="image_negative_hint">反向提示词（可选）</string>
+    <string name="image_width_hint">宽</string>
+    <string name="image_height_hint">高</string>
+    <string name="image_steps_hint">步数</string>
+    <string name="image_cfg_hint">CFG</string>
+    <string name="image_seed_hint">种子 (-1 随机)</string>
+    <string name="image_result_desc">生成结果</string>
+    <string name="image_loading_model">正在加载模型…</string>
+    <string name="image_generate">生成图片</string>
+    <string name="image_generating">正在生成图片…</string>
+    <string name="image_prompt_empty">请输入提示词</string>
+    <string name="image_generate_failed">图片生成失败</string>
+    <string name="image_error">错误: %1$s</string>
+    <string name="image_download_prompt_title">模型未下载</string>
+    <string name="image_model_missing">尚未下载文生图模型，请先在模型管理中下载。</string>
+    <string name="model_desc_moss_fp16">MOSS-Image 文生图，FP16 8 步（画质最佳，约 16GB）</string>
+    <string name="model_desc_moss_q4">MOSS-Image 文生图，Q4 8 步（更小更快，约 9GB）</string>
 </resources>

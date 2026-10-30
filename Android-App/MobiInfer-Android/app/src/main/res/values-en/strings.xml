@@ -241,4 +241,26 @@
     <string name="debug_logging_enabled">Debug logging enabled</string>
     <string name="debug_logging_disabled">Debug logging disabled</string>
     <string name="debug_logs_unavailable">This build does not include the debug log viewer</string>
+
+    <!-- Text-to-image (stable-diffusion.cpp) -->
+    <string name="image_title">Text to Image (Stable Diffusion)</string>
+    <string name="image_header_subtitle">Enter a prompt to generate an image on-device</string>
+    <string name="image_prompt_hint">Prompt</string>
+    <string name="image_negative_hint">Negative prompt (optional)</string>
+    <string name="image_width_hint">Width</string>
+    <string name="image_height_hint">Height</string>
+    <string name="image_steps_hint">Steps</string>
+    <string name="image_cfg_hint">CFG</string>
+    <string name="image_seed_hint">Seed (-1 random)</string>
+    <string name="image_result_desc">Generated result</string>
+    <string name="image_loading_model">Loading model…</string>
+    <string name="image_generate">Generate Image</string>
+    <string name="image_generating">Generating image…</string>
+    <string name="image_prompt_empty">Please enter a prompt</string>
+    <string name="image_generate_failed">Image generation failed</string>
+    <string name="image_error">Error: %1$s</string>
+    <string name="image_download_prompt_title">Model not downloaded</string>
+    <string name="image_model_missing">The image model has not been downloaded. Please download it from Model Management.</string>
+    <string name="model_desc_moss_fp16">MOSS-Image text-to-image, FP16 8-step (best quality, ~16GB)</string>
+    <string name="model_desc_moss_q4">MOSS-Image text-to-image, Q4 8-step (smaller/faster, ~9GB)</string>
 </resources>

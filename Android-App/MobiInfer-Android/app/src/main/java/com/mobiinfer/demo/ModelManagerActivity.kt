@@ -213,6 +213,19 @@ class ModelManagerActivity : AppCompatActivity() {
 
         recyclerModels.layoutManager = LinearLayoutManager(this)
         recyclerModels.adapter = modelAdapter
+        // The list lives inside a ScrollView; a wrap_content RecyclerView there
+        // measures against the viewport height and clips the last row(s). Force
+        // it to expand to its full content height instead.
+        recyclerModels.isNestedScrollingEnabled = false
+        recyclerModels.post {
+            val lp = recyclerModels.layoutParams
+            recyclerModels.measure(
+                View.MeasureSpec.makeMeasureSpec(recyclerModels.width, View.MeasureSpec.EXACTLY),
+                View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+            )
+            lp.height = recyclerModels.measuredHeight
+            recyclerModels.layoutParams = lp
+        }
     }
 
     private fun fractionOf(model: ModelInfo): Float {
