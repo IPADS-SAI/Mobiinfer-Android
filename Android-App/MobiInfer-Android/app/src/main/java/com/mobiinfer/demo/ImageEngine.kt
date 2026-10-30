@@ -2,6 +2,7 @@ package com.mobiinfer.demo
 
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -63,14 +64,19 @@ class ImageEngine private constructor(
         diffusionModelPath: String, llmPath: String, vaePath: String,
         tokenizerPath: String, nThreads: Int, backend: String
     ): Boolean
+    // Returns the seed the image was drawn with (>= 0), or -1 on failure.
     private external fun nativeGenerate(
         prompt: String, negative: String,
         width: Int, height: Int, steps: Int, cfg: Float,
         seed: Long, outPngPath: String
-    ): Boolean
+    ): Long
     private external fun nativeLastError(): String
     private external fun nativeModelVersion(): String
     private external fun nativeFree()
+
+    // Resolved once the library is loaded (or loading failed). Every native
+    // entry point awaits it, so loadModel can never race the initial dlopen.
+    private val initialized = CompletableDeferred<Boolean>()
 
     init {
         imageScope.launch {
@@ -94,7 +100,37 @@ class ImageEngine private constructor(
                 _state.value = ImageState.Error(e)
                 throw e
             }
+        }.also { job ->
+            job.invokeOnCompletion { cause ->
+                initialized.complete(cause == null && _state.value !is ImageState.Error)
+            }
         }
+    }
+
+    private suspend fun awaitInitialized(): Boolean {
+        val ok = initialized.await()
+        if (!ok) throw IllegalStateException("Imagegen native library failed to load")
+        return ok
+    }
+
+    /**
+     * Frees the native context if one is loaded, and waits for it to happen on
+     * the image dispatcher. Needed before loading another checkpoint: the
+     * native side has a single global context, and [loadModel] must not run
+     * while a previous context is still alive.
+     */
+    suspend fun destroyIfLoaded() {
+        if (!isLoaded) return
+        withContext(imageDispatcher) { freeNative() }
+    }
+
+    private fun freeNative() {
+        if (!isLoaded) return
+        runCatching { nativeFree() }
+            .onFailure { Log.w(TAG, "nativeFree failed", it) }
+        isLoaded = false
+        _state.value = ImageState.Uninitialized
+        Log.i(TAG, "Image engine freed")
     }
 
     // GGML_HEXAGON_ARCH: v79 for Snapdragon 8 Elite (SM8750 / OnePlus 13),
@@ -107,8 +143,9 @@ class ImageEngine private constructor(
                 .invoke(null, "ro.soc.model") as? String)
         }.getOrNull() ?: ""
         return when {
-            soc.contains("SM8850", true) -> "81"
-            else -> "79"
+            // Matches the libggml-htp-v*.so skels the Gradle build ships.
+            soc.contains("SM8850", true) -> "v81"
+            else -> "v79"
         }
     }
 
@@ -120,6 +157,7 @@ class ImageEngine private constructor(
         nThreads: Int = 0,
         backend: String = "diffusion=HTP0,te=cpu,vae=HTP0"
     ): Boolean = withContext(imageDispatcher) {
+        awaitInitialized()
         check(File(diffusionModelPath).exists()) { "Diffusion model not found: $diffusionModelPath" }
         if (!llmPath.isNullOrBlank()) {
             check(File(llmPath).exists()) { "Text encoder not found: $llmPath" }
@@ -131,6 +169,13 @@ class ImageEngine private constructor(
             check(File(tokenizerPath).exists()) { "Tokenizer not found: $tokenizerPath" }
         }
 
+        // DiT + text encoder + VAE are mmapped/loaded into RAM by sdcpp; the
+        // file sizes are a good enough upper bound for deciding whether the
+        // language model must be unloaded first.
+        estimatedFootprintBytes = listOfNotNull(
+            File(diffusionModelPath), llmPath?.let { File(it) }, vaePath?.let { File(it) }, tokenizerPath?.let { File(it) }
+        ).sumOf { it.length() }
+
         try {
             _state.value = ImageState.LoadingModel
             Log.i(TAG, "Initializing imagegen: dit=$diffusionModelPath te=${llmPath ?: "-"} vae=${vaePath ?: "-"} backend=$backend")
@@ -140,6 +185,7 @@ class ImageEngine private constructor(
             )
             if (!ok) {
                 val e = RuntimeException("Imagegen init failed: ${nativeLastError()}")
+                lastError = e.message
                 _state.value = ImageState.Error(e)
                 return@withContext false
             }
@@ -150,21 +196,27 @@ class ImageEngine private constructor(
             return@withContext true
         } catch (e: Exception) {
             Log.e(TAG, "Error loading image model", e)
+            lastError = e.message
             _state.value = ImageState.Error(e)
             return@withContext false
         }
     }
 
+    /**
+     * Draws one image and returns the seed used, or null on failure (details
+     * in [lastError]). A negative [seed] asks the engine to pick a random one.
+     */
     suspend fun generate(
         prompt: String,
         negativePrompt: String = "",
-        width: Int = 512,
-        height: Int = 512,
-        steps: Int = 20,
-        cfg: Float = 7.0f,
-        seed: Long = -1L,
+        width: Int = LlamaEngine.DEFAULT_IMAGE_GEN_SIDE,
+        height: Int = LlamaEngine.DEFAULT_IMAGE_GEN_SIDE,
+        steps: Int = LlamaEngine.DEFAULT_IMAGE_GEN_STEPS,
+        cfg: Float = LlamaEngine.DEFAULT_IMAGE_GEN_CFG,
+        seed: Long = LlamaEngine.RANDOM_IMAGE_SEED,
         outputPath: String
-    ): Boolean = withContext(imageDispatcher) {
+    ): Long? = withContext(imageDispatcher) {
+        awaitInitialized()
         check(isLoaded) { "Image engine not loaded" }
         check(prompt.isNotBlank()) { "Prompt must not be empty" }
         check(_state.value is ImageState.Ready) { "Engine not ready: ${_state.value}" }
@@ -173,31 +225,43 @@ class ImageEngine private constructor(
             _state.value = ImageState.Generating
             Log.i(TAG, "Generating image: ${width}x$height steps=$steps cfg=$cfg seed=$seed")
 
-            val ok = nativeGenerate(
+            val usedSeed = nativeGenerate(
                 prompt, negativePrompt, width, height, steps, cfg, seed, outputPath
             )
-            if (!ok) {
+            if (usedSeed < 0) {
                 val e = RuntimeException("Image generation failed: ${nativeLastError()}")
                 _state.value = ImageState.Error(e)
-                return@withContext false
+                lastError = e.message
+                return@withContext null
             }
             _state.value = ImageState.Ready
-            Log.i(TAG, "Image generated: $outputPath (${File(outputPath).length() / 1024} KB)")
-            return@withContext true
+            Log.i(TAG, "Image generated with seed $usedSeed: $outputPath (${File(outputPath).length() / 1024} KB)")
+            return@withContext usedSeed
         } catch (e: Exception) {
             Log.e(TAG, "Error during image generation", e)
             _state.value = ImageState.Error(e)
-            return@withContext false
+            lastError = e.message
+            return@withContext null
         }
     }
 
+    /** Message of the last failed [loadModel]/[generate], if any. */
+    @Volatile
+    var lastError: String? = null
+        private set
+
+    /**
+     * Rough resident footprint of [loadModel]'s weights, derived from the
+     * file sizes on disk. Used to decide whether the language model has to go
+     * before the image stack is loaded (see MainActivity's image tool).
+     */
+    var estimatedFootprintBytes: Long = 0L
+        private set
+
     fun destroy() {
         imageScope.launch {
-            if (isLoaded) {
-                nativeFree()
-                isLoaded = false
-                Log.i(TAG, "Image engine destroyed")
-            }
+            freeNative()
+            Log.i(TAG, "Image engine destroyed")
         }.invokeOnCompletion {
             imageScope.cancel()
         }

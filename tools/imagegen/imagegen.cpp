@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <random>
 #include <string>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -74,9 +75,13 @@ bool imagegen_generate(imagegen_ctx * ctx,
                        const char * out_png_path,
                        imagegen_progress_cb cb,
                        void * cb_user_data,
-                       const char ** err) {
+                       const char ** err,
+                       int64_t * seed_out) {
     if (err != nullptr) {
         *err = nullptr;
+    }
+    if (seed_out != nullptr) {
+        *seed_out = -1;
     }
     if (ctx == nullptr || ctx->sd == nullptr || params == nullptr || out_png_path == nullptr) {
         if (err != nullptr) { *err = "invalid arguments"; }
@@ -90,7 +95,18 @@ bool imagegen_generate(imagegen_ctx * ctx,
     gp.negative_prompt = params->negative_prompt;
     gp.width           = params->width  > 0 ? params->width  : 512;
     gp.height          = params->height > 0 ? params->height : 512;
-    gp.seed            = params->seed;
+    // sdcpp's own resolve_seed() re-seeds rand() from time() for negative
+    // values, which makes two requests inside the same second identical.
+    // Draw the seed here instead and hand sdcpp an explicit one.
+    int64_t seed = params->seed;
+    if (seed < 0) {
+        std::random_device rd;
+        seed = static_cast<int64_t>(rd() & 0x7fffffffULL);
+    }
+    // sdcpp seeds only the low 32 bits of the RNG, so anything wider would be
+    // reported back but never reproducible. Keep it inside 32 bits.
+    seed &= 0xffffffffLL;
+    gp.seed = seed;
 
     if (params->steps > 0) {
         gp.sample_params.sample_steps = params->steps;
@@ -134,5 +150,8 @@ bool imagegen_generate(imagegen_ctx * ctx,
     }
 
     free_sd_image_generation_result(result);
+    if (ok && seed_out != nullptr) {
+        *seed_out = seed;
+    }
     return ok;
 }

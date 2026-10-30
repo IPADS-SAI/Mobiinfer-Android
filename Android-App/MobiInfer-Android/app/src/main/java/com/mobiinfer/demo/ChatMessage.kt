@@ -20,7 +20,11 @@ sealed class ChatMessage {
         // Stored instead of the bitmap so a saved conversation can re-open the
         // original file for display and for context replay. Null for synthetic
         // messages (e.g. restored placeholders) that carry no media.
-        val imageUri: String? = null
+        val imageUri: String? = null,
+        // Set on the bubble that produced an ImageResult (text-to-image mode
+        // or the generate_image tool). Those turns never go to the LLM as a
+        // bare question without an answer; see ImagePromptMarker.
+        val isImagePrompt: Boolean = false
     ) : ChatMessage()
 
     data class AiMessage(
@@ -30,12 +34,37 @@ sealed class ChatMessage {
         val metrics: InferenceMetrics? = null,
         // True while this bubble is only a "thinking" placeholder shown during
         // model loading (not an actual generation). Hides the stop button.
-        val isLoadingPlaceholder: Boolean = false
+        val isLoadingPlaceholder: Boolean = false,
+        // Display-only status line (e.g. "generating image: …"). It is never
+        // part of the text sent back to the model.
+        val status: String? = null
+    ) : ChatMessage()
+
+    /**
+     * Assistant-side image result for a text-to-image turn. The bitmap is
+     * decoded lazily by the view holder; [pngPath] is the file kept on disk so
+     * a saved conversation can redraw it after a restart.
+     */
+    data class ImageResult(
+        override val id: Long,
+        val prompt: String,
+        val pngPath: String?,
+        // Size/steps/cfg/seed actually used, shown under the image.
+        val paramsText: String?,
+        val isGenerating: Boolean = false,
+        val error: String? = null,
+        val elapsedMs: Long? = null,
+        // Set when the image was requested by the language model through the
+        // generate_image tool rather than by the image-mode switch.
+        val requestedByModel: Boolean = false
     ) : ChatMessage()
 
     data class WelcomeCard(
         override val id: Long = 0L,
-        val isTextOnly: Boolean = false
+        val isTextOnly: Boolean = false,
+        // The home screen is currently in text-to-image mode, so the card
+        // suggests image prompts instead of chat ones.
+        val isImageMode: Boolean = false
     ) : ChatMessage()
 
     /**

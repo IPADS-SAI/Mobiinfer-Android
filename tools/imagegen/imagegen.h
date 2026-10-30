@@ -50,7 +50,10 @@ struct imagegen_gen_params {
     int height;                        // <=0 -> 512
     int steps;                         // <=0 -> model default (8 for MOSS)
     float cfg_scale;                   // <=0 -> model default (3.0 for MOSS)
-    int64_t seed;                      // <0 -> random
+    // <0 -> pick a random seed in 32-bit range. sdcpp takes the seed as a
+    // uint64 (and seeds only the low 32 bits), so a 64-bit value would not be
+    // reproducible; callers must pass something < 2^32.
+    int64_t seed;
 
     bool vae_tiling;                   // enable tiled VAE decode to bound peak memory
 };
@@ -66,12 +69,15 @@ IMAGEGEN_API void imagegen_free(imagegen_ctx * ctx);
 // Generates one image and writes it as PNG to out_png_path.
 // Returns true on success. On failure *err (if non-NULL) receives a short
 // message describing the reason.
+// seed_out (optional) receives the seed the image was actually drawn with, so
+// callers can display it and reproduce the result later.
 IMAGEGEN_API bool imagegen_generate(imagegen_ctx * ctx,
                                     const imagegen_gen_params * params,
                                     const char * out_png_path,
                                     imagegen_progress_cb cb,
                                     void * cb_user_data,
-                                    const char ** err);
+                                    const char ** err,
+                                    int64_t * seed_out);
 
 // Returns the detected model version name, or "Unknown".
 IMAGEGEN_API const char * imagegen_model_version(const imagegen_ctx * ctx);

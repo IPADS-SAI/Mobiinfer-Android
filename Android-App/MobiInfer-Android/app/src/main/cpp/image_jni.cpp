@@ -8,7 +8,8 @@
 //
 // Exposes a minimal API to Kotlin (class com.mobiinfer.demo.ImageEngine):
 //   - nativeInit(diffusion, llm, vae, tokenizer, nThreads, backend) -> bool
-//   - nativeGenerate(prompt, negative, w, h, steps, cfg, seed, outPng) -> bool
+//   - nativeGenerate(prompt, negative, w, h, steps, cfg, seed, outPng) -> seed
+//     (the seed actually used, or -1 on failure)
 //   - nativeLastError() -> String
 //   - nativeModelVersion() -> String
 //   - nativeFree()
@@ -95,7 +96,9 @@ Java_com_mobiinfer_demo_ImageEngine_nativeInit(
     return JNI_TRUE;
 }
 
-JNIEXPORT jboolean JNICALL
+// Returns the seed the image was generated with (>= 0) or -1 on failure; the
+// reason is available through nativeLastError().
+JNIEXPORT jlong JNICALL
 Java_com_mobiinfer_demo_ImageEngine_nativeGenerate(
         JNIEnv * env, jobject /*thiz*/,
         jstring prompt, jstring negative,
@@ -103,7 +106,7 @@ Java_com_mobiinfer_demo_ImageEngine_nativeGenerate(
         jlong seed, jstring outPngPath) {
     if (g_ctx == nullptr) {
         g_last_error = "context not initialized";
-        return JNI_FALSE;
+        return -1;
     }
 
     const std::string p   = jstringToStdString(env, prompt);
@@ -111,7 +114,7 @@ Java_com_mobiinfer_demo_ImageEngine_nativeGenerate(
     const std::string out = jstringToStdString(env, outPngPath);
     if (out.empty()) {
         g_last_error = "output path is empty";
-        return JNI_FALSE;
+        return -1;
     }
 
     imagegen_gen_params gp{};
@@ -121,20 +124,22 @@ Java_com_mobiinfer_demo_ImageEngine_nativeGenerate(
     gp.height          = height;
     gp.steps           = steps;
     gp.cfg_scale       = cfg;
-    gp.seed            = seed;
+    gp.seed            = seed;  // <0 -> imagegen picks and reports one
     gp.vae_tiling      = true;  // bound peak memory on mobile
 
     LOG_I("imagegen generate: %dx%d steps=%d cfg=%.1f seed=%lld -> %s",
           width, height, steps, cfg, (long long) seed, out.c_str());
 
     const char * err = nullptr;
-    const bool ok = imagegen_generate(g_ctx, &gp, out.c_str(), nullptr, nullptr, &err);
+    int64_t used_seed = -1;
+    const bool ok = imagegen_generate(g_ctx, &gp, out.c_str(), nullptr, nullptr, &err, &used_seed);
     if (!ok) {
         g_last_error = err ? err : "generation failed";
         LOG_E("imagegen_generate failed: %s", g_last_error.c_str());
-        return JNI_FALSE;
+        return -1;
     }
-    return JNI_TRUE;
+    LOG_I("imagegen generate done: seed=%lld", (long long) used_seed);
+    return static_cast<jlong>(used_seed);
 }
 
 JNIEXPORT jstring JNICALL

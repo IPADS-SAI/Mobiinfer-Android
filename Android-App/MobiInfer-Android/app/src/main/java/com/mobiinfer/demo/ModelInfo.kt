@@ -166,6 +166,13 @@ data class ModelInfo(
         get() = !hfRepo.isNullOrBlank() || !msRepo.isNullOrBlank()
 
     companion object {
+        /**
+         * Checkpoint the generate_image tool downloads when no text-to-image
+         * model has been picked yet: the smallest MOSS-Image build, so a chat
+         * model asking for a picture does not pull ~16 GB over a phone link.
+         */
+        const val DEFAULT_IMAGE_MODEL_ID = "sd-moss-image-q4"
+
         // This NPU branch ships the Qwen3-VL-4B demo model plus the Hexagon
         // MoE bundles (MiniCPM-V 4.7, Qwen3.5-35B-A3B, Sage-A1.5, Qwen3-30B-A3B).
         // The upstream demo's other variants (V-4, V-4.6, MiniCPM5-1B/2B,

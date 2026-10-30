@@ -731,13 +731,7 @@ static int decode_tokens_in_batches(
     return 0;
 }
 
-extern "C"
-JNIEXPORT jint JNICALL
-Java_com_mobiinfer_demo_LlamaEngine_processSystemPrompt(
-        JNIEnv *env,
-        jobject /*unused*/,
-        jstring jsystem_prompt
-) {
+static int apply_system_prompt(JNIEnv *env, jstring jsystem_prompt, bool keep_state) {
     if (g_moe_runtime) {
         const char *text = env->GetStringUTFChars(jsystem_prompt, nullptr);
         g_moe_runtime->setSystemPrompt(text);
@@ -749,7 +743,9 @@ Java_com_mobiinfer_demo_LlamaEngine_processSystemPrompt(
              __func__, (void *) g_context, (void *) g_chat_templates.get());
         return 3;
     }
-    reset_short_term_states();
+    if (!keep_state) {
+        reset_short_term_states();
+    }
 
     const auto *system_prompt = env->GetStringUTFChars(jsystem_prompt, nullptr);
     LOGd("%s: System prompt received: \n%s", __func__, system_prompt);
@@ -811,6 +807,44 @@ Java_com_mobiinfer_demo_LlamaEngine_processSystemPrompt(
 
     system_prompt_position = current_position;
     return 0;
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
+Java_com_mobiinfer_demo_LlamaEngine_processSystemPrompt(
+        JNIEnv *env,
+        jobject /*unused*/,
+        jstring jsystem_prompt
+) {
+    return apply_system_prompt(env, jsystem_prompt, /*keep_state=*/false);
+}
+
+// Mid-conversation variant used when the generate_image tool is switched on
+// or off: it must not throw away the tokens already in the KV cache.
+extern "C"
+JNIEXPORT jint JNICALL
+Java_com_mobiinfer_demo_LlamaEngine_processSystemPromptKeepStateNative(
+        JNIEnv *env,
+        jobject /*unused*/,
+        jstring jsystem_prompt
+) {
+    return apply_system_prompt(env, jsystem_prompt, /*keep_state=*/true);
+}
+
+extern "C"
+JNIEXPORT jstring JNICALL
+Java_com_mobiinfer_demo_LlamaEngine_chatTemplateNative(
+        JNIEnv *env,
+        jobject /*unused*/
+) {
+    if (!g_model) {
+        return nullptr;
+    }
+    const char *tmpl = llama_model_chat_template(g_model, /*name=*/nullptr);
+    if (tmpl == nullptr) {
+        return nullptr;
+    }
+    return env->NewStringUTF(tmpl);
 }
 
 extern "C"

@@ -170,6 +170,104 @@ class LlamaEngine private constructor(
         private const val KEY_MODEL_SWITCHED = "model_switched"
         private const val KEY_ENABLE_THINKING = "enable_thinking"
 
+        // Text-to-image generation defaults. Kept in prefs (not per-model) so a
+        // MOSS fp16 <-> q4 switch keeps the user's size/step choices.
+        private const val KEY_IMAGE_WIDTH = "image_gen_width"
+        private const val KEY_IMAGE_HEIGHT = "image_gen_height"
+        private const val KEY_IMAGE_STEPS = "image_gen_steps"
+        private const val KEY_IMAGE_CFG = "image_gen_cfg"
+        private const val KEY_IMAGE_NEGATIVE = "image_gen_negative_prompt"
+        private const val KEY_IMAGE_SEED = "image_gen_seed"
+        private const val KEY_IMAGE_LAST_SEED = "image_gen_last_seed"
+        private const val KEY_IMAGE_CHAT_TOOL = "image_gen_chat_tool"
+        const val MIN_IMAGE_GEN_SIDE = 256
+        const val MAX_IMAGE_GEN_SIDE = 1024
+        const val IMAGE_GEN_SIDE_STEP = 64
+        const val MIN_IMAGE_GEN_STEPS = 1
+        const val MAX_IMAGE_GEN_STEPS = 50
+        const val DEFAULT_IMAGE_GEN_SIDE = 512
+        const val DEFAULT_IMAGE_GEN_STEPS = 8
+        const val DEFAULT_IMAGE_GEN_CFG = 3.0f
+        // -1 means "pick a fresh random seed for every image". Any other value
+        // is reused verbatim so the same prompt can be reproduced.
+        const val RANDOM_IMAGE_SEED = -1L
+
+        fun getImageGenWidth(context: Context): Int =
+            prefs(context).getInt(KEY_IMAGE_WIDTH, DEFAULT_IMAGE_GEN_SIDE)
+                .coerceIn(MIN_IMAGE_GEN_SIDE, MAX_IMAGE_GEN_SIDE)
+
+        fun setImageGenWidth(context: Context, width: Int) {
+            val clamped = width.coerceIn(MIN_IMAGE_GEN_SIDE, MAX_IMAGE_GEN_SIDE)
+            prefs(context).edit().putInt(KEY_IMAGE_WIDTH, clamped).apply()
+        }
+
+        fun getImageGenHeight(context: Context): Int =
+            prefs(context).getInt(KEY_IMAGE_HEIGHT, DEFAULT_IMAGE_GEN_SIDE)
+                .coerceIn(MIN_IMAGE_GEN_SIDE, MAX_IMAGE_GEN_SIDE)
+
+        fun setImageGenHeight(context: Context, height: Int) {
+            val clamped = height.coerceIn(MIN_IMAGE_GEN_SIDE, MAX_IMAGE_GEN_SIDE)
+            prefs(context).edit().putInt(KEY_IMAGE_HEIGHT, clamped).apply()
+        }
+
+        fun getImageGenSteps(context: Context): Int =
+            prefs(context).getInt(KEY_IMAGE_STEPS, DEFAULT_IMAGE_GEN_STEPS)
+                .coerceIn(MIN_IMAGE_GEN_STEPS, MAX_IMAGE_GEN_STEPS)
+
+        fun setImageGenSteps(context: Context, steps: Int) {
+            val clamped = steps.coerceIn(MIN_IMAGE_GEN_STEPS, MAX_IMAGE_GEN_STEPS)
+            prefs(context).edit().putInt(KEY_IMAGE_STEPS, clamped).apply()
+        }
+
+        fun getImageGenCfg(context: Context): Float =
+            prefs(context).getFloat(KEY_IMAGE_CFG, DEFAULT_IMAGE_GEN_CFG).coerceIn(1f, 15f)
+
+        fun setImageGenCfg(context: Context, cfg: Float) {
+            // Keep one decimal place so the UI never shows 3.0000001.
+            val stepped = (cfg.coerceIn(1f, 15f) * 10).roundToInt() / 10f
+            prefs(context).edit().putFloat(KEY_IMAGE_CFG, stepped).apply()
+        }
+
+        /** Seed of the most recently drawn picture (for "reuse this seed"). */
+        fun getLastImageSeed(context: Context): Long =
+            prefs(context).getLong(KEY_IMAGE_LAST_SEED, RANDOM_IMAGE_SEED)
+
+        fun setLastImageSeed(context: Context, seed: Long) {
+            prefs(context).edit().putLong(KEY_IMAGE_LAST_SEED, seed).apply()
+        }
+
+        fun getImageGenSeed(context: Context): Long =
+            prefs(context).getLong(KEY_IMAGE_SEED, RANDOM_IMAGE_SEED)
+
+        /** Clamps to sdcpp's 32-bit seed range; negative keeps it random. */
+        fun setImageGenSeed(context: Context, seed: Long) {
+            val stored = if (seed < 0) RANDOM_IMAGE_SEED else seed and 0xffffffffL
+            prefs(context).edit().putLong(KEY_IMAGE_SEED, stored).apply()
+        }
+
+        /**
+         * Whether chat models are told about the generate_image tool. Off
+         * means the model never hears about image generation; the chat-side
+         * text-to-image switch (for image checkpoints) is unaffected.
+         */
+        fun isImageToolEnabled(context: Context): Boolean =
+            prefs(context).getBoolean(KEY_IMAGE_CHAT_TOOL, true)
+
+        fun setImageToolEnabled(context: Context, enabled: Boolean) {
+            prefs(context).edit().putBoolean(KEY_IMAGE_CHAT_TOOL, enabled).apply()
+        }
+
+        fun getImageNegativePrompt(context: Context): String =
+            prefs(context).getString(KEY_IMAGE_NEGATIVE, "") ?: ""
+
+        fun setImageNegativePrompt(context: Context, prompt: String) {
+            prefs(context).edit().putString(KEY_IMAGE_NEGATIVE, prompt.trim()).apply()
+        }
+
+        /** Directory holding generated PNGs (outside cacheDir so history survives). */
+        fun imageOutputDir(context: Context): File =
+            File(context.filesDir, "generated_images").apply { mkdirs() }
+
         // MiniCPM-V's hard upper bound on slice count.  Values higher than 9
         // get clamped by clip.cpp::get_best_grid anyway; we cap on the UI
         // side to keep the slider semantics honest.
@@ -270,10 +368,10 @@ class LlamaEngine private constructor(
         fun modelDirFor(context: Context, model: ModelInfo): String =
             File(modelDir(context), model.id).absolutePath
 
-        fun modelPath(context: Context): String {
-            val model = getSelectedModel(context)
-            return File(modelDirFor(context, model), model.ggufFileName).absolutePath
-        }
+        fun modelPath(context: Context): String = modelPath(context, getSelectedModel(context))
+
+        fun modelPath(context: Context, model: ModelInfo): String =
+            File(modelDirFor(context, model), model.ggufFileName).absolutePath
 
         fun mmprojPath(context: Context): String? {
             val model = getSelectedModel(context)
@@ -291,16 +389,24 @@ class LlamaEngine private constructor(
         // [text encoder, VAE, tokenizer]). Return null if the model has no
         // matching extra files configured.
         fun imageTextEncoderPath(context: Context): String? =
-            imageExtraPath(context, 0)
+            imageTextEncoderPath(context, getSelectedModel(context))
 
         fun imageVaePath(context: Context): String? =
-            imageExtraPath(context, 1)
+            imageVaePath(context, getSelectedModel(context))
 
         fun imageTokenizerPath(context: Context): String? =
-            imageExtraPath(context, 2)
+            imageTokenizerPath(context, getSelectedModel(context))
 
-        private fun imageExtraPath(context: Context, index: Int): String? {
-            val model = getSelectedModel(context)
+        fun imageTextEncoderPath(context: Context, model: ModelInfo): String? =
+            imageExtraPath(context, model, 0)
+
+        fun imageVaePath(context: Context, model: ModelInfo): String? =
+            imageExtraPath(context, model, 1)
+
+        fun imageTokenizerPath(context: Context, model: ModelInfo): String? =
+            imageExtraPath(context, model, 2)
+
+        private fun imageExtraPath(context: Context, model: ModelInfo, index: Int): String? {
             val name = model.extraFiles.getOrNull(index) ?: return null
             return File(modelDirFor(context, model), name).absolutePath
         }
@@ -1480,6 +1586,14 @@ class LlamaEngine private constructor(
     private external fun getMinicpmvVersionNative(): Int
     private external fun prepare(): Int
     private external fun systemInfo(): String
+    // The active chat template (Jinja or built-in), or null when the model
+    // ships none. Used to expose the generate_image tool in a shape the
+    // model's own template understands (tools schema vs. system text).
+    private external fun chatTemplateNative(): String?
+    // Process the system prompt without dropping an existing short-term
+    // state. Unlike the single-shot variant used at load time, this can be
+    // called mid-conversation so a new system prompt never wipes history.
+    private external fun processSystemPromptKeepStateNative(systemPrompt: String): Int
     private external fun processSystemPrompt(systemPrompt: String): Int
     private external fun processUserPrompt(userPrompt: String, predictLength: Int): Int
     private external fun generateNextToken(): String?
@@ -1651,6 +1765,32 @@ class LlamaEngine private constructor(
         setEnableThinkingPref(context, enable)
         setEnableThinkingNative(enable)
         Log.i(TAG, "enable_thinking=$enable")
+    }
+
+    /** The model's chat template source, or null when it has none. */
+    suspend fun chatTemplate(): String? = withContext(llamaDispatcher) {
+        runCatching { chatTemplateNative() }.getOrNull()?.takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * Applies a system prompt mid-conversation without resetting the context.
+     * The KV prefix is recomputed from the system prompt on the next request;
+     * the restored history is replayed afterwards by the caller.
+     */
+    suspend fun reapplySystemPrompt(prompt: String) = withContext(llamaDispatcher) {
+        require(prompt.isNotBlank()) { "Cannot process empty system prompt!" }
+        val state = _state.value
+        if (state is LlamaState.ModelReady) {
+            _state.value = LlamaState.ProcessingSystemPrompt
+        }
+        try {
+            processSystemPromptKeepStateNative(prompt).let { result ->
+                if (result != 0) throw RuntimeException("Failed to apply system prompt: $result")
+            }
+        } finally {
+            if (state is LlamaState.ModelReady) _state.value = LlamaState.ModelReady
+        }
+        Log.i(TAG, "System prompt re-applied mid-conversation")
     }
 
     suspend fun setSystemPrompt(prompt: String) =
@@ -1921,6 +2061,10 @@ class LlamaEngine private constructor(
     fun cancelGeneration() {
         _cancelGeneration = true
     }
+
+    /** True while a model is resident in memory (loading/generating excluded). */
+    val isModelLoaded: Boolean
+        get() = _state.value is LlamaState.ModelReady
 
     suspend fun unloadModel() = withContext(llamaDispatcher) {
         if (_nativeCallTimedOut) {

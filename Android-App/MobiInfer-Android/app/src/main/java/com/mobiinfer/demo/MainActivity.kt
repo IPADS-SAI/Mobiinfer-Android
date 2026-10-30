@@ -31,11 +31,16 @@ import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.appbar.AppBarLayout
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.textfield.TextInputEditText
+import com.mobiinfer.demo.imagegen.ImageTool
+import com.mobiinfer.demo.imagegen.MemoryBudget
+import com.mobiinfer.demo.imagegen.SystemPrompts
 import io.noties.markwon.Markwon
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.takeWhile
 import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -51,6 +56,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnSend: ImageButton
     private lateinit var btnImage: ImageButton
     private lateinit var btnThink: MaterialButton
+    // Text-to-image switch, sibling of btnThink. Checked => the chat input is
+    // an image prompt and replies are rendered as generated images.
+    private lateinit var btnT2i: MaterialButton
     private lateinit var btnModelManager: ImageButton
     private lateinit var btnModelSelect: ImageButton
     private lateinit var cardInputBar: View
@@ -76,6 +84,19 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var engine: LlamaEngine
     private var generationJob: Job? = null
+
+    // Lazily created: the image stack (libimagegen + its own ggml) is only
+    // loaded the first time the user actually generates an image.
+    private var imageEngine: ImageEngine? = null
+    private var imageJob: Job? = null
+    // Bumped for every image request so a late result from an abandoned or
+    // superseded request cannot overwrite a newer one.
+    private var imageGenerationToken = 0
+    private var isImageModelLoaded = false
+    private var loadedImageModelId: String? = null
+    // Whether the resident chat model was loaded with the generate_image tool
+    // in its system prompt; null while no model is loaded.
+    private var lastSystemPromptHadImageTool: Boolean? = null
     private var isModelReady = false
     private var isImagePrefilled = false
     private var pendingImageProcessingMs: Long? = null
@@ -116,12 +137,6 @@ class MainActivity : AppCompatActivity() {
         // The chat interface is only meaningful for LLM/VLM models.
         if (shouldRedirectToTts()) {
             startActivity(Intent(this, TtsActivity::class.java))
-            finish()
-            return
-        }
-
-        if (shouldRedirectToImage()) {
-            startActivity(Intent(this, ImageActivity::class.java))
             finish()
             return
         }
@@ -172,6 +187,7 @@ class MainActivity : AppCompatActivity() {
         btnSend = findViewById(R.id.btn_send)
         btnImage = findViewById(R.id.btn_image)
         btnThink = findViewById(R.id.btn_think)
+        btnT2i = findViewById(R.id.btn_t2i)
         btnModelManager = findViewById(R.id.btn_model_manager)
         btnModelSelect = findViewById(R.id.btn_model_select)
         cardInputBar = findViewById(R.id.card_input_bar)
@@ -199,6 +215,8 @@ class MainActivity : AppCompatActivity() {
         chatAdapter.setOnStopClick {
             engine.cancelGeneration()
         }
+        chatAdapter.setOnImageClick { path -> ImageViewer.show(this, path) }
+        chatAdapter.setOnImageLongClick { path -> ImageViewer.saveToGallery(this, path) }
         chatAdapter.setOnDownloadConfirm {
             startInlineDownload()
         }
@@ -318,7 +336,12 @@ class MainActivity : AppCompatActivity() {
         val loaded = ConversationStore.load(applicationContext, id)
         val selectedModel = LlamaEngine.getSelectedModel(applicationContext)
         if (loaded.isEmpty()) {
-            messages.add(ChatMessage.WelcomeCard(isTextOnly = selectedModel.isTextOnly))
+            messages.add(
+                ChatMessage.WelcomeCard(
+                    isTextOnly = selectedModel.isTextOnly,
+                    isImageMode = selectedModel.isImage && isImageMode()
+                )
+            )
         }
         messages.addAll(loaded)
         messageIdCounter = (loaded.maxOfOrNull { it.id } ?: 0L) + 1L
@@ -444,6 +467,21 @@ class MainActivity : AppCompatActivity() {
             engine.setEnableThinking(next)
             refreshThinkButton()
         }
+        btnT2i.setOnClickListener {
+            val model = LlamaEngine.getSelectedModel(applicationContext)
+            if (!model.isImage) {
+                // Only reachable if the selection changed under us; the button
+                // is hidden for chat models.
+                Toast.makeText(this, R.string.t2i_prompt_download, Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            if (!LlamaEngine.modelsExist(applicationContext, model)) {
+                Toast.makeText(this, R.string.t2i_prompt_download, Toast.LENGTH_LONG).show()
+                startActivity(Intent(this, ModelManagerActivity::class.java))
+                return@setOnClickListener
+            }
+            setImageMode(!btnT2i.isChecked)
+        }
         findViewById<View>(R.id.btn_language).setOnClickListener {
             val languages = LocaleManager.AppLanguage.entries
             AlertDialog.Builder(this)
@@ -483,6 +521,25 @@ class MainActivity : AppCompatActivity() {
 
     private fun collapseAppBar() {
         appBarLayout.setExpanded(false, true)
+    }
+
+    /**
+     * System message the chat model is loaded with. The generate_image tool is
+     * described here; switching it off in the config page changes the text
+     * and reloads the model (see onResume).
+     */
+    private fun chatSystemPrompt(): String {
+        val ctx = applicationContext
+        val locale = LocaleManager.currentLanguage(ctx).tag
+        lastSystemPromptHadImageTool = LlamaEngine.isImageToolEnabled(ctx)
+        return SystemPrompts.systemMessage(
+            isChinese = locale.startsWith("zh"),
+            toolEnabled = LlamaEngine.isImageToolEnabled(ctx),
+            defaultWidth = LlamaEngine.getImageGenWidth(ctx),
+            defaultHeight = LlamaEngine.getImageGenHeight(ctx),
+            defaultSteps = LlamaEngine.getImageGenSteps(ctx),
+            defaultCfg = LlamaEngine.getImageGenCfg(ctx)
+        )
     }
 
     private fun isChatAtBottom(): Boolean = !recyclerChat.canScrollVertically(1)
@@ -525,7 +582,12 @@ class MainActivity : AppCompatActivity() {
     private fun clearChatUI() {
         messages.clear()
         val selectedModel = LlamaEngine.getSelectedModel(applicationContext)
-        messages.add(ChatMessage.WelcomeCard(isTextOnly = selectedModel.isTextOnly))
+        messages.add(
+            ChatMessage.WelcomeCard(
+                isTextOnly = selectedModel.isTextOnly,
+                isImageMode = selectedModel.isImage && isImageMode()
+            )
+        )
         messageIdCounter = 1L
         isImagePrefilled = false
         pendingImageProcessingMs = null
@@ -640,16 +702,12 @@ class MainActivity : AppCompatActivity() {
         val supportsThinking = LlamaEngine.getSelectedModel(applicationContext).supportsThinking
         btnThink.visibility = if (supportsThinking) View.VISIBLE else View.GONE
         if (supportsThinking) refreshThinkButton()
+        refreshImageModeUi()
     }
 
     private fun shouldRedirectToTts(): Boolean {
         val model = LlamaEngine.getSelectedModel(applicationContext)
         return model.isTts
-    }
-
-    private fun shouldRedirectToImage(): Boolean {
-        val model = LlamaEngine.getSelectedModel(applicationContext)
-        return model.isImage
     }
 
     private fun updateUIForModelType() {
@@ -664,7 +722,12 @@ class MainActivity : AppCompatActivity() {
         if (model.supportsThinking) {
             refreshThinkButton()
         }
-
+        // A model switch may cross the chat/image boundary (or pick a different
+        // image checkpoint): drop the stale image engine and re-sync the UI.
+        if (loadedImageModelId != null && loadedImageModelId != model.id) {
+            releaseImageEngine()
+        }
+        refreshImageModeUi()
         refreshWelcomeCard(model.isTextOnly)
     }
 
@@ -702,12 +765,7 @@ class MainActivity : AppCompatActivity() {
             if (model.id == LlamaEngine.getSelectedModel(this).id) return@setOnItemClickListener
             LlamaEngine.setSelectedModel(this, model.id)
             syncSelectedModelUi()
-            btnThink.visibility = if (model.supportsThinking) {
-                View.VISIBLE
-            } else {
-                View.GONE
-            }
-            if (model.supportsThinking) refreshThinkButton()
+            updateUIForModelType()
             if (!LlamaEngine.modelsExist(this, model)) {
                 Toast.makeText(this, R.string.model_not_downloaded_hint, Toast.LENGTH_SHORT).show()
             } else if (isModelReady && loadedModelId != model.id) {
@@ -721,6 +779,582 @@ class MainActivity : AppCompatActivity() {
         popup.show()
     }
 
+    // ------------------------------------------------------------------
+    // Text-to-image mode (image checkpoint selected on the home screen)
+    // ------------------------------------------------------------------
+
+    /** True when the chat input is acting as an image prompt box. */
+    private fun isImageMode(): Boolean = ::btnT2i.isInitialized && btnT2i.isChecked
+
+    /**
+     * The text-to-image switch lives next to deep thinking and is only shown
+     * when the selected model is an image checkpoint. It only lights up once
+     * that checkpoint is fully downloaded, because the button would otherwise
+     * promise something the device cannot run yet.
+     */
+    private fun refreshImageModeUi() {
+        val model = LlamaEngine.getSelectedModel(applicationContext)
+        if (!model.isImage) {
+            btnT2i.isChecked = false
+            btnT2i.visibility = View.GONE
+            applyImageModeChrome(false)
+            return
+        }
+        val ready = LlamaEngine.modelsExist(applicationContext, model)
+        btnT2i.visibility = View.VISIBLE
+        btnT2i.isEnabled = true
+        btnT2i.alpha = if (ready) 1f else 0.5f
+        btnT2i.isChecked = ready
+        applyImageModeChrome(ready)
+    }
+
+    private fun setImageMode(on: Boolean) {
+        btnT2i.isChecked = on
+        applyImageModeChrome(on)
+        refreshWelcomeCard(LlamaEngine.getSelectedModel(applicationContext).isTextOnly)
+    }
+
+    /** Input-bar affordances that differ between chat and image mode. */
+    private fun applyImageModeChrome(imageMode: Boolean) {
+        // Image prompts never carry attachments or chain-of-thought.
+        btnImage.visibility = View.GONE
+        btnImage.isEnabled = false
+        btnThink.visibility = View.GONE
+        etInput.setHint(if (imageMode) R.string.t2i_toggle else R.string.hint_input)
+        etInput.contentDescription =
+            getString(if (imageMode) R.string.t2i_toggle else R.string.hint_input)
+    }
+
+    /**
+     * One request to the image engine: which prompt, with what parameters, and
+     * where the result goes. Produced either by the image-mode switch
+     * ([beginImageGeneration]) or by the language model calling the
+     * generate_image tool ([runImageGenerationForTool]).
+     */
+    private data class ImageRequest(
+        val prompt: String,
+        val width: Int,
+        val height: Int,
+        val steps: Int,
+        val cfg: Float,
+        val negativePrompt: String,
+        val seed: Long,
+        val model: ModelInfo
+    )
+
+    private fun currentImageRequest(prompt: String, model: ModelInfo): ImageRequest {
+        val ctx = applicationContext
+        return ImageRequest(
+            prompt = prompt,
+            model = model,
+            width = LlamaEngine.getImageGenWidth(ctx),
+            height = LlamaEngine.getImageGenHeight(ctx),
+            steps = LlamaEngine.getImageGenSteps(ctx),
+            cfg = LlamaEngine.getImageGenCfg(ctx),
+            negativePrompt = LlamaEngine.getImageNegativePrompt(ctx),
+            seed = LlamaEngine.getImageGenSeed(ctx)
+        )
+    }
+
+    private fun releaseImageEngine() {
+        val destroyed = imageEngine
+        imageEngine = null
+        isImageModelLoaded = false
+        loadedImageModelId = null
+        destroyed?.destroy()
+    }
+
+    /**
+     * Makes sure libimagegen has [imageModel] loaded, downloading it first if
+     * necessary, showing progress on the message [statusMessageId] and giving
+     * up if that message leaves the screen.
+     *
+     * The image stack is completely separate from the llama one (its own
+     * ggml), so the chat model is only unloaded when it does not fit in
+     * memory next to the image stack.
+     */
+    private suspend fun prepareImageEngine(
+        imageModel: ModelInfo,
+        statusMessageId: Long
+    ): ImageEngine? {
+        val ctx = applicationContext
+        cancelActiveGeneration()
+
+        if (!LlamaEngine.modelsExist(ctx, imageModel)) {
+            updateAiStatus(
+                statusMessageId,
+                getString(R.string.tool_download_image_model, imageModel.displayName)
+            )
+            if (!downloadImageModelInline(imageModel, statusMessageId)) return null
+        }
+
+        val engine = imageEngine ?: ImageEngine.getInstance(ctx).also { imageEngine = it }
+        if (isImageModelLoaded && loadedImageModelId == imageModel.id) return engine
+
+        if (isImageModelLoaded) {
+            // Different checkpoint: free the old one before loading the new.
+            engine.destroyIfLoaded()
+            isImageModelLoaded = false
+            loadedImageModelId = null
+        }
+
+        if (shouldUnloadChatModelFor(imageModel)) {
+            updateAiStatus(statusMessageId, getString(R.string.tool_unloading_model))
+            unloadChatModelForImage()
+        }
+
+        val ok = withContext(Dispatchers.IO) {
+            engine.loadModel(
+                diffusionModelPath = LlamaEngine.modelPath(ctx, imageModel),
+                llmPath = LlamaEngine.imageTextEncoderPath(ctx, imageModel),
+                vaePath = LlamaEngine.imageVaePath(ctx, imageModel),
+                tokenizerPath = LlamaEngine.imageTokenizerPath(ctx, imageModel),
+                nThreads = 0,
+                backend = "diffusion=HTP0,te=cpu,vae=HTP0"
+            )
+        }
+        if (ok) {
+            isImageModelLoaded = true
+            loadedImageModelId = imageModel.id
+        } else {
+            Log.e(TAG, "Image model load failed: ${engine.lastError}")
+        }
+        return if (ok) engine else null
+    }
+
+    /**
+     * Loads [imageModel] through the regular download service and mirrors its
+     * progress into the chat until it finishes. Returns false when the user
+     * dismissed the card or the download failed.
+     */
+    private suspend fun downloadImageModelInline(imageModel: ModelInfo, statusMessageId: Long): Boolean {
+        if (ModelDownloadController.isRunning) {
+            updateAiStatus(statusMessageId, getString(R.string.toast_downloading))
+            return false
+        }
+        ModelDownloadService.start(applicationContext, imageModel.id)
+        val outcome = try {
+            var terminal = DownloadOutcome.Progress
+            ModelDownloadController.status
+                .filter { status -> status.modelIdOrNull() == imageModel.id }
+                .takeWhile { status ->
+                    if (status is ModelDownloadController.Status.Running) {
+                        val pct = (status.fraction * 100f).toInt().coerceIn(0, 100)
+                        updateAiStatus(
+                            statusMessageId,
+                            "${getString(R.string.tool_download_image_model_short, imageModel.displayName)} $pct%"
+                        )
+                    }
+                    terminal = status.toDownloadOutcome()
+                    terminal == DownloadOutcome.Progress
+                }
+                .collect { }
+            terminal
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            cancelImageModelDownload(imageModel)
+            throw e
+        }
+        return outcome == DownloadOutcome.Done
+    }
+
+    private enum class DownloadOutcome { Progress, Done, Aborted }
+
+    private fun ModelDownloadController.Status.modelIdOrNull(): String? = when (this) {
+        is ModelDownloadController.Status.Idle -> null
+        is ModelDownloadController.Status.Running -> modelId
+        is ModelDownloadController.Status.Paused -> modelId
+        is ModelDownloadController.Status.Completed -> modelId
+        is ModelDownloadController.Status.Cancelled -> modelId
+        is ModelDownloadController.Status.Failed -> modelId
+    }
+
+    private fun ModelDownloadController.Status.toDownloadOutcome(): DownloadOutcome = when (this) {
+        is ModelDownloadController.Status.Completed -> {
+            ModelDownloadController.acknowledge()
+            DownloadOutcome.Done
+        }
+        is ModelDownloadController.Status.Failed,
+        is ModelDownloadController.Status.Cancelled -> {
+            ModelDownloadController.acknowledge()
+            DownloadOutcome.Aborted
+        }
+        else -> DownloadOutcome.Progress
+    }
+
+    private fun cancelImageModelDownload(imageModel: ModelInfo) {
+        if (ModelDownloadController.runningModelId() == imageModel.id) {
+            ModelDownloadService.pause(applicationContext)
+        }
+    }
+
+    /**
+     * Decides whether the chat model has to go before the image stack loads.
+     * Uses the configured runtime budget as the chat model's share, so a
+     * large MoE on a 12 GB phone releases memory and a small model on a
+     * 24 GB phone keeps running for the follow-up question.
+     */
+    private fun shouldUnloadChatModelFor(imageModel: ModelInfo): Boolean {
+        if (!isModelReady) return false
+        // DiT + text encoder + VAE as they sit on disk: an upper bound for
+        // what sdcpp maps into RAM.
+        val footprint = modelFileSize(imageModel, imageModel.ggufFileName) +
+            imageModel.extraFiles.sumOf { modelFileSize(imageModel, it) }
+        val budgetMb = LlamaEngine.getMemoryBudgetMb(applicationContext)
+        return !MemoryBudget.fitsAlongsideLanguageModel(applicationContext, footprint, budgetMb)
+    }
+
+    private fun modelFileSize(model: ModelInfo, fileName: String): Long =
+        File(LlamaEngine.modelDirFor(applicationContext, model), fileName).length()
+
+    private suspend fun unloadChatModelForImage() {
+        try {
+            engine.cancelGeneration()
+            engine.unloadModel()
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to unload the chat model for the image stack", e)
+        }
+        isModelReady = false
+        loadedModelId = null
+    }
+
+    /** Home-screen image mode entry point (the switch is on). */
+    private fun beginImageGeneration(prompt: String) {
+        val ctx = applicationContext
+        val model = LlamaEngine.getSelectedModel(ctx)
+        if (!LlamaEngine.modelsExist(ctx, model)) {
+            beginModelFlow(prompt)
+            return
+        }
+        if (isInlineDownloading || isInlineModelLoad) {
+            Toast.makeText(this, R.string.toast_please_wait_model, Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (imageJob?.isActive == true) {
+            Toast.makeText(this, R.string.image_generating, Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        etInput.text = null
+        etInput.clearFocus()
+        (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
+            .hideSoftInputFromWindow(etInput.windowToken, 0)
+        collapseAppBar()
+        autoFollowStreaming = true
+
+        val userMsgId = messageIdCounter++
+        messages.add(
+            ChatMessage.UserMessage(
+                id = userMsgId,
+                text = prompt,
+                isImagePrompt = true
+            )
+        )
+        val resultId = addImageResultPlaceholder(prompt, requestedByModel = false)
+        chatAdapter.submitList(messages.toList()) { scrollToBottom() }
+        persistCurrentConversation()
+        enableInput(false)
+
+        val request = currentImageRequest(prompt, model)
+        val outFile = ImageOutput.newOutputFile(ctx)
+        val token = ++imageGenerationToken
+        imageJob = lifecycleScope.launch {
+            val startNs = SystemClock.elapsedRealtime()
+            try {
+                val imageEngine = prepareImageEngine(model, resultId) ?: run {
+                    failImageResult(resultId, getString(R.string.image_generate_failed))
+                    return@launch
+                }
+                if (token != imageGenerationToken) return@launch
+
+                updateAiStatus(resultId, getString(R.string.image_generating))
+                val usedSeed = withContext(Dispatchers.IO) {
+                    imageEngine.generate(
+                        prompt = request.prompt,
+                        negativePrompt = request.negativePrompt,
+                        width = request.width,
+                        height = request.height,
+                        steps = request.steps,
+                        cfg = request.cfg,
+                        seed = request.seed,
+                        outputPath = outFile.absolutePath
+                    )
+                }
+                if (token != imageGenerationToken) return@launch
+                if (usedSeed == null) {
+                    failImageResult(resultId, imageEngine.lastError ?: getString(R.string.image_generate_failed))
+                    return@launch
+                }
+
+                finishImageResult(resultId, outFile.absolutePath, request, usedSeed, (SystemClock.elapsedRealtime() - startNs))
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Image generation failed", e)
+                if (token == imageGenerationToken) {
+                    failImageResult(resultId, e.message ?: getString(R.string.image_generate_failed))
+                }
+            } finally {
+                if (token == imageGenerationToken) {
+                    enableInput(true)
+                }
+            }
+        }
+    }
+
+    /**
+     * Inserts the result cell and returns its id. Params stay empty until the
+     * engine reports the seed it actually used.
+     */
+    private fun addImageResultPlaceholder(prompt: String, requestedByModel: Boolean): Long {
+        val id = messageIdCounter++
+        messages.add(
+            ChatMessage.ImageResult(
+                id = id,
+                prompt = prompt,
+                pngPath = null,
+                paramsText = null,
+                isGenerating = true,
+                requestedByModel = requestedByModel
+            )
+        )
+        return id
+    }
+
+    private fun finishImageResult(
+        id: Long,
+        pngPath: String,
+        request: ImageRequest,
+        seed: Long,
+        elapsedMs: Long
+    ) {
+        val index = messages.indexOfFirst { it.id == id }
+        if (index < 0) return
+        val current = messages[index] as? ChatMessage.ImageResult ?: return
+        // A pinned seed keeps producing the same picture; a random one is
+        // surfaced as "last seed" so the user can pin it from the config page.
+        LlamaEngine.setLastImageSeed(applicationContext, seed)
+        messages[index] = current.copy(
+            pngPath = pngPath,
+            paramsText = ImageOutput.paramsText(
+                applicationContext, request.width, request.height, request.steps, request.cfg, seed
+            ),
+            isGenerating = false,
+            error = null,
+            elapsedMs = elapsedMs
+        )
+        submitMessages(scrollToEnd = true)
+        persistCurrentConversation()
+        refreshConversationList()
+        pruneUnusedImages()
+    }
+
+    /**
+     * Drops PNGs no conversation refers to any more (deleted chats, images
+     * pruned from history). Cheap enough to run after each picture; skipped
+     * while a generation may still be writing files.
+     */
+    private fun pruneUnusedImages() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            val referenced = ConversationStore.allImagePaths(applicationContext)
+            ImageOutput.pruneOrphans(applicationContext, referenced)
+        }
+    }
+
+    private fun failImageResult(id: Long, reason: String) {
+        val index = messages.indexOfFirst { it.id == id }
+        if (index < 0) return
+        val current = messages[index] as? ChatMessage.ImageResult ?: return
+        messages[index] = current.copy(isGenerating = false, error = reason)
+        submitMessages(scrollToEnd = true)
+        persistCurrentConversation()
+    }
+
+    // ------------------------------------------------------------------
+    // generate_image tool called by the language model
+    // ------------------------------------------------------------------
+
+    /** Image checkpoint the tool uses: the selected one, else the Q4 model. */
+    private fun imageModelForTool(): ModelInfo {
+        val selected = LlamaEngine.getSelectedModel(applicationContext)
+        if (selected.isImage) return selected
+        return ModelInfo.AVAILABLE_MODELS.firstOrNull { it.id == ModelInfo.DEFAULT_IMAGE_MODEL_ID }
+            ?: ModelInfo.AVAILABLE_MODELS.first { it.isImage }
+    }
+
+    /**
+     * Runs the image engine for a tool call the model made inside [aiMsgId].
+     *
+     * The turnaround is: download the checkpoint if needed (progress stays on
+     * the assistant bubble) -> free the chat model when it does not fit ->
+     * draw the picture as a new ImageResult -> reload the chat model and feed
+     * the result back so the model can close the answer.
+     */
+    private suspend fun runImageGenerationForTool(
+        aiMsgId: Long,
+        call: ImageTool.Call
+    ): Boolean {
+        val ctx = applicationContext
+        val imageModel = imageModelForTool()
+        val prompt = call.prompt
+        val resultId = addImageResultPlaceholder(prompt, requestedByModel = true)
+        submitMessages(scrollToEnd = true)
+
+        val startNs = SystemClock.elapsedRealtime()
+        val request = currentImageRequest(prompt, imageModel)
+        val outFile = ImageOutput.newOutputFile(ctx)
+        // The stream that produced this call still owns the llama context; it
+        // has to stop before the image stack can take the NPU (and before the
+        // chat model may be unloaded).
+        cancelActiveGeneration()
+        val imageEngine = try {
+            prepareImageEngine(imageModel, aiMsgId)
+        } catch (e: Exception) {
+            Log.e(TAG, "Image tool: preparation failed", e)
+            null
+        }
+        if (imageEngine == null) {
+            if (messages.any { it.id == aiMsgId }) {
+                failImageResult(resultId, getString(R.string.image_generate_failed))
+            }
+            return false
+        }
+        if (!messages.any { it.id == aiMsgId }) return false
+
+        updateAiStatus(aiMsgId, getString(R.string.tool_generating_image, prompt))
+        val usedSeed = withContext(Dispatchers.IO) {
+            imageEngine.generate(
+                prompt = request.prompt,
+                negativePrompt = request.negativePrompt,
+                width = request.width,
+                height = request.height,
+                steps = request.steps,
+                cfg = request.cfg,
+                seed = request.seed,
+                outputPath = outFile.absolutePath
+            )
+        }
+        if (usedSeed == null) {
+            failImageResult(resultId, imageEngine.lastError ?: getString(R.string.image_generate_failed))
+            return false
+        }
+        finishImageResult(resultId, outFile.absolutePath, request, usedSeed, (SystemClock.elapsedRealtime() - startNs))
+        updateAiStatus(aiMsgId, getString(R.string.tool_image_done))
+
+        // Give the model its turn back so it can answer around the picture.
+        if (!isModelReady) {
+            if (!reloadChatModel()) {
+                appendAiText(
+                    aiMsgId,
+                    getString(R.string.tool_image_done_no_reply)
+                )
+                updateAiStatus(aiMsgId, null)
+                return true
+            }
+        }
+        val reply = ImageTool.formatImageReply(prompt, outFile.name)
+        appendAiText(aiMsgId, reply, isGenerating = true)
+        streamChatContinuation(aiMsgId)
+        return true
+    }
+
+    /** Reloads the chat model after the image stack freed its memory. */
+    private suspend fun reloadChatModel(): Boolean {
+        if (!::engine.isInitialized) return false
+        val ctx = applicationContext
+        val model = LlamaEngine.getSelectedModel(ctx)
+        if (!LlamaEngine.modelsExist(ctx, model)) return false
+        return try {
+            val mmproj = if (!model.isTextOnly) LlamaEngine.mmprojPath(ctx)?.takeIf { File(it).exists() } else null
+            engine.loadModel(LlamaEngine.modelPath(ctx), mmproj)
+            engine.setSystemPrompt(chatSystemPrompt())
+            // The lazy reload starts from an empty context: replay the
+            // conversation (minus the turn being answered) so follow-ups and
+            // the image acknowledgement stay in context.
+            restoreHistoryForCurrentConversation()
+            isModelReady = true
+            loadedModelId = model.id
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to reload the chat model after image generation", e)
+            isModelReady = false
+            loadedModelId = null
+            false
+        }
+    }
+
+    /** Streams the model's follow-up message into [aiMsgId]. */
+    private fun streamChatContinuation(aiMsgId: Long) {
+        generationJob = lifecycleScope.launch(Dispatchers.Default) {
+            val tokens = runCatching { engine.sendUserPrompt("(continue)", predictLength = 256) }
+                .getOrElse { error ->
+                    Log.e(TAG, "Continuation failed", error)
+                    withContext(Dispatchers.Main) { updateAiStatus(aiMsgId, null) }
+                    return@launch
+                }
+            val text = StringBuilder()
+            tokens
+                .onCompletion { _ ->
+                    withContext(Dispatchers.Main) {
+                        updateAiStatus(aiMsgId, null)
+                        setAiText(aiMsgId, text.toString(), isGenerating = false)
+                        enableInput(true)
+                        persistCurrentConversation()
+                        refreshConversationList()
+                    }
+                }
+                .collect { token ->
+                    text.append(token)
+                    withContext(Dispatchers.Main) {
+                        setAiText(aiMsgId, text.toString(), isGenerating = true)
+                    }
+                }
+        }
+    }
+
+    // ---- small helpers used by both paths -----------------------------
+
+    private fun submitMessages(scrollToEnd: Boolean) {
+        chatAdapter.submitList(messages.toList()) {
+            if (scrollToEnd) followStreamingIfAtBottom()
+        }
+    }
+
+    /** Replaces the AI message's text (used by status and continuation paths). */
+    private fun setAiText(id: Long, text: String, isGenerating: Boolean) {
+        val index = messages.indexOfFirst { it.id == id }
+        if (index < 0) return
+        val current = messages[index] as? ChatMessage.AiMessage ?: return
+        messages[index] = current.copy(text = text, isGenerating = isGenerating)
+        if (isGenerating) {
+            chatAdapter.updateStreamingText(id, text)
+        } else {
+            chatAdapter.submitList(messages.toList())
+        }
+    }
+
+    /** Appends to the assistant text and pushes it to the bound holder. */
+    private fun appendAiText(id: Long, extra: String, isGenerating: Boolean = false) {
+        val index = messages.indexOfFirst { it.id == id }
+        if (index < 0) return
+        val current = messages[index] as? ChatMessage.AiMessage ?: return
+        val text = if (current.text.isBlank()) extra else current.text.trimEnd() + "\n\n" + extra
+        messages[index] = current.copy(text = text, isGenerating = isGenerating)
+        chatAdapter.updateStreamingText(id, text)
+        if (!isGenerating) chatAdapter.submitList(messages.toList())
+    }
+
+    /** Shows (or clears, with null) the display-only status line of a bubble. */
+    private fun updateAiStatus(id: Long, status: String?) {
+        val index = messages.indexOfFirst { it.id == id }
+        if (index < 0) return
+        val current = messages[index] as? ChatMessage.AiMessage ?: return
+        if (current.status == status) return
+        messages[index] = current.copy(status = status)
+        chatAdapter.submitList(messages.toList()) {
+            if (status != null) followStreamingIfAtBottom()
+        }
+    }
+
     private fun refreshThinkButton() {
         val on = LlamaEngine.getEnableThinking(this)
         btnThink.isChecked = on
@@ -730,7 +1364,10 @@ class MainActivity : AppCompatActivity() {
     private fun refreshWelcomeCard(isTextOnly: Boolean) {
         val welcomeIndex = messages.indexOfFirst { it is ChatMessage.WelcomeCard }
         if (welcomeIndex >= 0) {
-            messages[welcomeIndex] = ChatMessage.WelcomeCard(isTextOnly = isTextOnly)
+            messages[welcomeIndex] = ChatMessage.WelcomeCard(
+                isTextOnly = isTextOnly,
+                isImageMode = isImageMode()
+            )
             chatAdapter.submitList(messages.toList())
         }
     }
@@ -762,6 +1399,7 @@ class MainActivity : AppCompatActivity() {
             try {
                 val mmprojArg = if (mmprojFile != null && mmprojFile.exists()) mmprojFile.absolutePath else null
                 engine.loadModel(ggufFile.absolutePath, mmprojArg)
+                engine.setSystemPrompt(chatSystemPrompt())
                 loadedModelId = model.id
             } catch (e: Exception) {
                 Log.e(TAG, "Error loading model", e)
@@ -1082,6 +1720,10 @@ class MainActivity : AppCompatActivity() {
         }
 
         val selected = LlamaEngine.getSelectedModel(applicationContext)
+        if (selected.isImage && isImageMode()) {
+            beginImageGeneration(userMsg)
+            return
+        }
         // A changed memory budget is only consumed while loading the model, so
         // force one reload on the next request instead of reusing the old one.
         val budgetReload = LlamaEngine.consumeRuntimeReloadPending(applicationContext)
@@ -1339,6 +1981,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 val mmprojArg = mmprojFile?.takeIf { it.exists() }?.absolutePath
                 engine.loadModel(ggufFile.absolutePath, mmprojArg)
+                engine.setSystemPrompt(chatSystemPrompt())
 
                 // The lazy (re)load starts from an empty context. Replay the
                 // saved turns so follow-up messages keep the conversation
@@ -1453,7 +2096,8 @@ class MainActivity : AppCompatActivity() {
         generationJob = lifecycleScope.launch(Dispatchers.Default) {
             val inferenceStartNs = System.nanoTime()
             if (resetStatsForTextOnlyTurn) engine.resetPerformanceStats()
-            val fullResponse = StringBuilder()
+            var fullResponse = StringBuilder()
+            var toolInvoked = false
             engine.sendUserPrompt(userMsg)
                 .onCompletion { cause ->
                     withContext(NonCancellable) {
@@ -1528,6 +2172,36 @@ class MainActivity : AppCompatActivity() {
                     }
                     persistDuringStreaming()
                 }
+
+            // The model asked for a picture. The text so far is what it said
+            // before the call; from here on the image path owns this bubble.
+            val call = ImageTool.parse(fullResponse.toString())
+            if (call != null && LlamaEngine.isImageToolEnabled(applicationContext)) {
+                toolInvoked = true
+                val visible = ImageTool.strip(fullResponse.toString())
+                withContext(Dispatchers.Main) {
+                    setAiText(aiMsgId, visible, isGenerating = true)
+                    persistCurrentConversation()
+                }
+                val handled = withContext(Dispatchers.Main) {
+                    runImageGenerationForTool(aiMsgId, call)
+                }
+                if (handled) return@launch
+                // The request could not be served (cancelled, failed): fall
+                // through and close the bubble with an explanation.
+                withContext(Dispatchers.Main) {
+                    appendAiText(aiMsgId, getString(R.string.tool_image_failed, ""))
+                    updateAiStatus(aiMsgId, null)
+                }
+            }
+            if (!toolInvoked) {
+                // Any stray protocol text must never reach the screen.
+                val raw = fullResponse.toString()
+                val clean = ImageTool.strip(raw)
+                if (clean != raw) {
+                    withContext(Dispatchers.Main) { setAiText(aiMsgId, clean, isGenerating = false) }
+                }
+            }
         }
     }
 
@@ -1562,12 +2236,35 @@ class MainActivity : AppCompatActivity() {
             finish()
             return
         }
-        if (shouldRedirectToImage()) {
-            startActivity(Intent(this, ImageActivity::class.java))
-            finish()
-            return
-        }
         if (!::engine.isInitialized) return
+        // The image model / generation parameters may have changed in the
+        // configuration page while we were in the background.
+        if (loadedImageModelId != null &&
+            loadedImageModelId != LlamaEngine.getSelectedModel(applicationContext).id
+        ) {
+            releaseImageEngine()
+        }
+        refreshImageModeUi()
+        // The generate_image toggle changes the system prompt, which is only
+        // read when a model is loaded: drop the resident model so the next
+        // request picks the new prompt up.
+        if (isModelReady && loadedModelId != null &&
+            loadedModelId == LlamaEngine.getSelectedModel(applicationContext).id
+        ) {
+            val appliedTool = lastSystemPromptHadImageTool
+            if (appliedTool != null && appliedTool != LlamaEngine.isImageToolEnabled(applicationContext)) {
+                lifecycleScope.launch {
+                    runCatching { engine.unloadModel() }
+                    isModelReady = false
+                    loadedModelId = null
+                    Toast.makeText(
+                        this@MainActivity,
+                        R.string.config_reload_for_prompt,
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        }
         // Selection is lazy: a model switch (here or on the model manager page)
         // only updates the title/selection.  The engine keeps whatever model it
         // currently has until the next request, which then unloads + loads the
@@ -1606,6 +2303,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStop() {
         generationJob?.cancel()
+        imageJob?.cancel()
         persistCurrentConversation()
         super.onStop()
     }
@@ -1621,5 +2319,7 @@ class MainActivity : AppCompatActivity() {
         private val TAG = MainActivity::class.java.simpleName
         private const val STREAM_PERSIST_INTERVAL_MS = 1000L
         private const val STATE_CURRENT_CONVERSATION = "state_current_conversation"
+        private const val KEY_IMAGE_PROMPTS = "recent_image_prompts"
+        private const val MAX_IMAGE_PROMPTS = 10
     }
 }

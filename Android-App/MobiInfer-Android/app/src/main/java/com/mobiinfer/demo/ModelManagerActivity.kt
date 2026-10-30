@@ -23,6 +23,8 @@ import androidx.lifecycle.repeatOnLifecycle
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.button.MaterialButton
+import com.google.android.material.button.MaterialButtonToggleGroup
+import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.materialswitch.MaterialSwitch
 import com.google.android.material.slider.Slider
 import kotlinx.coroutines.Dispatchers
@@ -32,11 +34,17 @@ import java.io.File
 import kotlin.math.roundToInt
 
 /**
- * Model download centre.  This page no longer selects/loads models for
- * inference: selection is shared with the home page (same persisted
- * `selectedModelId`) and loading happens lazily on the home page when the user
- * sends a request.  Here users only decide whether to download / pause / resume
- * / delete each model, plus the advanced settings (image scale, memory budget).
+ * Configuration page for both model families.
+ *
+ * A segmented switch at the top selects the family:
+ *  - "Language": chat/VLM checkpoints plus their runtime settings (context
+ *    size, memory budget, image scale, debug logs);
+ *  - "Image": text-to-image checkpoints plus the generation parameters
+ *    (size, steps, CFG, negative prompt) that used to live on a dedicated
+ *    screen.
+ *
+ * Selection is shared with the home page (same persisted `selectedModelId`);
+ * nothing is loaded here - the home page loads lazily on the first request.
  */
 class ModelManagerActivity : AppCompatActivity() {
 
@@ -49,6 +57,12 @@ class ModelManagerActivity : AppCompatActivity() {
 
     private var lastRunningModelId: String? = null
     private var pendingDownloadModelId: String? = null
+
+    // Which family the page is showing. Persisted so a return visit lands on
+    // the same tab the user left.
+    private var imageMode = false
+    private var sliderImageWidth: Slider? = null
+    private var sliderImageHeight: Slider? = null
 
     private val notificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -78,6 +92,16 @@ class ModelManagerActivity : AppCompatActivity() {
         val toolbar = findViewById<Toolbar>(R.id.toolbar)
         toolbar.setNavigationOnClickListener { finish() }
 
+        val toggle = findViewById<MaterialButtonToggleGroup>(R.id.toggle_config_mode)
+        toggle.addOnButtonCheckedListener { _, checkedId, isChecked ->
+            if (!isChecked) return@addOnButtonCheckedListener
+            val target = checkedId == R.id.btn_mode_image
+            if (target != imageMode) {
+                imageMode = target
+                applyMode()
+            }
+        }
+
         recyclerModels = findViewById(R.id.recycler_models)
         sliderImageScale = findViewById(R.id.slider_image_scale)
         tvImageScaleValue = findViewById(R.id.tv_image_scale_value)
@@ -88,7 +112,12 @@ class ModelManagerActivity : AppCompatActivity() {
         setupImageScale()
         setupMemoryBudget()
         setupContextSize()
+        setupImageParameters()
         setupDebugLogs()
+
+        imageMode = readStoredMode()
+        toggle.check(if (imageMode) R.id.btn_mode_image else R.id.btn_mode_llm)
+        applyMode()
         refreshStates()
         observeDownloads()
     }
@@ -185,11 +214,20 @@ class ModelManagerActivity : AppCompatActivity() {
         }
     }
 
+    /** Models belonging to the family currently shown. */
+    private fun modelsForMode(): List<ModelInfo> =
+        ModelInfo.AVAILABLE_MODELS.filter { it.isImage == imageMode }
+
+    /** Selected model of the currently shown family, if any. */
+    private fun selectedModelForMode(): ModelInfo? {
+        val selected = LlamaEngine.getSelectedModel(this)
+        return if (selected.isImage == imageMode) selected else null
+    }
+
     private fun setupModelList() {
-        val selectedModel = LlamaEngine.getSelectedModel(this)
         modelAdapter = ModelAdapter(
-            models = ModelInfo.AVAILABLE_MODELS,
-            selectedModelId = selectedModel.id,
+            models = modelsForMode(),
+            selectedModelId = selectedModelForMode()?.id ?: "",
             onModelSelected = { model ->
                 LlamaEngine.setSelectedModel(this, model.id)
                 updateMemoryBudgetVisibility()
@@ -214,19 +252,236 @@ class ModelManagerActivity : AppCompatActivity() {
         recyclerModels.layoutManager = LinearLayoutManager(this)
         recyclerModels.adapter = modelAdapter
         // The list lives inside a ScrollView; a wrap_content RecyclerView there
-        // measures against the viewport height and clips the last row(s). Force
-        // it to expand to its full content height instead.
+        // measures against the viewport height and clips the last row(s). A
+        // small unaveraged adapter keeps that from happening in the first
+        // place, so the explicit height freeze is enough.
         recyclerModels.isNestedScrollingEnabled = false
-        recyclerModels.post {
-            val lp = recyclerModels.layoutParams
-            recyclerModels.measure(
-                View.MeasureSpec.makeMeasureSpec(recyclerModels.width, View.MeasureSpec.EXACTLY),
-                View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
-            )
-            lp.height = recyclerModels.measuredHeight
-            recyclerModels.layoutParams = lp
+        recyclerModels.setHasFixedSize(false)
+    }
+
+    /** Swap the list content when the language/image switch changes. */
+    private fun rebuildModelList() {
+        val selected = LlamaEngine.getSelectedModel(this)
+        modelAdapter = ModelAdapter(
+            models = modelsForMode(),
+            selectedModelId = selectedModelForMode()?.id ?: "",
+            onModelSelected = { model ->
+                LlamaEngine.setSelectedModel(this, model.id)
+                updateMemoryBudgetVisibility()
+                if (!LlamaEngine.modelsExist(this, model)) {
+                    Toast.makeText(this, R.string.model_not_downloaded_hint, Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(
+                        this,
+                        getString(R.string.model_switched_lazy, model.displayName),
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            },
+            onDownload = { model -> requestDownload(model) },
+            onPause = { ModelDownloadService.pause(this) },
+            onResume = { model -> requestDownload(model) },
+            onDelete = { model -> confirmDelete(model) }
+        )
+        recyclerModels.adapter = modelAdapter
+        // The running id may belong to the other family.
+        modelAdapter.setProgressTarget(ModelDownloadController.runningModelId())
+        refreshStates()
+    }
+
+    // ------------------------------------------------------------------
+    // Language / image switch
+    // ------------------------------------------------------------------
+
+    private fun modePrefs() = getSharedPreferences("config_page_prefs", MODE_PRIVATE)
+
+    private fun readStoredMode(): Boolean = modePrefs().getBoolean(KEY_CONFIG_MODE_IMAGE, false)
+
+    /** Shows the groups and list rows that belong to the selected family. */
+    private fun applyMode() {
+        modePrefs().edit().putBoolean(KEY_CONFIG_MODE_IMAGE, imageMode).apply()
+        findViewById<View>(R.id.group_llm_settings).visibility =
+            if (imageMode) View.GONE else View.VISIBLE
+        findViewById<View>(R.id.group_image_settings).visibility =
+            if (imageMode) View.VISIBLE else View.GONE
+        rebuildModelList()
+        refreshImageParameters()
+    }
+
+    // ------------------------------------------------------------------
+    // Text-to-image generation parameters
+    // ------------------------------------------------------------------
+
+    private fun setupImageParameters() {
+        val width = findViewById<Slider>(R.id.slider_image_width)
+        val height = findViewById<Slider>(R.id.slider_image_height)
+        sliderImageWidth = width
+        sliderImageHeight = height
+
+        width.valueFrom = LlamaEngine.MIN_IMAGE_GEN_SIDE.toFloat()
+        width.valueTo = LlamaEngine.MAX_IMAGE_GEN_SIDE.toFloat()
+        width.stepSize = LlamaEngine.IMAGE_GEN_SIDE_STEP.toFloat()
+        height.valueFrom = LlamaEngine.MIN_IMAGE_GEN_SIDE.toFloat()
+        height.valueTo = LlamaEngine.MAX_IMAGE_GEN_SIDE.toFloat()
+        height.stepSize = LlamaEngine.IMAGE_GEN_SIDE_STEP.toFloat()
+        refreshImageParameters()
+
+        width.addOnChangeListener { _, value, fromUser ->
+            // Keep the callback budget: the value is snapped to the 64 px
+            // grid before it is persisted, otherwise two sliders can be off
+            // by an unsupported odd size.
+            if (!fromUser) return@addOnChangeListener
+            val px = snapSide(value)
+            LlamaEngine.setImageGenWidth(this, px)
+            updateImageSizeLabel()
+        }
+        height.addOnChangeListener { _, value, fromUser ->
+            if (!fromUser) return@addOnChangeListener
+            val px = snapSide(value)
+            LlamaEngine.setImageGenHeight(this, px)
+            updateImageSizeLabel()
+        }
+
+        val steps = findViewById<Slider>(R.id.slider_image_steps)
+        val stepsLabel = findViewById<TextView>(R.id.tv_image_steps_value)
+        steps.valueFrom = LlamaEngine.MIN_IMAGE_GEN_STEPS.toFloat()
+        steps.valueTo = LlamaEngine.MAX_IMAGE_GEN_STEPS.toFloat()
+        steps.stepSize = 1f
+        steps.value = LlamaEngine.getImageGenSteps(this).toFloat()
+        stepsLabel.text = LlamaEngine.getImageGenSteps(this).toString()
+        steps.addOnChangeListener { _, value, fromUser ->
+            val n = value.roundToInt()
+            stepsLabel.text = n.toString()
+            if (fromUser) LlamaEngine.setImageGenSteps(this, n)
+        }
+
+        val cfg = findViewById<Slider>(R.id.slider_image_cfg)
+        val cfgLabel = findViewById<TextView>(R.id.tv_image_cfg_value)
+        cfg.valueFrom = 1.0f
+        cfg.valueTo = 10.0f
+        cfg.stepSize = 0.1f
+        cfg.value = LlamaEngine.getImageGenCfg(this)
+        cfgLabel.text = formatCfg(LlamaEngine.getImageGenCfg(this))
+        cfg.addOnChangeListener { _, value, fromUser ->
+            cfgLabel.text = formatCfg(value)
+            if (fromUser) LlamaEngine.setImageGenCfg(this, value)
+        }
+
+        val negative = findViewById<TextInputEditText>(R.id.et_image_negative)
+        negative.setText(LlamaEngine.getImageNegativePrompt(this))
+        negative.setSelection(negative.text?.length ?: 0)
+        negative.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
+            override fun afterTextChanged(s: android.text.Editable?) {
+                LlamaEngine.setImageNegativePrompt(this@ModelManagerActivity, s?.toString().orEmpty())
+            }
+        })
+
+        // Seed: empty field means "random every time" (-1). A number pins the
+        // sampler so the same prompt reproduces the same picture.
+        val seed = findViewById<TextInputEditText>(R.id.et_image_seed)
+        seed.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
+            override fun afterTextChanged(s: android.text.Editable?) {
+                val text = s?.toString()?.trim().orEmpty()
+                if (text.isEmpty()) {
+                    LlamaEngine.setImageGenSeed(this@ModelManagerActivity, LlamaEngine.RANDOM_IMAGE_SEED)
+                } else {
+                    text.toLongOrNull()?.let { LlamaEngine.setImageGenSeed(this@ModelManagerActivity, it) }
+                }
+                updateSeedHint()
+            }
+        })
+        findViewById<MaterialButton>(R.id.btn_image_seed_random).setOnClickListener {
+            seed.setText("")
+            LlamaEngine.setImageGenSeed(this, LlamaEngine.RANDOM_IMAGE_SEED)
+            updateSeedHint()
+        }
+        findViewById<MaterialButton>(R.id.btn_image_seed_last).setOnClickListener {
+            val last = LlamaEngine.getLastImageSeed(this)
+            if (last >= 0) {
+                seed.setText(last.toString())
+                seed.setSelection(seed.text?.length ?: 0)
+                LlamaEngine.setImageGenSeed(this, last)
+                updateSeedHint()
+            }
+        }
+
+        // generate_image tool toggle: takes effect when the chat model reloads
+        // (see MainActivity.onResume).
+        val toolSwitch = findViewById<MaterialSwitch>(R.id.switch_image_tool)
+        toolSwitch.isChecked = LlamaEngine.isImageToolEnabled(this)
+        toolSwitch.setOnCheckedChangeListener { _, enabled ->
+            LlamaEngine.setImageToolEnabled(this, enabled)
+        }
+
+        findViewById<MaterialButton>(R.id.btn_image_reset).setOnClickListener {
+            LlamaEngine.setImageGenWidth(this, LlamaEngine.DEFAULT_IMAGE_GEN_SIDE)
+            LlamaEngine.setImageGenHeight(this, LlamaEngine.DEFAULT_IMAGE_GEN_SIDE)
+            LlamaEngine.setImageGenSteps(this, LlamaEngine.DEFAULT_IMAGE_GEN_STEPS)
+            LlamaEngine.setImageGenCfg(this, LlamaEngine.DEFAULT_IMAGE_GEN_CFG)
+            LlamaEngine.setImageNegativePrompt(this, "")
+            LlamaEngine.setImageGenSeed(this, LlamaEngine.RANDOM_IMAGE_SEED)
+            refreshImageParameters()
+            Toast.makeText(this, R.string.image_param_saved, Toast.LENGTH_SHORT).show()
         }
     }
+
+    /** Explains what the seed field currently does, and offers the last one. */
+    private fun updateSeedHint() {
+        val fixed = LlamaEngine.getImageGenSeed(this) != LlamaEngine.RANDOM_IMAGE_SEED
+        val last = LlamaEngine.getLastImageSeed(this)
+        findViewById<TextView>(R.id.tv_image_seed_hint).setText(
+            if (fixed) R.string.image_param_seed_fixed else R.string.image_param_seed_random
+        )
+        val useLast = findViewById<MaterialButton>(R.id.btn_image_seed_last)
+        useLast.visibility = if (!fixed && last >= 0) View.VISIBLE else View.GONE
+        useLast.text = getString(R.string.image_param_seed_use_last, last)
+    }
+
+    private fun refreshImageParameters() {
+        val w = LlamaEngine.getImageGenWidth(this)
+        val h = LlamaEngine.getImageGenHeight(this)
+        sliderImageWidth?.value = w.toFloat()
+        sliderImageHeight?.value = h.toFloat()
+        findViewById<TextView>(R.id.tv_image_steps_value).text =
+            LlamaEngine.getImageGenSteps(this).toString()
+        val cfg = LlamaEngine.getImageGenCfg(this)
+        findViewById<TextView>(R.id.tv_image_cfg_value).text = formatCfg(cfg)
+        findViewById<Slider>(R.id.slider_image_steps).value = LlamaEngine.getImageGenSteps(this).toFloat()
+        findViewById<Slider>(R.id.slider_image_cfg).value = cfg
+        // Only rewrite the field when it would actually change, so refreshing
+        // (e.g. after a reset) does not jump the caret around.
+        val seedValue = LlamaEngine.getImageGenSeed(this)
+        val seedField = findViewById<TextInputEditText>(R.id.et_image_seed)
+        val seedText = if (seedValue == LlamaEngine.RANDOM_IMAGE_SEED) "" else seedValue.toString()
+        if (seedField.text?.toString() != seedText) seedField.setText(seedText)
+        updateSeedHint()
+        val negativeField = findViewById<TextInputEditText>(R.id.et_image_negative)
+        val negativeValue = LlamaEngine.getImageNegativePrompt(this)
+        if (negativeField.text?.toString() != negativeValue) {
+            negativeField.setText(negativeValue)
+        }
+        updateImageSizeLabel()
+    }
+
+    private fun updateImageSizeLabel() {
+        val w = sliderImageWidth?.value?.let { snapSide(it) } ?: LlamaEngine.getImageGenWidth(this)
+        val h = sliderImageHeight?.value?.let { snapSide(it) } ?: LlamaEngine.getImageGenHeight(this)
+        findViewById<TextView>(R.id.tv_image_size_value).text =
+            getString(R.string.image_param_size_value, w, h)
+    }
+
+    private fun snapSide(value: Float): Int {
+        val step = LlamaEngine.IMAGE_GEN_SIDE_STEP
+        val snapped = (value / step).roundToInt() * step
+        return snapped.coerceIn(LlamaEngine.MIN_IMAGE_GEN_SIDE, LlamaEngine.MAX_IMAGE_GEN_SIDE)
+    }
+
+    private fun formatCfg(value: Float): String =
+        String.format(java.util.Locale.getDefault(), "%.1f", value)
 
     private fun fractionOf(model: ModelInfo): Float {
         if (model.totalBytes <= 0L) return 0f
@@ -237,7 +492,7 @@ class ModelManagerActivity : AppCompatActivity() {
     private fun refreshStates() {
         val runningId = ModelDownloadController.runningModelId()
         val running = ModelDownloadController.status.value as? ModelDownloadController.Status.Running
-        val states = ModelInfo.AVAILABLE_MODELS.associate { model ->
+        val states = modelsForMode().associate { model ->
             val ui = when {
                 runningId == model.id ->
                     ModelRowUi(ModelRowState.DOWNLOADING, running?.fraction ?: 0f, running?.message)
@@ -363,12 +618,13 @@ class ModelManagerActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         // Selection may have changed on the home page.
-        modelAdapter.updateSelection(LlamaEngine.getSelectedModel(this).id)
+        modelAdapter.updateSelection(selectedModelForMode()?.id ?: "")
         updateMemoryBudgetVisibility()
         refreshStates()
     }
 
     companion object {
         private val TAG = ModelManagerActivity::class.java.simpleName
+        private const val KEY_CONFIG_MODE_IMAGE = "config_mode_image"
     }
 }

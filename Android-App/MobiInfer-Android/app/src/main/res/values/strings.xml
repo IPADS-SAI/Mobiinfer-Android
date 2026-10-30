@@ -251,24 +251,72 @@
     <string name="debug_logs_unavailable">当前版本不包含调试日志查看器</string>
 
     <!-- Text-to-image (stable-diffusion.cpp) -->
-    <string name="image_title">文生图 (Stable Diffusion)</string>
-    <string name="image_header_subtitle">输入提示词，在本地生成图片</string>
-    <string name="image_prompt_hint">提示词</string>
-    <string name="image_negative_hint">反向提示词（可选）</string>
-    <string name="image_width_hint">宽</string>
-    <string name="image_height_hint">高</string>
-    <string name="image_steps_hint">步数</string>
-    <string name="image_cfg_hint">CFG</string>
-    <string name="image_seed_hint">种子 (-1 随机)</string>
     <string name="image_result_desc">生成结果</string>
-    <string name="image_loading_model">正在加载模型…</string>
-    <string name="image_generate">生成图片</string>
     <string name="image_generating">正在生成图片…</string>
-    <string name="image_prompt_empty">请输入提示词</string>
     <string name="image_generate_failed">图片生成失败</string>
     <string name="image_error">错误: %1$s</string>
-    <string name="image_download_prompt_title">模型未下载</string>
-    <string name="image_model_missing">尚未下载文生图模型，请先在模型管理中下载。</string>
     <string name="model_desc_moss_fp16">MOSS-Image 文生图，FP16 8 步（画质最佳，约 16GB）</string>
     <string name="model_desc_moss_q4">MOSS-Image 文生图，Q4 8 步（更小更快，约 9GB）</string>
+
+    <!-- Text-to-image UI -->
+    <string name="t2i_toggle">文生图</string>
+    <string name="t2i_prompt_download">尚未下载文生图模型，请先在模型配置中下载并选择。</string>
+    <string name="t2i_mode_hint">文生图模式</string>
+    <string name="welcome_title_image">开始创作图片</string>
+    <string name="welcome_desc_image">输入一句描述，模型会在本机直接生成图片；尺寸、步数等参数可在模型配置中调整。</string>
+    <string name="suggestion_image_1">一只在月球上漫步的橘猫，写实风格</string>
+    <string name="suggestion_image_2">江南水乡的清晨，水墨画风格</string>
+    <string name="image_result_params">%1$d × %2$d · %3$d 步 · CFG %4$s · 种子 %5$d</string>
+    <string name="image_result_elapsed">耗时 %1$s</string>
+
+    <!-- Model manager: mode switch and text-to-image settings -->
+    <string name="config_page_title">模型配置</string>
+    <string name="config_tab_llm">大模型</string>
+    <string name="config_tab_image">文生图</string>
+    <string name="config_section_downloadable">可下载模型</string>
+    <string name="config_section_settings">配置</string>
+    <string name="config_section_parameters">生成参数</string>
+    <string name="image_param_size">尺寸</string>
+    <string name="image_param_size_value">%1$d × %2$d</string>
+    <string name="image_param_steps">步数</string>
+    <string name="image_param_cfg">CFG</string>
+    <string name="image_param_negative">反向提示词</string>
+    <string name="image_param_negative_hint">留空则使用模型默认值</string>
+    <string name="image_param_reset">恢复默认值</string>
+    <string name="image_param_saved">已保存</string>
+    <string name="image_model_none">尚未选择文生图模型</string>
+
+    <!-- Image viewer and gallery export -->
+    <string name="image_result_hint">点击查看大图</string>
+    <string name="image_loading">载入中…</string>
+    <string name="image_missing">图片文件已不存在</string>
+    <string name="image_save">保存到相册</string>
+    <string name="image_share">分享</string>
+    <string name="image_share_title">分享图片</string>
+    <string name="image_save_title">保存图片</string>
+    <string name="image_save_message">图片将保存到系统相册的 MobiInfer 目录。</string>
+    <string name="image_save_confirm">保存</string>
+    <string name="image_save_done_title">已保存</string>
+    <string name="image_save_done">图片已保存到相册。</string>
+    <string name="image_save_failed">保存失败</string>
+    <string name="image_save_permission_needed">需要存储权限才能保存到相册</string>
+    <string name="image_open_gallery">打开</string>
+
+    <!-- generate_image tool -->
+    <string name="tool_generating_image">正在生成图片：%1$s</string>
+    <string name="tool_image_done">图片已生成</string>
+    <string name="tool_download_image_model">正在下载文生图模型（%1$s），完成后会自动生成…</string>
+    <string name="tool_image_failed">图片生成失败：%1$s</string>
+    <string name="tool_unloading_model">内存不足，正在卸载语言模型以加载文生图模型…</string>
+    <string name="tool_image_done_no_reply">图片已生成，但继续对话需要重新加载语言模型。</string>
+    <string name="config_image_tool_title">允许聊天模型生成图片</string>
+    <string name="config_image_tool_description">在系统提示中加入 generate_image 工具：聊天时模型可以直接调用文生图；若模型未下载会自动下载（默认 Q4）。</string>
+    <string name="image_param_seed">种子</string>
+    <string name="image_param_seed_random">随机（每个提示词都不一样）</string>
+    <string name="image_param_seed_fixed">固定种子，可复现同一张图</string>
+    <string name="image_param_seed_random_action">改为随机</string>
+    <string name="image_param_seed_use_last">使用上一张的种子 %1$d</string>
+    <string name="image_result_seed">种子 %1$d</string>
+    <string name="config_reload_for_prompt">已切换生成图片工具，语言模型将在下次对话时重新加载。</string>
+    <string name="tool_download_image_model_short">正在下载文生图模型 %1$s</string>
 </resources>

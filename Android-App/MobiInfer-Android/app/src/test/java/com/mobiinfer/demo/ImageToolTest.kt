@@ -1,0 +1,117 @@
+package com.mobiinfer.demo.imagegen
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class ImageToolTest {
+
+    private fun call(prompt: String) =
+        """${ImageTool.OPEN}{"name":"generate_image","arguments":{"prompt":"$prompt"}}${ImageTool.CLOSE}"""
+
+    @Test
+    fun parsesTaggedCall() {
+        val text = "Sure! ${call("a cat on the moon")}"
+        val parsed = ImageTool.parse(text)
+        assertEquals("a cat on the moon", parsed?.prompt)
+        assertEquals("Sure!", ImageTool.strip(text))
+    }
+
+    @Test
+    fun parsesCallWithoutClosingTag() {
+        val text = """<tool_call>{"name":"generate_image","arguments":{"prompt":"red kite"}}"""
+        assertEquals("red kite", ImageTool.parse(text)?.prompt)
+    }
+
+    @Test
+    fun parsesBareJsonAndNestedArgsObject() {
+        val text = """{"name": "generate_image", "arguments": "{\"prompt\":\"harbour at dusk\"}"}"""
+        // Arguments given as a JSON string are not something the protocol
+        // promises, but the fallback must at least not throw.
+        assertTrue(ImageTool.parse(text) == null || ImageTool.parse(text)!!.prompt.isNotBlank())
+    }
+
+    @Test
+    fun rejectsCallsToOtherTools() {
+        val text = """<tool_call>{"name":"search","arguments":{"prompt":"x"}}</tool_call>"""
+        assertNull(ImageTool.parse(text))
+    }
+
+    @Test
+    fun rejectsCallsWithoutPrompt() {
+        val text = """<tool_call>{"name":"generate_image","arguments":{"prompt":"  "}}</tool_call>"""
+        assertNull(ImageTool.parse(text))
+    }
+
+    @Test
+    fun plainTextHasNoCall() {
+        assertNull(ImageTool.parse("A picture of a cat would look like this."))
+        assertEquals("no tools here", ImageTool.strip("no tools here"))
+    }
+
+    @Test
+    fun partialCallIsDetected() {
+        assertTrue(ImageTool.isPartialCall("""<tool_call>{"name":"generate_image","argu"""))
+        assertFalse(ImageTool.isPartialCall(call("done")))
+        assertFalse(ImageTool.isPartialCall("plain"))
+    }
+
+    @Test
+    fun stripRemovesEverythingFromAnUnclosedCall() {
+        assertEquals("Look:", ImageTool.strip("Look: " + ImageTool.OPEN + "{\"name\":\"generate_image\""))
+    }
+
+    @Test
+    fun systemPromptSectionIsWellFormed() {
+        val section = ImageTool.systemPromptSection(512, 512, 8, 3.0f, null)
+        assertTrue(section.contains(ImageTool.NAME))
+        assertTrue(section.contains("512x512"))
+        assertTrue(section.contains("8 steps"))
+        assertTrue(section.contains(ImageTool.OPEN))
+    }
+
+    @Test
+    fun imageReplyFormattingKeepsThePrompt() {
+        val reply = ImageTool.formatImageReply("a dog", "image_1.png")
+        assertTrue(reply.contains("a dog"))
+        assertTrue(reply.contains("image_1.png"))
+    }
+
+    @Test
+    fun promptMarkerRoundTrips() {
+        val encoded = ImagePromptMarker.encode("a castle")
+        assertTrue(ImagePromptMarker.isImageTurn(encoded))
+        assertFalse(ImagePromptMarker.isImageTurn("a castle"))
+        assertEquals("a castle", ImagePromptMarker.strip(encoded))
+        assertEquals("a castle" to "[image generated: a castle]", ImagePromptMarker.forLlm(encoded))
+        assertNull(ImagePromptMarker.forLlm("plain question"))
+    }
+
+    @Test
+    fun toolSchemaIsWellFormed() {
+        val schema = SystemPrompts.toolSchema()
+        assertTrue(schema.startsWith("{\"type\":\"function\""))
+        assertTrue(schema.contains("\"name\":\"${ImageTool.NAME}\""))
+        assertTrue(schema.contains("\"required\":[\"prompt\"]"))
+        // Balanced braces: the schema is spliced into a template by hand.
+        assertEquals(schema.count { it == '{' }, schema.count { it == '}' })
+    }
+
+    @Test
+    fun templateSupportDetection() {
+        assertTrue(SystemPrompts.templateSupportsTools("{{ if tools }}{{ tools }}{{ endif }}"))
+        assertFalse(SystemPrompts.templateSupportsTools("{{ messages[0].content }}"))
+        assertFalse(SystemPrompts.templateSupportsTools(null))
+    }
+
+    @Test
+    fun systemMessageIncludesToolOnlyWhenEnabled() {
+        val withTool = SystemPrompts.systemMessage(true, true, 512, 512, 8, 3.0f)
+        val without = SystemPrompts.systemMessage(true, false, 512, 512, 8, 3.0f)
+        assertTrue(withTool.contains(ImageTool.NAME))
+        assertFalse(without.contains(ImageTool.NAME))
+        assertTrue(without.isNotBlank())
+    }
+}

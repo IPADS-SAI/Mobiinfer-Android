@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.util.Log
+import com.mobiinfer.demo.imagegen.ImagePromptMarker
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -205,7 +206,8 @@ object ConversationStore {
                                 imageBitmap = uri?.let { decodeBitmap(context, it) },
                                 imageInfo = o.optString("imageInfo", null),
                                 isVideo = o.optBoolean("isVideo", false),
-                                imageUri = uri
+                                imageUri = uri,
+                                isImagePrompt = o.optBoolean("isImagePrompt", false)
                             )
                         )
                     }
@@ -225,6 +227,22 @@ object ConversationStore {
                                 metrics = metrics
                             )
                         )
+                    }
+                    "image" -> {
+                        val pngPath = o.optString("pngPath", "").takeIf { it.isNotBlank() }
+                        // Drop results whose file was cleaned up so the cell
+                        // never shows a permanently blank frame.
+                        if (pngPath == null || File(pngPath).exists()) {
+                            out.add(
+                                ChatMessage.ImageResult(
+                                    id = o.getLong("id"),
+                                    prompt = o.optString("prompt", ""),
+                                    pngPath = pngPath,
+                                    paramsText = o.optString("params", "").takeIf { it.isNotBlank() },
+                                    elapsedMs = if (o.has("elapsedMs")) o.getLong("elapsedMs") else null
+                                )
+                            )
+                        }
                     }
                 }
             }
@@ -248,6 +266,7 @@ object ConversationStore {
                         m.imageInfo?.let { put("imageInfo", it) }
                         put("isVideo", m.isVideo)
                         m.imageUri?.let { put("imageUri", it) }
+                        if (m.isImagePrompt) put("isImagePrompt", true)
                     }
                 )
                 is ChatMessage.AiMessage -> {
@@ -271,6 +290,22 @@ object ConversationStore {
                         )
                     }
                 }
+                is ChatMessage.ImageResult -> {
+                    // Only persist finished results; an in-flight generation has
+                    // no file yet and would come back as a blank frame.
+                    if (!m.isGenerating && m.pngPath != null) {
+                        arr.put(
+                            JSONObject().apply {
+                                put("type", "image")
+                                put("id", m.id)
+                                put("prompt", m.prompt)
+                                put("pngPath", m.pngPath)
+                                m.paramsText?.let { put("params", it) }
+                                m.elapsedMs?.let { put("elapsedMs", it) }
+                            }
+                        )
+                    }
+                }
                 else -> Unit
             }
         }
@@ -279,7 +314,9 @@ object ConversationStore {
         // entries must never appear in the history list.
         val hasContent = messages.any { m ->
             (m is ChatMessage.UserMessage && (m.text.isNotBlank() || m.imageUri != null)) ||
-            (m is ChatMessage.AiMessage && !m.isLoadingPlaceholder && m.text.isNotBlank())
+            (m is ChatMessage.AiMessage && !m.isLoadingPlaceholder && m.text.isNotBlank()) ||
+            (m is ChatMessage.ImageResult && !m.isGenerating && m.pngPath != null) ||
+            (m is ChatMessage.UserMessage && m.isImagePrompt)
         }
         if (!hasContent) return
 
@@ -316,6 +353,25 @@ object ConversationStore {
         return if (clean.length <= TITLE_MAX) clean else clean.substring(0, TITLE_MAX) + "…"
     }
 
+    /** Every generated PNG referenced by any saved conversation. */
+    fun allImagePaths(context: Context): Set<String> {
+        val paths = mutableSetOf<String>()
+        for (meta in list(context)) {
+            messagesFile(context, meta.id).takeIf { it.exists() }?.let { file ->
+                runCatching {
+                    val arr = JSONArray(file.readText())
+                    for (i in 0 until arr.length()) {
+                        val o = arr.getJSONObject(i)
+                        if (o.optString("type") == "image") {
+                            o.optString("pngPath", "").takeIf { it.isNotBlank() }?.let { paths.add(it) }
+                        }
+                    }
+                }.onFailure { Log.w(TAG, "Failed to scan images of ${meta.id}", it) }
+            }
+        }
+        return paths
+    }
+
     /** Persisted turns, in order, for context replay on conversation switch. */
     fun toHistoryTurns(messages: List<ChatMessage>): List<ChatHistoryTurn> {
         val turns = mutableListOf<ChatHistoryTurn>()
@@ -332,11 +388,31 @@ object ConversationStore {
                             imageUris = m.imageUri?.let { listOf(it) } ?: emptyList()
                         )
                     )
+                    // Text-to-image turns: the picture was not drawn by the
+                    // LLM, so tell it what happened instead of leaving a
+                    // question that looks answered only by the next turn. The
+                    // image path rides in the marker so the replay can use the
+                    // file name (and therefore find the PNG again).
+                    if (m.isImagePrompt) {
+                        turns.add(
+                            ChatHistoryTurn(
+                                role = "assistant",
+                                text = ImagePromptMarker.encode(text)
+                            )
+                        )
+                    }
                 }
                 is ChatMessage.AiMessage -> {
                     if (m.text.isNotBlank() && !m.isLoadingPlaceholder) {
                         turns.add(ChatHistoryTurn(role = "assistant", text = m.text))
                     }
+                }
+                // Image results never enter the LLM context: they belong to the
+                // text-to-image engine, which is a separate native stack. While
+                // in image mode the chat model is not even loaded.
+                is ChatMessage.ImageResult -> {
+                    // The acknowledgement was already emitted above, next to
+                    // the prompt; the result cell itself is UI only.
                 }
                 else -> Unit
             }

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Only the generated pictures are shareable; nothing else under filesDir
+     is exposed. -->
+<paths>
+    <files-path name="generated_images" path="generated_images/" />
+</paths>

@@ -1,6 +1,7 @@
 package com.mobiinfer.demo
 
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -22,6 +23,11 @@ class ChatAdapter(
         private const val TYPE_USER = 1
         private const val TYPE_AI = 2
         private const val TYPE_DOWNLOAD = 3
+        private const val TYPE_IMAGE_RESULT = 4
+        // Decoded results are cached by path: ListAdapter rebinds every time the
+        // list is submitted, and re-decoding a 1-2 MB PNG on the main thread on
+        // each pass would stutter while the next image streams in.
+        private val bitmapCache = androidx.collection.LruCache<String, Bitmap>(6)
     }
 
     private var onSuggestionClick: ((String) -> Unit)? = null
@@ -31,6 +37,8 @@ class ChatAdapter(
     private var onDownloadCancel: (() -> Unit)? = null
     private var onDownloadPause: (() -> Unit)? = null
     private var onDownloadResume: (() -> Unit)? = null
+    private var onImageClick: ((String) -> Unit)? = null
+    private var onImageLongClick: ((String) -> Unit)? = null
 
     private var activeAiHolder: AiMessageViewHolder? = null
     private var activeAiId: Long = -1L
@@ -63,6 +71,16 @@ class ChatAdapter(
 
     fun setOnDownloadResume(listener: () -> Unit) {
         onDownloadResume = listener
+    }
+
+    /** Full-screen preview of a generated picture. */
+    fun setOnImageClick(listener: (String) -> Unit) {
+        onImageClick = listener
+    }
+
+    /** Save a generated picture to the gallery. */
+    fun setOnImageLongClick(listener: (String) -> Unit) {
+        onImageLongClick = listener
     }
 
     fun setActiveAiMessage(id: Long) {
@@ -113,6 +131,7 @@ class ChatAdapter(
             is ChatMessage.UserMessage -> TYPE_USER
             is ChatMessage.AiMessage -> TYPE_AI
             is ChatMessage.ModelDownloadPrompt -> TYPE_DOWNLOAD
+            is ChatMessage.ImageResult -> TYPE_IMAGE_RESULT
         }
     }
 
@@ -138,6 +157,11 @@ class ChatAdapter(
                     .inflate(R.layout.item_download_prompt, parent, false)
                 DownloadPromptViewHolder(view)
             }
+            TYPE_IMAGE_RESULT -> {
+                val view = LayoutInflater.from(parent.context)
+                    .inflate(R.layout.item_image_result, parent, false)
+                ImageResultViewHolder(view)
+            }
             else -> throw IllegalArgumentException("Unknown view type: $viewType")
         }
     }
@@ -160,6 +184,7 @@ class ChatAdapter(
                     activeDownloadHolder = promptHolder
                 }
             }
+            is ChatMessage.ImageResult -> (holder as ImageResultViewHolder).bind(item)
         }
     }
 
@@ -178,8 +203,22 @@ class ChatAdapter(
         private val btnSuggestion1: MaterialButton = itemView.findViewById(R.id.btn_suggestion_1)
         private val btnSuggestion2: MaterialButton = itemView.findViewById(R.id.btn_suggestion_2)
 
+        private val ivWelcomeIcon: ImageView = itemView.findViewById(R.id.iv_welcome_icon)
+
         fun bind(item: ChatMessage.WelcomeCard) {
             val ctx = itemView.context
+            ivWelcomeIcon.visibility = if (item.isImageMode) View.VISIBLE else View.GONE
+            if (item.isImageMode) {
+                tvWelcomeTitle.setText(R.string.welcome_title_image)
+                tvWelcomeDesc.setText(R.string.welcome_desc_image)
+                btnSuggestion1.setText(R.string.suggestion_image_1)
+                btnSuggestion2.setText(R.string.suggestion_image_2)
+                btnSuggestion1.setIconResource(R.drawable.ic_image)
+                btnSuggestion2.setIconResource(R.drawable.ic_image)
+                btnSuggestion1.setOnClickListener { onSuggestionClick?.invoke(btnSuggestion1.text.toString()) }
+                btnSuggestion2.setOnClickListener { onSuggestionClick?.invoke(btnSuggestion2.text.toString()) }
+                return
+            }
             if (item.isTextOnly) {
                 tvWelcomeTitle.setText(R.string.welcome_title_text)
                 tvWelcomeDesc.setText(R.string.welcome_desc_text)
@@ -258,6 +297,85 @@ class ChatAdapter(
         }
     }
 
+    inner class ImageResultViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
+        private val tvModel: TextView = itemView.findViewById(R.id.tv_image_model)
+        private val layoutProgress: View = itemView.findViewById(R.id.layout_image_progress)
+        private val tvProgress: TextView = itemView.findViewById(R.id.tv_image_progress)
+        private val ivResult: ImageView = itemView.findViewById(R.id.iv_image_result)
+        private val tvError: TextView = itemView.findViewById(R.id.tv_image_error)
+        private val tvParams: TextView = itemView.findViewById(R.id.tv_image_params)
+        private val tvHint: TextView = itemView.findViewById(R.id.tv_image_hint)
+        // The model that drew this picture is recorded on the message itself
+        // (the selection may have changed since), but ImageResult carries no
+        // model name; the label is therefore only shown while generating.
+        private var boundPath: String? = null
+
+        fun bind(item: ChatMessage.ImageResult) {
+            val ctx = itemView.context
+            tvModel.text = LlamaEngine.getSelectedModel(ctx).displayName
+
+            val params = mutableListOf<String>()
+            item.paramsText?.let { params += it }
+            item.elapsedMs?.let {
+                params += ctx.getString(R.string.image_result_elapsed, formatDuration(it))
+            }
+            if (params.isNotEmpty() && !item.isGenerating && item.error == null) {
+                tvParams.text = params.joinToString(" · ")
+                tvParams.visibility = View.VISIBLE
+            } else {
+                tvParams.visibility = View.GONE
+            }
+
+            when {
+                item.isGenerating -> {
+                    layoutProgress.visibility = View.VISIBLE
+                    tvProgress.setText(R.string.image_generating)
+                    ivResult.visibility = View.GONE
+                    tvHint.visibility = View.GONE
+                    tvError.visibility = View.GONE
+                }
+                item.error != null -> {
+                    layoutProgress.visibility = View.GONE
+                    ivResult.visibility = View.GONE
+                    tvHint.visibility = View.GONE
+                    tvError.visibility = View.VISIBLE
+                    tvError.text = ctx.getString(R.string.image_error, item.error)
+                }
+                else -> {
+                    layoutProgress.visibility = View.GONE
+                    tvError.visibility = View.GONE
+                    val path = item.pngPath
+                    if (path == null) {
+                        ivResult.visibility = View.GONE
+                        return
+                    }
+                    ivResult.visibility = View.VISIBLE
+                    if (boundPath != path) {
+                        boundPath = path
+                        val bitmap = bitmapCache[path] ?: runCatching {
+                            ImageOutput.decodeForDisplay(path)
+                        }.getOrNull()?.also { bitmapCache.put(path, it) }
+                        ivResult.setImageBitmap(bitmap)
+                        ivResult.visibility = if (bitmap != null) View.VISIBLE else View.GONE
+                    }
+                    val available = ivResult.drawable != null
+                    tvHint.visibility = if (available) View.VISIBLE else View.GONE
+                    // Tap opens the picture full screen, long-press offers to
+                    // save it; both are also reachable from the viewer.
+                    ivResult.setOnClickListener { if (available) onImageClick?.invoke(path) }
+                    ivResult.setOnLongClickListener {
+                        if (available) onImageLongClick?.invoke(path)
+                        available
+                    }
+                    tvHint.setOnClickListener { if (available) onImageClick?.invoke(path) }
+                }
+            }
+        }
+
+        private fun formatDuration(milliseconds: Long): String =
+            String.format(java.util.Locale.getDefault(), "%.1fs", milliseconds / 1000.0)
+    }
+
     inner class UserMessageViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
         private val tvText: TextView = itemView.findViewById(R.id.tv_user_text)
         private val flImageContainer: View = itemView.findViewById(R.id.fl_user_image_container)
@@ -289,6 +407,7 @@ class ChatAdapter(
     inner class AiMessageViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
         private val tvAiModel: TextView = itemView.findViewById(R.id.tv_ai_model)
         private val tvText: TextView = itemView.findViewById(R.id.tv_ai_text)
+        private val tvStatus: TextView = itemView.findViewById(R.id.tv_ai_status)
         private val tvMetrics: TextView = itemView.findViewById(R.id.tv_ai_metrics)
         private val btnStop: MaterialButton = itemView.findViewById(R.id.btn_stop_generating)
         private val layoutThinking: View = itemView.findViewById(R.id.layout_thinking)
@@ -305,6 +424,12 @@ class ChatAdapter(
 
         fun bind(item: ChatMessage.AiMessage) {
             tvAiModel.text = LlamaEngine.getSelectedModel(itemView.context).displayName
+            if (!item.status.isNullOrBlank()) {
+                tvStatus.text = item.status
+                tvStatus.visibility = View.VISIBLE
+            } else {
+                tvStatus.visibility = View.GONE
+            }
             if (!item.isGenerating) {
                 streamingMinWidth = 0
                 (tvText.parent as? ViewGroup)?.minimumWidth = 0
@@ -359,7 +484,10 @@ class ChatAdapter(
         }
 
         private fun renderWithThinking(raw: String, isGenerating: Boolean) {
-            prefillStatus.visibility = if (isGenerating && raw.isEmpty()) View.VISIBLE else View.GONE
+            // The prefill spinner only makes sense for a plain token stream; a
+            // status line (e.g. image tool progress) replaces it.
+            prefillStatus.visibility =
+                if (isGenerating && raw.isEmpty() && tvStatus.visibility != View.VISIBLE) View.VISIBLE else View.GONE
             val parsed = parseThinkingBlock(raw, isGenerating)
 
             if (parsed.thinkingText != null) {
@@ -445,7 +573,14 @@ class ChatAdapter(
                     oldItem.isGenerating == newItem.isGenerating &&
                             (oldItem.isGenerating || (oldItem.text == newItem.text && oldItem.metrics == newItem.metrics))
                 oldItem is ChatMessage.WelcomeCard && newItem is ChatMessage.WelcomeCard ->
-                    oldItem.isTextOnly == newItem.isTextOnly
+                    oldItem.isTextOnly == newItem.isTextOnly &&
+                            oldItem.isImageMode == newItem.isImageMode
+                oldItem is ChatMessage.ImageResult && newItem is ChatMessage.ImageResult ->
+                    oldItem.isGenerating == newItem.isGenerating &&
+                            oldItem.pngPath == newItem.pngPath &&
+                            oldItem.error == newItem.error &&
+                            oldItem.paramsText == newItem.paramsText &&
+                            oldItem.elapsedMs == newItem.elapsedMs
                 oldItem is ChatMessage.ModelDownloadPrompt && newItem is ChatMessage.ModelDownloadPrompt ->
                     oldItem.modelName == newItem.modelName &&
                             oldItem.downloading == newItem.downloading &&

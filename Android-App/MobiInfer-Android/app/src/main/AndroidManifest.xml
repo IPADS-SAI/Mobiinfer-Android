@@ -18,6 +18,12 @@
     <!-- Android 13+: notification posting now requires runtime consent;
          we ask for it the first time the user taps "下载". -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Saving a generated picture to the gallery. Android 10+ writes through
+         MediaStore and needs no permission; the scoped maxSdkVersion keeps
+         older devices working without asking for broad storage access. -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
     <!-- TTS: recording reference audio for voice cloning. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
@@ -63,13 +69,24 @@
             android:label="@string/tts_title"
             android:parentActivityName=".MainActivity"
             android:windowSoftInputMode="adjustResize" />
+
+        <!-- Full-screen preview of a generated picture. Local only. -->
         <activity
-            android:name=".ImageActivity"
+            android:name=".ImageViewerActivity"
             android:exported="false"
-            android:configChanges="locale|layoutDirection"
-            android:label="@string/image_title"
-            android:parentActivityName=".MainActivity"
-            android:windowSoftInputMode="adjustResize" />
+            android:label="@string/image_result_desc"
+            android:theme="@style/Theme.MiniCPMVdemo" />
+
+        <!-- Shares only filesDir/generated_images with the share sheet. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
         <service
             android:name=".ModelDownloadService"
