@@ -2,8 +2,15 @@
 
 #include "stable-diffusion.h"
 
+// Internal sdcpp header: sd_progress_is_uploading() distinguishes weight
+// loading from denoising, which share the public progress callback.
+#include "core/util.h"
+
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <chrono>
 #include <random>
 #include <string>
 
@@ -13,6 +20,157 @@
 struct imagegen_ctx {
     sd_ctx_t * sd = nullptr;
 };
+
+// Kept in a buffer with the preview/cancel context: "the sampler stopped
+// early" and "the model blew up" both used to surface as kErrGen.
+static std::string     g_last_failure;
+static std::atomic<int> g_preview_calls{0};
+static std::atomic<int> g_step_calls{0};
+
+
+namespace {
+
+// Context whose generate_image() call owns the thread that runs sdcpp; the
+// step callback uses it to request a cancel.
+thread_local imagegen_ctx * g_active_ctx = nullptr;
+
+// Thread-local "currently generating" context: the sdcpp preview/progress
+// callbacks are process-global function pointers, so they need a way back to
+// the call that installed them.
+thread_local const imagegen_gen_params * tls_params = nullptr;
+// Which phase the current generate_image() call is in. Set by the wrapper
+// itself (not guessed from step numbers): the same process-global callback
+// reports text encoding, denoising and tiled VAE decoding with unrelated
+// step/total pairs (8 denoising steps vs 426 decode tiles).
+thread_local imagegen_stage_t tls_stage = IMAGEGEN_STAGE_LOADING;
+// Set at the first preview of the sampling pass, so nothing before it can be
+// mistaken for denoising.
+thread_local bool tls_sampling_seen = false;
+
+// Announces a phase change once, so listeners do not have to infer it.
+void announce_stage(imagegen_stage_t stage) {
+    if (tls_stage == stage) {
+        return;
+    }
+    tls_stage = stage;
+    const imagegen_gen_params * p = tls_params;
+    if (p != nullptr && p->on_step != nullptr) {
+        p->on_step(0, static_cast<int>(stage), 0, 0, 0.0, p->on_step_user_data);
+    }
+}
+thread_local int64_t tls_last_step_us = 0;
+thread_local int tls_pass = 0;
+
+int64_t now_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// Keeps the preview cheap: latent-resolution RGB is blown up by
+// preview_latent_video(), a 64 px long side is plenty for a progress thumbnail
+// and keeps the JNI copy at ~12 KB.
+constexpr int kPreviewMaxSide = 64;
+
+struct DownsampledPreview {
+    std::vector<unsigned char> rgb;
+    int width  = 0;
+    int height = 0;
+};
+
+DownsampledPreview downsample_rgb(const sd_image_t & img) {
+    DownsampledPreview out;
+    if (img.data == nullptr || img.width == 0 || img.height == 0) {
+        return out;
+    }
+    const int src_w    = static_cast<int>(img.width);
+    const int src_h    = static_cast<int>(img.height);
+    const int channels = img.channel > 0 ? static_cast<int>(img.channel) : 3;
+    const int step     = std::max(1, std::max(src_w, src_h) / kPreviewMaxSide);
+    out.width          = (src_w + step - 1) / step;
+    out.height         = (src_h + step - 1) / step;
+    out.rgb.resize(static_cast<size_t>(out.width) * out.height * 3);
+    for (int y = 0; y < out.height; ++y) {
+        for (int x = 0; x < out.width; ++x) {
+            const int sx = std::min(src_w - 1, x * step);
+            const int sy = std::min(src_h - 1, y * step);
+            const unsigned char * px = img.data + (static_cast<size_t>(sy) * src_w + sx) * channels;
+            unsigned char * dst     = out.rgb.data() + (static_cast<size_t>(y) * out.width + x) * 3;
+            dst[0] = px[0];
+            dst[1] = channels > 1 ? px[1] : px[0];
+            dst[2] = channels > 2 ? px[2] : px[0];
+        }
+    }
+    return out;
+}
+
+void preview_cb(int step, int frame_count, sd_image_t * frames, bool /*is_noisy*/, void * /*data*/) {
+    ++g_preview_calls;
+    const imagegen_gen_params * p = tls_params;
+    if (p == nullptr || p->on_preview == nullptr || frame_count <= 0 || frames == nullptr) {
+        return;
+    }
+    const int pass = sd_get_preview_info().sample_pass;
+    // The denoising loop is the only thing that produces previews; the first
+    // one marks the end of text encoding.
+    if (pass == 1 && !tls_sampling_seen) {
+        tls_sampling_seen = true;
+        announce_stage(IMAGEGEN_STAGE_SAMPLING);
+    }
+    // Pass 1 only: later passes start from noise and would make the thumbnail
+    // jump back to an unreadable blur.
+    if (pass != 1) {
+        return;
+    }
+    const DownsampledPreview small = downsample_rgb(frames[0]);
+    if (!small.rgb.empty()) {
+        p->on_preview(pass, step, small.width, small.height, small.rgb.data(),
+                      p->on_preview_user_data);
+    }
+}
+
+void step_cb(int step, int steps, float /*secs*/, void * /*data*/) {
+    ++g_step_calls;
+    const imagegen_gen_params * p = tls_params;
+    if (p == nullptr || p->on_step == nullptr) {
+        return;
+    }
+    const int64_t t      = now_us();
+    const double elapsed = tls_last_step_us > 0 ? (t - tls_last_step_us) / 1000.0 : 0.0;
+    tls_last_step_us     = t;
+
+    // The wrapper owns the phase; this callback only carries step numbers that
+    // are meaningful inside it (denoising steps, or decode tiles). Weight
+    // loading reports through the same callback with tensor counts (426 of
+    // 426!), so it is tagged as its own stage instead of being mistaken for a
+    // sampling step.
+    const int pass = std::max(0, sd_get_preview_info().sample_pass);
+    const int stage = sd_progress_is_uploading()
+                          ? static_cast<int>(IMAGEGEN_STAGE_LOADING)
+                          : static_cast<int>(tls_stage);
+    if (!p->on_step(pass, stage, step, steps, elapsed, p->on_step_user_data)) {
+        if (g_active_ctx != nullptr && g_active_ctx->sd != nullptr) {
+            sd_cancel_generation(g_active_ctx->sd, SD_CANCEL_ALL);
+        }
+    }
+}
+
+}  // namespace
+
+
+
+namespace {
+
+// sdcpp's preview and progress callbacks are process-global, so they are
+// installed once and read the per-call parameters from the thread-locals above.
+bool install_callbacks() {
+    sd_set_preview_callback(preview_cb, PREVIEW_PROJ, /*interval=*/1,
+                            /*denoised=*/true, /*noisy=*/false, nullptr);
+    sd_set_progress_callback(step_cb, nullptr);
+    return true;
+}
+
+}  // namespace
 
 static const char * kErrInit = "failed to create sd context";
 static const char * kErrGen  = "generate_image failed";
@@ -48,6 +206,7 @@ imagegen_ctx * imagegen_init(const imagegen_params * params) {
         return nullptr;
     }
 
+    install_callbacks();
     auto * ctx = new imagegen_ctx();
     ctx->sd = sd;
     return ctx;
@@ -125,12 +284,40 @@ bool imagegen_generate(imagegen_ctx * ctx,
         return false;
     }
 
+    // Arm the per-step hooks for this call only.
+    g_last_failure.clear();
+    g_preview_calls = 0;
+    g_step_calls    = 0;
+    tls_stage       = IMAGEGEN_STAGE_LOADING;
+    tls_sampling_seen = false;
+    const imagegen_gen_params * prev_params = tls_params;
+    imagegen_ctx * const prev_ctx          = g_active_ctx;
+    tls_params      = params;
+    tls_last_step_us = now_us();
+    g_active_ctx    = ctx;
+
+    // Text encoding happens inside generate_image() before the first preview;
+    // the tiled VAE decode happens inside it after the last one. The wrapper
+    // announces ENCODING now, SAMPLING on the first preview, DECODING after
+    // the call returns, so every step number lands in the right phase.
+    announce_stage(IMAGEGEN_STAGE_ENCODING);
     sd_image_generation_result_t * result = nullptr;
-    if (!generate_image(ctx->sd, &gp, &result) || result == nullptr || result->count <= 0) {
+    const bool generated = generate_image(ctx->sd, &gp, &result);
+    announce_stage(IMAGEGEN_STAGE_DECODING);
+    tls_params           = prev_params;
+    g_active_ctx         = prev_ctx;
+    tls_stage            = IMAGEGEN_STAGE_DONE;
+    if (!generated || result == nullptr || result->count <= 0) {
         if (result != nullptr) {
             free_sd_image_generation_result(result);
         }
-        if (err != nullptr) { *err = kErrGen; }
+        char detail[256];
+        std::snprintf(detail, sizeof(detail),
+                      "generate_image failed (steps seen=%d, previews=%d%s)",
+                      g_step_calls.load(), g_preview_calls.load(),
+                      g_last_failure.empty() ? "" : ", ");
+        g_last_failure.insert(0, detail);
+        if (err != nullptr) { *err = g_last_failure.c_str(); }
         return false;
     }
 

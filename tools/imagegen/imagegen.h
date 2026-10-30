@@ -42,6 +42,26 @@ struct imagegen_params {
     bool release_te_after_encode;
 };
 
+// sample_pass counts sampling batches inside one generate_image() call (a
+// refiner or a second guidance pass starts a new one); preview only carries
+// frames for pass 1, because a later pass starts from noise again and would
+// flash the picture back to a blur.
+// stage: which phase of the run produced this event, as imagegen_stage_t
+// (declared below). A sampling pass reports its denoising steps (step/steps),
+// the VAE decode reports its tile grid (also step/steps) - do not mix them.
+typedef bool (*imagegen_step_cb)(int sample_pass, int stage, int step, int steps, double elapsed_ms,
+                                 void * user_data);
+typedef void (*imagegen_preview_cb)(int sample_pass, int step, int width, int height,
+                                    const unsigned char * rgb, void * user_data);
+
+typedef enum imagegen_stage_t {
+    IMAGEGEN_STAGE_LOADING   = 0,  // weights / context being created
+    IMAGEGEN_STAGE_ENCODING  = 1,  // text encoder running
+    IMAGEGEN_STAGE_SAMPLING  = 2,  // denoising loop, the "real" steps
+    IMAGEGEN_STAGE_DECODING  = 3,  // VAE decode (tiled: one event per tile)
+    IMAGEGEN_STAGE_DONE      = 4,
+} imagegen_stage_t;
+
 struct imagegen_gen_params {
     const char * prompt;
     const char * negative_prompt;      // NULL -> empty
@@ -56,11 +76,24 @@ struct imagegen_gen_params {
     int64_t seed;
 
     bool vae_tiling;                   // enable tiled VAE decode to bound peak memory
+
+    // Called once per denoising step (after the preview projection exists):
+    // step/steps describe the current sampling pass, elapsed_ms is the time of
+    // the step that just finished. Return false to cancel the generation.
+    imagegen_step_cb on_step;
+    void * on_step_user_data;
+
+    // Called once per step with a downscaled RGB preview of the current
+    // latent (PREVIEW_PROJ, no VAE). width*height*3 bytes, needs no other
+    // header. Issued right before on_step.
+    imagegen_preview_cb on_preview;
+    void * on_preview_user_data;
 };
 
 // Progress callback: called once before generation starts (step negotiated by
 // the library API has no per-step hook); return false to cancel.
 typedef bool (*imagegen_progress_cb)(int step, int steps, void * user_data);
+
 
 // Loads the model. Returns NULL on failure.
 IMAGEGEN_API imagegen_ctx * imagegen_init(const imagegen_params * params);

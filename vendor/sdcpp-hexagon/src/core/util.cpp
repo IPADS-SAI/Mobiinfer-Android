@@ -623,10 +623,24 @@ void pretty_progress(int step, int steps, float time) {
     print_progress_line(step, steps, sd_format("%.2f%s", speed, unit), '=', true, remainder_text);
 }
 
+static thread_local bool tls_progress_uploading = false;
+
+void sd_progress_mark_uploading(bool uploading) {
+    tls_progress_uploading = uploading;
+}
+
+bool sd_progress_is_uploading() {
+    return tls_progress_uploading;
+}
+
 void pretty_bytes_progress(int step, int steps, uint64_t bytes_processed, float elapsed_seconds) {
     if (sd_progress_cb) {
         float time = elapsed_seconds / (step + 1e-6f);
+        // Weight/tensor loading shares the callback with denoising; flag it so
+        // the receiver can tell "426 of 426 tensors" from "426 of 426 steps".
+        sd_progress_mark_uploading(true);
         sd_progress_cb(step, steps, time, sd_progress_cb_data);
+        sd_progress_mark_uploading(false);
         return;
     }
     if (step == 0) {

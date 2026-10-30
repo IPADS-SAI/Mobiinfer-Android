@@ -18,6 +18,7 @@
 #include <android/log.h>
 
 #include <cstdarg>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -48,6 +49,89 @@ static void crit(const char *fmt, ...) {
 
 static imagegen_ctx * g_ctx = nullptr;
 static std::string    g_last_error;
+
+// Progress/preview bridge. The callbacks fire on the thread that runs
+// imagegen_generate(); they take the listener under a lock, call into it and
+// never keep a JNI reference across calls.
+static JavaVM *   g_vm                = nullptr;
+static jobject    g_progress_listener = nullptr;  // global ref
+static std::mutex g_listener_mutex;
+
+static JNIEnv * attach_env() {
+    if (g_vm == nullptr) {
+        return nullptr;
+    }
+    JNIEnv * env = nullptr;
+    if (g_vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) == JNI_OK) {
+        return env;
+    }
+    return g_vm->AttachCurrentThread(&env, nullptr) == JNI_OK ? env : nullptr;
+}
+
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM * vm, void *) {
+    g_vm = vm;
+    return JNI_VERSION_1_6;
+}
+
+static void deliver_preview(int pass, int step, int width, int height, const unsigned char * rgb) {
+    std::lock_guard<std::mutex> lock(g_listener_mutex);
+    if (g_progress_listener == nullptr) {
+        return;
+    }
+    JNIEnv * env = attach_env();
+    if (env == nullptr) {
+        return;
+    }
+    const jsize n      = static_cast<jsize>(width) * height * 3;
+    jbyteArray pixels  = env->NewByteArray(n);
+    if (pixels != nullptr) {
+        env->SetByteArrayRegion(pixels, 0, n, reinterpret_cast<const jbyte *>(rgb));
+        jclass cls    = env->GetObjectClass(g_progress_listener);
+        // onPreview(samplePass: Int, step: Int, width: Int, height: Int, rgb: ByteArray)
+        jmethodID mid = env->GetMethodID(cls, "onPreview", "(IIII[B)V");
+        if (mid != nullptr) {
+            env->CallVoidMethod(g_progress_listener, mid, pass, step, width, height, pixels);
+        }
+        env->DeleteLocalRef(pixels);
+        env->DeleteLocalRef(cls);
+    }
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+    }
+}
+
+static bool deliver_step(int pass, int stage, int step, int steps, double elapsed_ms) {
+    std::lock_guard<std::mutex> lock(g_listener_mutex);
+    if (g_progress_listener == nullptr) {
+        return true;
+    }
+    JNIEnv * env = attach_env();
+    if (env == nullptr) {
+        return true;
+    }
+    bool keep_going = true;
+    jclass cls      = env->GetObjectClass(g_progress_listener);
+    // onStep(samplePass: Int, stage: Int, step: Int, steps: Int, elapsedMs: Double): Boolean
+    jmethodID mid = env->GetMethodID(cls, "onStep", "(IIIID)Z");
+    if (mid != nullptr) {
+        keep_going = env->CallBooleanMethod(g_progress_listener, mid, pass, stage, step, steps, elapsed_ms) == JNI_TRUE;
+    }
+    env->DeleteLocalRef(cls);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        keep_going = true;
+    }
+    return keep_going;
+}
+
+static void preview_trampoline(int pass, int step, int width, int height,
+                               const unsigned char * rgb, void *) {
+    deliver_preview(pass, step, width, height, rgb);
+}
+
+static bool step_trampoline(int pass, int stage, int step, int steps, double elapsed_ms, void *) {
+    return deliver_step(pass, stage, step, steps, elapsed_ms);
+}
 
 static std::string jstringToStdString(JNIEnv * env, jstring jStr) {
     if (!jStr) return {};
@@ -150,6 +234,10 @@ Java_com_mobiinfer_demo_ImageEngine_nativeGenerate(
     gp.cfg_scale       = cfg;  // <0 -> model default
     gp.seed            = seed;  // <0 -> imagegen picks and reports one
     gp.vae_tiling      = true;  // bound peak memory on mobile
+    gp.on_preview           = preview_trampoline;
+    gp.on_preview_user_data = nullptr;
+    gp.on_step              = step_trampoline;
+    gp.on_step_user_data    = nullptr;
 
     crit("generate start %dx%d steps=%d cfg=%.1f seed=%lld prompt=\"%.60s\"", width, height, steps, cfg, (long long) seed, brief.c_str());
     LOG_I("imagegen generate: %dx%d steps=%d cfg=%.1f seed=%lld prompt=\"%s\" -> %s",
@@ -177,6 +265,19 @@ JNIEXPORT jstring JNICALL
 Java_com_mobiinfer_demo_ImageEngine_nativeModelVersion(JNIEnv * env, jobject /*thiz*/) {
     const char * v = g_ctx != nullptr ? imagegen_model_version(g_ctx) : "Unknown";
     return env->NewStringUTF(v ? v : "Unknown");
+}
+
+JNIEXPORT void JNICALL
+Java_com_mobiinfer_demo_ImageEngine_nativeSetProgressListener(
+        JNIEnv * env, jobject /*thiz*/, jobject listener) {
+    std::lock_guard<std::mutex> lock(g_listener_mutex);
+    if (g_progress_listener != nullptr) {
+        env->DeleteGlobalRef(g_progress_listener);
+        g_progress_listener = nullptr;
+    }
+    if (listener != nullptr) {
+        g_progress_listener = env->NewGlobalRef(listener);
+    }
 }
 
 JNIEXPORT void JNICALL

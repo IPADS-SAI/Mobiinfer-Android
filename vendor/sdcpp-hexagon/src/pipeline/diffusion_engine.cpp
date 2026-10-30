@@ -2244,6 +2244,13 @@ void StableDiffusionGGML::report_sample_progress(int step,
                                  ? (now - *last_progress_us) / 1000000.f
                                  : 0.f;
         pretty_progress(showstep, (int)total_steps, step_seconds);
+        // Surface the same per-step event to embedders (mobile UIs need it to
+        // drive a determinate progress bar); sd_set_progress_callback() used to
+        // only store the pointer.
+        if (sd_get_progress_callback() != nullptr) {
+            sd_get_progress_callback()(showstep, (int)total_steps, step_seconds,
+                                       sd_get_progress_callback_data());
+        }
         if (last_progress_us != nullptr) {
             *last_progress_us = now;
         }

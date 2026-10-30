@@ -70,6 +70,10 @@ add_library(imagegen SHARED ${IMAGEGEN_SOURCES})
 target_include_directories(imagegen PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${SDCPP_SOURCE_DIR}/include
+    # src/ holds the internal headers (core/util.h): the progress callback is
+    # shared by weight loading and denoising, and only the internal flag can
+    # tell them apart.
+    ${SDCPP_SOURCE_DIR}/src
     ${SDCPP_SOURCE_DIR}/thirdparty)
 target_link_libraries(imagegen PRIVATE stable-diffusion)
 
