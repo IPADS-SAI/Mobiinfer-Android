@@ -163,7 +163,7 @@ class ChatAdapter(
     private val liveImageItems = HashMap<Long, ChatMessage.ImageResult>()
 
     /** Records the newest state of a drawing row; repaints only its label. */
-    fun updateImageItem(item: ChatMessage.ImageResult) {
+    fun updateImageItem(item: ChatMessage.ImageResult, allMessages: List<ChatMessage>? = null) {
         // Two paths write this row - the progress label and the preview frames -
         // and each carries whatever copy of the message its caller had. Keeping
         // the larger progress (and the newer frame) stops the older write from
@@ -179,7 +179,11 @@ class ChatAdapter(
         }
         liveImageItems[item.id] = merged
         val holder = activeImageHolder
-        val isBound = item.id == activeImageId && holder != null
+        // The decision has to use the merged item: the caller may hand us a copy
+        // that predates a finish/fail write, and reading `item` here made a row
+        // whose draw had already stopped look permanently bound, so the rebind
+        // below was skipped exactly when the row needed repainting.
+        val isBound = merged.id == activeImageId && holder != null
         if (!isBound) {
             // The row is not the one currently bound: either another image is
             // drawing, or this row is not on screen yet. The frames must not be
@@ -204,7 +208,13 @@ class ChatAdapter(
                 val now = SystemClock.elapsedRealtime()
                 val last = lastRebindAt[item.id] ?: 0L
                 if (now - last >= REBIND_INTERVAL_MS) {
-                    val list = currentList.toMutableList()
+                    // Plant the merged image into the CALLER's list, not into
+                    // currentList: currentList carries copies of every other row
+                    // taken at the time of the last submit, so re-submitting it
+                    // makes later diffs compare a stale row against an equally
+                    // stale row and skip the rebind - which is how the assistant
+                    // bubble kept its spinner after the draw.
+                    val list = (allMessages ?: currentList).toMutableList()
                     val at = list.indexOfFirst { it.id == item.id }
                     if (at >= 0) {
                         lastRebindAt[item.id] = now

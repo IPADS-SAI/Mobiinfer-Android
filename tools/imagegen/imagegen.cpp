@@ -219,13 +219,18 @@ void step_cb(int step, int steps, float /*secs*/, void * /*data*/) {
     // "uploading" only means the text encoder is lazily (re)loading its own
     // weights, which happens *during* encoding - reporting that as LOADING made
     // the label flicker loading -> encoding -> loading -> ... and hid the real
-    // phase. Keep uploading only for the case where no phase has been entered
-    // yet, so the very first draw of a process still says "loading weights".
+    // phase. The phase the wrapper declared (ENCODING from the start of the
+    // draw, SAMPLING at the first preview, DECODING at the first tile) is the
+    // answer, and `uploading` no longer overrides it.
+    //
+    // A previous version kept `uploading && tls_stage == LOADING` as a safety
+    // net "so the first draw of a process still says loading weights". That arm
+    // was unreachable: imagegen_generate() sets tls_stage = ENCODING before
+    // calling generate_image(), and LOADING is never announced - the initial
+    // weight load is reported through on_load_step instead.
     const int stage = decoding
                           ? static_cast<int>(IMAGEGEN_STAGE_DECODING)
-                          : (uploading && tls_stage == IMAGEGEN_STAGE_LOADING)
-                                ? static_cast<int>(IMAGEGEN_STAGE_LOADING)
-                                : static_cast<int>(tls_stage);
+                          : static_cast<int>(tls_stage);
     if (g_trace_cb != nullptr) {
         // Log the stage that is actually reported, not the raw flags. The old
         // line preferred the byte-progress flag, so during the VAE decode -

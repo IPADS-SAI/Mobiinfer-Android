@@ -1106,29 +1106,36 @@ class MainActivity : AppCompatActivity() {
         engine.setProgressListener(loadToken, loadUi)
 
         val loadStart = SystemClock.elapsedRealtime()
-        val ok = withContext(Dispatchers.IO) {
-            engine.loadModel(
-                diffusionModelPath = LlamaEngine.modelPath(ctx, imageModel),
-                llmPath = LlamaEngine.imageTextEncoderPath(ctx, imageModel),
-                vaePath = LlamaEngine.imageVaePath(ctx, imageModel),
-                tokenizerPath = LlamaEngine.imageTokenizerPath(ctx, imageModel),
-                nThreads = 0,
-                backend = "diffusion=HTP0,te=cpu,vae=HTP0"
-            )
+        // loadModel() throws (missing file, init timeout) and rethrows
+        // CancellationException, so the ticker has to be torn down in a finally:
+        // this instance was built without a request, and its estimate would be a
+        // defaults sum that expired immediately, leaving "99% · loading weights"
+        // on the bubble for as long as it is on screen.
+        val ok = try {
+            withContext(Dispatchers.IO) {
+                engine.loadModel(
+                    diffusionModelPath = LlamaEngine.modelPath(ctx, imageModel),
+                    llmPath = LlamaEngine.imageTextEncoderPath(ctx, imageModel),
+                    vaePath = LlamaEngine.imageVaePath(ctx, imageModel),
+                    tokenizerPath = LlamaEngine.imageTokenizerPath(ctx, imageModel),
+                    nThreads = 0,
+                    backend = "diffusion=HTP0,te=cpu,vae=HTP0"
+                )
+            }
+        } finally {
+            engine.setProgressListener(loadToken, null)
+            // ...and its one-second tick must stop with it. Leaving it running
+            // left a second ImageProgressUi publishing into the same bubble: the
+            // load instance and the draw instance each repainted with their own
+            // phase and percentage, which is what made the label flicker between
+            // "loading weights" and the real phase for the whole draw.
+            loadUi.stop()
         }
         CriticalLog.log(
             "image",
             "load ${if (ok) "OK" else "FAILED"} in ${SystemClock.elapsedRealtime() - loadStart} ms, " +
                 "native heap ${nativeHeapMb()} MB" + (engine.lastError?.let { ", error=$it" } ?: "")
         )
-        // The draw installs its own listener; this one only carried the load.
-        engine.setProgressListener(loadToken, null)
-        // ...and its one-second tick must stop with it. Leaving it running left
-        // a second ImageProgressUi publishing into the same bubble: the load
-        // instance and the draw instance each repainted with their own phase and
-        // percentage, which is what made the label flicker between
-        // "loading weights" and the real phase for the whole draw.
-        loadUi.stop()
         if (ok) {
             isImageModelLoaded = true
             loadedImageModelId = imageModel.id
@@ -1364,10 +1371,11 @@ class MainActivity : AppCompatActivity() {
                     return@launch
                 }
 
-                (imageEngine.progressListener as? ImageProgressUi)?.also {
-                    it.stop()
-                    it.saveTiming(request.steps)
-                }
+                // Only the measurement is success-gated; stopping the ticker
+                // happens in the finally below, because generate() returning
+                // null is the ordinary native-failure path and it used to leave
+                // a ticker appending to the error card.
+                (imageEngine.progressListener as? ImageProgressUi)?.saveTiming(request.steps)
                 // Stopped before finishImageResult(): that shows the picture and
                 // saves the conversation, and none of that is drawing time.
                 val drawMs = SystemClock.elapsedRealtime() - startNs
@@ -1380,6 +1388,7 @@ class MainActivity : AppCompatActivity() {
                     failImageResult(resultId, e.message ?: getString(R.string.image_generate_failed))
                 }
             } finally {
+                (imageEngine?.progressListener as? ImageProgressUi)?.stop()
                 lockOrientationWhileGenerating(false)
                 imageEngine?.setProgressListener(token, null)
                 if (token == imageGenerationToken) {
@@ -1497,6 +1506,12 @@ class MainActivity : AppCompatActivity() {
         private var shownFraction = 0f
         // Drives the bar during the phases that emit no events (see startTicking).
         private var tickJob: Job? = null
+        /**
+         * Whether the one-second tick has ever started. Distinct from
+         * [startedAt], which is set in the constructor and therefore always
+         * non-zero - the old guard was a no-op.
+         */
+        private var tickStarted = false
 
         /** Told up front so the first phases can be estimated at all. */
         fun expectSteps(steps: Int) {
@@ -1592,7 +1607,7 @@ class MainActivity : AppCompatActivity() {
                 // Recorded for later rebinds and painted into the bound row in
                 // one step. Not submitList(): diffing and rebinding the row on
                 // every frame is what made the thumbnail and the bar flicker.
-                chatAdapter.updateImageItem(updated)
+                chatAdapter.updateImageItem(updated, messages.toList())
                 // The frame being replaced is NOT recycled here. submitList()
                 // commits asynchronously and DefaultItemAnimator can keep the
                 // previous drawable alive while the row cross-fades; recycling it
@@ -1713,6 +1728,7 @@ class MainActivity : AppCompatActivity() {
          */
         private fun startTicking() {
             if (tickJob?.isActive == true) return
+            tickStarted = true
             tickJob = lifecycleScope.launch {
                 while (isActive) {
                     delay(TICK_INTERVAL_MS)
@@ -1721,6 +1737,10 @@ class MainActivity : AppCompatActivity() {
                     if (message == null || !message.isGenerating) break
                     tickSecond()
                 }
+                // Clear the finished job: the guard above checks isActive, and a
+                // completed job left in place made a later startTicking() launch
+                // a second ticker against the same bubble.
+                tickJob = null
             }
         }
 
@@ -1740,7 +1760,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         /** True while the draw is still running (the tick has a start mark). */
-        private fun startedTickingYet(): Boolean = startedAt > 0L
+        private fun startedTickingYet(): Boolean = tickStarted
 
         private fun currentStageTitle(): Int = currentStageTitleFor(currentStage)
 
@@ -1801,7 +1821,7 @@ class MainActivity : AppCompatActivity() {
                 // plus a rebind on every 2%, and a rebound Material bar restarts
                 // its animation - the visible flicker. The live map keeps the
                 // newest value for when the row is rebound for another reason.
-                chatAdapter.updateImageItem(updated)
+                chatAdapter.updateImageItem(updated, messages.toList())
             }
         }
 
@@ -1904,14 +1924,18 @@ class MainActivity : AppCompatActivity() {
             // enough.
             val encodeArea = 1.0 + (areaScale - 1.0) * 0.03
             // One denoising step scales sub-linearly, by a different exponent per
-            // precision. Measured as (denoise total / steps):
-            //   fp16 4162 ms at 256x256, 4711 at 3.94x the pixels, 5354 at 4.00x
-            //        (k ~ 0.09-0.18, so 0.14)
+            // precision. Measured as (denoise total / steps), fp16 at 256x256 is
+            // 4162 ms and the ratio at larger sizes implies k = 0.090 (448x576),
+            // 0.182 (512x512) and 0.266/0.273 (768x768): k is NOT constant, so no
+            // single power law fits and these are a compromise, not physics.
+            // 0.20 minimises total-duration error over all fifteen profiles
+            // (3.75% mean, 2 rows over 6%); 0.14 fits only the small sizes and
+            // 0.266 only the large ones.
             //   q4    991 -> 2204 at 3.94x, 2452 at 4.00x (k ~ 0.58-0.65, so 0.62)
-            // Deriving it from the gaps between step events instead gives ~0.35
+            // Deriving k from the gaps between step events instead gives ~0.35
             // for fp16 and is wrong: the first step event is emitted when that
             // step completes, so a divide by the step count is the honest figure.
-            val stepArea = Math.pow(areaScale, if (isFp16) 0.22 else 0.62)
+            val stepArea = Math.pow(areaScale, if (isFp16) 0.20 else 0.62)
             // The VAE decode is not a smooth function of pixels at all - it is
             // the tile grid. Measured: 448x576 (258k px) is 6 tiles and 15.7 s,
             // 512x512 (262k px, almost identical area) is 9 tiles and 23.4 s.
@@ -1933,8 +1957,14 @@ class MainActivity : AppCompatActivity() {
             // ~18.6 ms per character on top of a fixed ~9.2 s. Denoise and decode
             // did not move. A multiplier against the reference length could not
             // express that (it matched at one length and drifted everywhere else).
-            val promptExtraMs =
-                ((request.prompt.length - ref.promptChars).coerceAtLeast(0)) * PROMPT_MS_PER_CHAR
+            // Stored record and defaults are both expressed at their own prompt
+            // length, so the measurement's own prompt cost has to be removed
+            // before this draw's is added. Subtracting only when this prompt is
+            // longer (the previous form) anchored the estimate to whatever the
+            // LAST draw was: after one 551-character prompt, a 13-character draw
+            // kept the full ~10 s premium.
+            val promptExtraMs = (request.prompt.length - ref.promptChars.coerceAtLeast(0)) *
+                PROMPT_MS_PER_CHAR
 
             // The measurement is already a per-step figure for ref.steps steps,
             // so scaling to this draw's step count is a plain multiply.
