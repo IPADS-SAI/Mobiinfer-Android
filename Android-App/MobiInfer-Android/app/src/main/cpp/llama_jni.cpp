@@ -758,7 +758,20 @@ static std::string chat_add_and_format(const std::string &role, const std::strin
                  "definition - this model's template does not render tools; the text "
                  "instructions are the only guidance", __func__);
         }
-    } else if (role == ROLE_USER && !g_tool_schemas_json.empty()) {
+    } else if (role == ROLE_USER) {
+        if (g_tool_schemas_json.empty()) {
+            // Plain path: no tool definition can be rendered, so fall back to
+            // the same shape the non-tool branch uses.
+            formatted = g_ctx_vision
+                ? std::string("<|im_start|>user\n") + content + "<|im_end|>\n" + assistant_turn_prefix()
+                : content;
+            common_chat_msg new_msg;
+            new_msg.role = ROLE_USER;
+            new_msg.content = content;
+            chat_msgs.push_back(new_msg);
+            LOGi("%s: user turn formatted WITHOUT tools (schema empty)", __func__);
+            return formatted;
+        }
         // Live turn under a tool-aware prompt: the same renderer as above,
         // otherwise the model would see tool_calls history on reload but a
         // hand-written "<tool_call>" text during the session.
@@ -867,9 +880,15 @@ static int apply_system_prompt(JNIEnv *env, jstring jsystem_prompt, bool keep_st
         // it when the text was prepended again), which is exactly why a model
         // answered with a picture description instead of calling anything.
         const std::string text = system_prompt;
-        g_tool_schemas_json.swap(g_tool_schemas_pending_json);
         g_system_prompt_text = text;
+        // Render FIRST, swap after: chat_add_and_format() decides whether the
+        // template renders tools (and whether to splice g_tool_history into
+        // the prefill) by looking at g_tool_schemas_pending_json. Swapping
+        // before the call emptied it, so the system turn was rendered without
+        // any tool definition and the replayed tool history was dropped - the
+        // model then could not call the tool at all after a reload.
         formatted_system_prompt = chat_add_and_format(ROLE_SYSTEM, text);
+        g_tool_schemas_json.swap(g_tool_schemas_pending_json);
     }
     env->ReleaseStringUTFChars(jsystem_prompt, system_prompt);
 
@@ -1158,8 +1177,11 @@ Java_com_mobiinfer_demo_LlamaEngine_fullReset(JNIEnv *env, jobject) {
     common_sampler_free(g_sampler);
     g_sampler = nullptr;
     g_chat_templates.reset();
-    g_tool_schemas_json.clear();
-    g_tool_schemas_pending_json.clear();
+    // The tool schema is NOT conversation state: it describes the model's
+    // capabilities and stays valid across a reset. Clearing it here silently
+    // disabled the image tool for every request after "new conversation",
+    // because applyChatSystemPrompt() only runs when a model is loaded and
+    // nothing re-registered the schema afterwards.
     g_tool_history.clear();
     llama_batch_free(g_batch);
     g_batch = {};
@@ -1226,7 +1248,17 @@ Java_com_mobiinfer_demo_LlamaEngine_processUserPrompt(
     }
 
     std::string formatted_user_prompt;
-    if (g_ctx_vision) {
+    // With a tool schema the turn MUST go through the template: the hand-written
+    // ChatML below carries neither the tool definitions nor the replayed tool
+    // history, so the model was asked to draw with no tool in front of it -
+    // that is why a vision model never called generate_image.
+    const bool tool_turn = !g_tool_schemas_json.empty() || !g_tool_schemas_pending_json.empty();
+    if (g_ctx_vision && tool_turn) {
+        formatted_user_prompt = chat_add_and_format(ROLE_USER, content_for_format.c_str());
+        LOGi("%s: vision user turn rendered through the tool template (%zu chars)",
+             __func__, formatted_user_prompt.size());
+        g_image_prefilled = false;
+    } else if (g_ctx_vision) {
         // No default system prompt: aligned with iOS opt-r1's MBMtmd.mm.
         // An English-only "You are a helpful assistant." was observed to
         // bias MiniCPM-V into answering Chinese queries in English. The
@@ -1467,6 +1499,30 @@ struct ImageAck {
 };
 
 static std::optional<ImageAck> parse_image_acknowledgement(const std::string & text) {
+    // Machine form first: one JSON object holding the whole payload, so a
+    // prompt containing ']", quotes, backslashes or newlines cannot truncate
+    // it. The marker is versioned so the format can change without guessing.
+    static const std::string json_prefix = "\x01image-gen:v1:";
+    const size_t json_at = text.find(json_prefix);
+    if (json_at != std::string::npos) {
+        const size_t begin = json_at + json_prefix.size();
+        const size_t end   = text.find('\x01', begin);
+        const std::string payload =
+            text.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+        try {
+            const auto obj = nlohmann::ordered_json::parse(payload);
+            ImageAck ack;
+            ack.prompt = obj.value("prompt", std::string{});
+            ack.result = obj.value("result", std::string{"The image was generated and shown to the user."});
+            if (!ack.prompt.empty()) {
+                return ack;
+            }
+        } catch (const std::exception & e) {
+            LOGe("%s: bad image-gen payload: %s", __func__, e.what());
+        }
+    }
+
+    // Legacy text form, kept for conversations written before the JSON bridge.
     static const std::string prefix = "[image generated: ";
     const size_t at = text.rfind(prefix);
     if (at == std::string::npos) {

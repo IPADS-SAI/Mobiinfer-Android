@@ -376,6 +376,12 @@ object ConversationStore {
     /** Persisted turns, in order, for context replay on conversation switch. */
     fun toHistoryTurns(messages: List<ChatMessage>): List<ChatHistoryTurn> {
         val turns = mutableListOf<ChatHistoryTurn>()
+        // Prompt of the picture that was just drawn, so the assistant turn that
+        // follows it can mention what it produced.
+        var previousImagePrompt: String? = null
+        // Set when the picture turn above was just emitted, so the assistant
+        // sentence that follows merges into it instead of starting a new turn.
+        var pendingDrawnPrompt: String? = null
         for (m in messages) {
             when (m) {
                 is ChatMessage.UserMessage -> {
@@ -395,6 +401,10 @@ object ConversationStore {
                     // image path rides in the marker so the replay can use the
                     // file name (and therefore find the PNG again).
                     if (m.isImagePrompt) {
+                        // Home-screen image mode: the prompt already has its
+                        // answer here, so the result cell below must not add a
+                        // second one.
+                        previousImagePrompt = text
                         turns.add(
                             ChatHistoryTurn(
                                 role = "assistant",
@@ -405,27 +415,47 @@ object ConversationStore {
                 }
                 is ChatMessage.AiMessage -> {
                     if (m.text.isNotBlank() && !m.isLoadingPlaceholder) {
-                        turns.add(ChatHistoryTurn(role = "assistant", text = m.text))
+                        val drawnPrompt = pendingDrawnPrompt
+                        if (drawnPrompt != null) {
+                            // Fold the sentence into the picture turn that was
+                            // just emitted, keeping one assistant turn.
+                            val last = turns.lastOrNull()
+                            if (last != null && last.role == "assistant") {
+                                turns[turns.size - 1] = last.copy(
+                                    text = last.text + " " + m.text
+                                )
+                            } else {
+                                turns.add(ChatHistoryTurn(role = "assistant", text = m.text))
+                            }
+                            pendingDrawnPrompt = null
+                        } else {
+                            turns.add(ChatHistoryTurn(role = "assistant", text = m.text))
+                        }
+                        previousImagePrompt = null
                     }
                 }
                 // Image results never enter the LLM context: they belong to the
                 // text-to-image engine, which is a separate native stack. While
                 // in image mode the chat model is not even loaded.
                 is ChatMessage.ImageResult -> {
-                    // UI only by itself, but a picture produced by the model
-                    // through generate_image has to appear in the context: the
-                    // user turn above it was not marked as an image prompt, so
-                    // nothing else records that a tool ran. Without this the
-                    // model replays its own request with no answer and concludes
-                    // it has no drawing tool at all.
-                    if (!m.isGenerating && m.pngPath != null) {
+                    // A finished picture is the assistant's answer to the turn
+                    // above it. Omitting it made the model replay its own
+                    // request with no reply and conclude it cannot draw;
+                    // narrating it in extra prose made it treat the topic as
+                    // closed. Recording it as the plain answer to that request
+                    // is what keeps later prompts calling the tool.
+                    if (!m.isGenerating && m.pngPath != null && previousImagePrompt == null) {
+                        // The native side turns this record into a real
+                        // generate_image call + result. Without it the model
+                        // replays "user asked for a picture" with a plain
+                        // sentence as the answer and stops calling the tool.
                         turns.add(
                             ChatHistoryTurn(
                                 role = "assistant",
-                                text = "I called ${ImageTool.NAME} and the picture is ready: " +
-                                    "${m.prompt}. See it in the chat above."
+                                text = ImagePromptMarker.toolRecord(m.prompt)
                             )
                         )
+                        pendingDrawnPrompt = m.prompt
                     }
                 }
                 else -> Unit

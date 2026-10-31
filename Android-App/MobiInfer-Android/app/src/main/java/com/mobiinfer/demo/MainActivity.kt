@@ -1492,7 +1492,15 @@ class MainActivity : AppCompatActivity() {
             when (stage) {
                 ImageEngine.STAGE_LOADING -> {
                     if (steps > 0 && step > loadStepSeen) loadStepSeen = step
-                    enterStage(ImageEngine.STAGE_LOADING)
+                    // Only the initial weight load may move the label back to
+                    // "loading weights". The text encoder lazily (re)loads its
+                    // own weights while it runs and those events also carry the
+                    // upload flag: honouring them relabelled ~9 s of encoding as
+                    // weight loading, and the phase text never showed
+                    // "理解提示词" at all.
+                    if (currentStage == ImageEngine.STAGE_LOADING) {
+                        enterStage(ImageEngine.STAGE_LOADING)
+                    }
                 }
                 ImageEngine.STAGE_SAMPLING -> {
                     if (step > lastStepSeen) lastStepSeen = step
@@ -1569,6 +1577,11 @@ class MainActivity : AppCompatActivity() {
         /** Marks the start of the phases the estimate needs to know about. */
         private fun enterStage(stage: Int) {
             if (stage == currentStage) return
+            // Phases only move forward. The text encoder loads its own weights
+            // lazily while it runs, and those events arrive as LOADING; without
+            // this the label went back to "loading weights" in the middle of
+            // encoding and never showed "理解提示词".
+            if (stage == ImageEngine.STAGE_LOADING && currentStage != ImageEngine.STAGE_LOADING) return
             currentStage = stage
             // The tick keeps running across every phase now: it is the only
             // thing that moves the bar and the countdown.
@@ -3395,7 +3408,6 @@ class MainActivity : AppCompatActivity() {
         // still going, so it must not read 0.
         private const val MIN_REMAINING_MS = 1_000L
         private const val MIN_TOTAL_ESTIMATE_MS = 3_000L
-        private const val PROGRESS_EPSILON = 0.01f
         private const val PREVIEW_FIRST_STEP = 2
         // Two previews per second is plenty for a thumbnail and keeps the
         // downsampled JPEG-free bitmap churn off the UI thread budget.

@@ -16,6 +16,8 @@ object ImagePromptMarker {
 
     private const val SENTINEL = '\uE000'
 
+    /** Prefix the native side looks for; versioned so the shape can change. */
+    private const val BRIDGE = "\u0001image-gen:v1:"
     fun encode(text: String): String = SENTINEL + text
 
     fun strip(text: String): String =
@@ -32,12 +34,45 @@ object ImagePromptMarker {
 
     /**
      * Text that goes back into the LLM context for an image turn: the prompt
-     * itself, and a note that the picture was drawn (so the model does not
-     * claim to have drawn it itself).
+     * itself, and a machine-readable record of the draw.
+     *
+     * The native side turns the record into a real `generate_image` tool call
+     * plus its result, which is what the model needs to see to call the tool
+     * again on the next request. It is one JSON object wrapped in \u0001 on
+     * both sides: a prompt containing `]`, quotes or newlines cannot truncate
+     * it the way the older `[image generated: ...]` text could.
      */
     fun forLlm(text: String): Pair<String, String>? {
         if (!isImageTurn(text)) return null
         val prompt = strip(text).trim()
-        return prompt to "[image generated: $prompt]"
+        val payload = """{"prompt":${quote(prompt)},"result":"The image was generated and shown to the user."}"""
+        return prompt to "$BRIDGE$payload\u0001"
+    }
+
+    /**
+     * Bridge record for a picture drawn through the tool: same payload as
+     * [forLlm] but written straight from the prompt, no sentinel round trip.
+     */
+    fun toolRecord(prompt: String): String {
+        val payload = """{"prompt":${quote(prompt)},"result":"The image was generated and shown to the user."}"""
+        return "$BRIDGE$payload\u0001"
+    }
+
+    /** Minimal JSON string escaping; the payload never leaves this app. */
+    private fun quote(value: String): String {
+        val out = StringBuilder(value.length + 2)
+        out.append('"')
+        for (c in value) {
+            when (c) {
+                '"' -> out.append("\\\"")
+                '\\' -> out.append("\\\\")
+                '\n' -> out.append("\\n")
+                '\r' -> out.append("\\r")
+                '\t' -> out.append("\\t")
+                else -> if (c < ' ') out.append(String.format("\\u%04x", c.code)) else out.append(c)
+            }
+        }
+        out.append('"')
+        return out.toString()
     }
 }

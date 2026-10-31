@@ -50,6 +50,10 @@ class ImageEngine private constructor(
 
         private const val INIT_TIMEOUT_MS = 30_000L
 
+        // A text encode never finishes this fast on a phone; anything shorter is
+        // a phase announcement mistaken for the end of the encode.
+        private const val MIN_ENCODE_MS = 100L
+
         // One bridge for the whole process; rebuilt engines re-point it.
         private val sharedBridge = Bridge(null)
 
@@ -88,6 +92,59 @@ class ImageEngine private constructor(
     @Volatile
     var isLoaded = false
         private set
+
+    // ---- phase timings of the most recent draw -------------------------
+    // Kept on the engine rather than in the UI: they describe the model and
+    // the device, not one bubble. The tool flow prepares the engine minutes
+    // before it draws and reloads the chat model afterwards, so a UI object
+    // created at "start" has almost no elapsed time to reason from.
+    // Read from the progress callback (native thread) and from the UI thread.
+    @Volatile private var encodeStartedAt = 0L
+    @Volatile private var samplingStartedAt = 0L
+    @Volatile private var decodeStartedAt = 0L
+    @Volatile private var lastEncodeMs = 0L
+    @Volatile private var lastDecodeMs = 0L
+    @Volatile private var lastStepMs = 0L
+
+    /** Wall time from the draw's start to its first denoising step. */
+    val encodeMs: Long get() = lastEncodeMs
+
+    /** Wall time of the last denoising step; 0 before the first one. */
+    val stepMs: Long get() = lastStepMs
+
+    /** Wall time of the VAE decode; 0 until it has run. */
+    val decodeMs: Long get() = lastDecodeMs
+
+    /**
+     * Called by the progress bridge; [elapsed] is the step's own duration.
+     *
+     * [step] matters: the wrapper announces every phase change as a step-less
+     * event, so the first SAMPLING event is "denoising is starting", not "the
+     * first step is done". Measuring the encode phase on that event produced a
+     * ~1 ms encode time (the announcement lands as the encoder exits), which
+     * was then saved and made every later estimate jump straight to the end of
+     * the encoding band.
+     */
+    internal fun onNativeStep(stage: Int, step: Int, elapsedMs: Double) {
+        val now = SystemClock.elapsedRealtime()
+        when (stage) {
+            STAGE_SAMPLING -> {
+                if (samplingStartedAt == 0L) samplingStartedAt = now
+                // Only a real step finishes the encode phase.
+                if (step > 0 && lastEncodeMs == 0L && encodeStartedAt > 0L) {
+                    val measured = now - encodeStartedAt
+                    // A sub-100 ms reading cannot be a real text encode on this
+                    // hardware; keep the previous value instead of poisoning the
+                    // stored one.
+                    if (measured >= MIN_ENCODE_MS) lastEncodeMs = measured
+                }
+                if (elapsedMs > 0.0) lastStepMs = elapsedMs.toLong()
+            }
+            STAGE_DECODING -> {
+                if (decodeStartedAt == 0L) decodeStartedAt = now
+            }
+        }
+    }
 
     @Volatile
     var modelVersion: String = "Unknown"
@@ -210,8 +267,14 @@ class ImageEngine private constructor(
      */
     internal class Bridge(@Volatile var engine: ImageEngine?) {
         @Suppress("unused")  // called from native
-        fun onStep(pass: Int, stage: Int, step: Int, steps: Int, elapsedMs: Double): Boolean =
-            engine?.progressListener?.onStep(pass, stage, step, steps, elapsedMs) ?: true
+        fun onStep(pass: Int, stage: Int, step: Int, steps: Int, elapsedMs: Double): Boolean {
+            val current = engine ?: return true
+            // Timings are recorded even when no UI is listening: they belong
+            // to the engine, and the listener is installed late (after a model
+            // load) or removed right after a draw.
+            current.onNativeStep(stage, step, elapsedMs)
+            return current.progressListener?.onStep(pass, stage, step, steps, elapsedMs) ?: true
+        }
 
         @Suppress("unused")  // called from native
         fun onPreview(pass: Int, step: Int, width: Int, height: Int, rgb: ByteArray) {
@@ -416,6 +479,16 @@ class ImageEngine private constructor(
                 "generate(${width}x$height steps=$steps cfg=$cfg seed=$seed) -> native call"
             )
             isGenerating = true
+            // The remaining-time estimate is split by phase, so each timer
+            // starts at the moment its phase does. On the native thread and
+            // right before the native call, otherwise the queueing time would
+            // be counted as part of a phase that has not started.
+            lastEncodeMs = 0L
+            lastDecodeMs = 0L
+            lastStepMs = 0L
+            samplingStartedAt = 0L
+            decodeStartedAt = 0L
+            encodeStartedAt = SystemClock.elapsedRealtime()
             val usedSeed = try {
                 nativeGenerate(prompt, negativePrompt, width, height, steps, cfg, seed, outputPath)
             } finally {
@@ -432,6 +505,14 @@ class ImageEngine private constructor(
                 return null
             }
             outcome = "ok seed=$usedSeed"
+            // Settle the decode timer: the draw ends inside it and is never
+            // "left" the way the other phases are. Guarded, because the native
+            // side only announces the decode through the listener: if that
+            // listener was replaced mid-draw the start is still 0 and the
+            // subtraction would report the whole run as decode time.
+            if (decodeStartedAt > 0L) {
+                lastDecodeMs = SystemClock.elapsedRealtime() - decodeStartedAt
+            }
             _state.value = ImageState.Ready
             Log.i(TAG, "Image generated with seed $usedSeed: $outputPath (${File(outputPath).length() / 1024} KB)")
             return usedSeed

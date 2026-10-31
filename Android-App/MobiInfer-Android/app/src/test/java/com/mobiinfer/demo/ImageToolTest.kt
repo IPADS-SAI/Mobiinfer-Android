@@ -85,8 +85,57 @@ class ImageToolTest {
         assertTrue(ImagePromptMarker.isImageTurn(encoded))
         assertFalse(ImagePromptMarker.isImageTurn("a castle"))
         assertEquals("a castle", ImagePromptMarker.strip(encoded))
-        assertEquals("a castle" to "[image generated: a castle]", ImagePromptMarker.forLlm(encoded))
+        // The bridge is a machine record now: one JSON object, delimited by
+        // \u0001 so a prompt containing ']', quotes or newlines cannot truncate
+        // it the way the old "[image generated: ...]" text could.
+        val (prompt, record) = ImagePromptMarker.forLlm(encoded)!!
+        assertEquals("a castle", prompt)
+        assertTrue(record.startsWith("\u0001image-gen:v1:"))
+        assertTrue(record.endsWith("\u0001"))
+        assertTrue(record.contains("\"prompt\":\"a castle\""))
         assertNull(ImagePromptMarker.forLlm("plain question"))
+    }
+
+    @Test
+    fun bridgeRecordEscapesJson() {
+        // A prompt with the characters that broke the old text format must
+        // survive intact: it is the model's argument for a real tool call.
+        val tricky = "a cat [on a windowsill] with \"quotes\" and a\\slash\nand a newline"
+        val record = ImagePromptMarker.toolRecord(tricky)
+        assertTrue(record.startsWith("\u0001image-gen:v1:"))
+        assertTrue(record.endsWith("\u0001"))
+        // The payload between the markers has to be valid JSON on its own.
+        val payload = record.removePrefix("\u0001image-gen:v1:").dropLast(1)
+        assertTrue(payload.startsWith("{") && payload.endsWith("}"))
+        // org.json is a stub in JVM unit tests, so verify the escaping by the
+        // property that matters: every quote and backslash in the payload is
+        // escaped, and the markers cannot appear inside it.
+        assertTrue(payload.contains("\\\""))
+        assertFalse(payload.contains("\u0001"))
+        // Strip the escapes back off and the original prompt must return.
+        val unescaped = StringBuilder()
+        var i = 0
+        while (i < payload.length) {
+            val c = payload[i]
+            if (c == '\\' && i + 1 < payload.length) {
+                when (val n = payload[i + 1]) {
+                    'n' -> unescaped.append('\n')
+                    'r' -> unescaped.append('\r')
+                    't' -> unescaped.append('\t')
+                    else -> unescaped.append(n)
+                }
+                i += 2
+            } else {
+                unescaped.append(c)
+                i++
+            }
+        }
+        assertTrue(
+            "prompt must survive escaping: $payload",
+            unescaped.contains("a cat [on a windowsill]")
+        )
+        assertTrue("quotes survive", unescaped.contains("\"quotes\""))
+        assertTrue("backslash survives", unescaped.contains("a\\slash"))
     }
 
     @Test
