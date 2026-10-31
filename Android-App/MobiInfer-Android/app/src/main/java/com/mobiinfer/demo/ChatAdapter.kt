@@ -164,7 +164,20 @@ class ChatAdapter(
 
     /** Records the newest state of a drawing row; repaints only its label. */
     fun updateImageItem(item: ChatMessage.ImageResult) {
-        liveImageItems[item.id] = item
+        // Two paths write this row - the progress label and the preview frames -
+        // and each carries whatever copy of the message its caller had. Keeping
+        // the larger progress (and the newer frame) stops the older write from
+        // undoing the newer one when a rebind reads the map back.
+        val known = liveImageItems[item.id]
+        val merged = if (known != null && known.isGenerating && item.isGenerating) {
+            item.copy(
+                progress = maxOf(item.progress, known.progress).coerceIn(0f, 1f),
+                previewBitmap = item.previewBitmap ?: known.previewBitmap
+            )
+        } else {
+            item
+        }
+        liveImageItems[item.id] = merged
         val holder = activeImageHolder
         val isBound = item.id == activeImageId && holder != null
         if (!isBound) {
@@ -195,28 +208,14 @@ class ChatAdapter(
             }
             return
         }
-        holder.updateProgress(item.progress, item.stage)
-        item.previewBitmap?.let { holder.showPreview(it) }
+        holder.updateProgress(merged.progress, merged.stage)
+        merged.previewBitmap?.let { holder.showPreview(it) }
     }
 
     /** Drops the live state of a row that finished or was removed. */
     fun forgetImageItem(id: Long) {
         liveImageItems.remove(id)
     }
-
-    /**
-     * Pushes progress into the row that is currently on screen.
-     *
-     * Does not rebind: the bar moves several times per second and a full submit
-     * for each of them is what made it flicker. Callers keep [updateImageItem]
-     * in step so later rebinds still see the newest value.
-     */
-    fun notifyImageProgress(id: Long, fraction: Float, stage: String?) {
-        if (id == activeImageId) {
-            activeImageHolder?.updateProgress(fraction, stage)
-        }
-    }
-
     /**
      * Swaps in a live preview frame. Returns false when the row is no longer
      * bound, so the caller can recycle the bitmap.
@@ -481,9 +480,22 @@ class ChatAdapter(
         // (the selection may have changed since), but ImageResult carries no
         // model name; the label is therefore only shown while generating.
         private var boundPath: String? = null
+        // Id of the draw this row is showing, and the furthest the bar has got.
+        // bind() receives whatever copy of the item the list holds, and the
+        // progress label and the preview frames are written by two different
+        // paths, so that copy is not always the newest one. Without a floor the
+        // bar stepped back to the older value on every rebind - the flicker.
+        private var progressItemId: Long = -1L
+        private var maxProgress: Float = 0f
 
         fun bind(item: ChatMessage.ImageResult) {
             val ctx = itemView.context
+            // A recycled view may still hold the previous draw's high-water mark;
+            // the floor only makes sense within one message.
+            if (item.id != progressItemId) {
+                progressItemId = item.id
+                maxProgress = 0f
+            }
             // The card names the checkpoint that draws the picture, not the
             // selection: during a tool turn the selection is the language model.
             tvModel.text = item.imageModelName
@@ -572,9 +584,14 @@ class ChatAdapter(
                 progressBar.isIndeterminate = true
             } else {
                 progressBar.isIndeterminate = false
+                // The bar never goes backwards within one draw: a stale copy of
+                // the item (another write path got there first) must not pull it
+                // back down to an earlier percentage.
+                val shown = maxOf(fraction, maxProgress).coerceIn(0f, 1f)
+                maxProgress = shown
                 // No animation: a 500 ms cross-fade per step reads as jitter
                 // while the bar is being restarted every step.
-                progressBar.setProgressCompat((fraction * 100f).toInt().coerceIn(0, 100), false)
+                progressBar.setProgressCompat((shown * 100f).toInt().coerceIn(0, 100), false)
             }
             stage?.let { tvProgress.text = it }
         }
