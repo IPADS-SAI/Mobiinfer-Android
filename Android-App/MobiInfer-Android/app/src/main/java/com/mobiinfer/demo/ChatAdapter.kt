@@ -190,18 +190,27 @@ class ChatAdapter(
             // notifyItemChanged() alone is not enough: it resolves the position
             // through currentList, and the image row is inserted ahead of the
             // assistant bubble, so while that insert is still pending the index
-            // is -1 and the rebind is skipped. Re-submitting the list instead
-            // always runs a diff, and onBindViewHolder() then reads this map.
-            // A fresh list instance is required: submitList() compares by
-            // identity first and would return early for currentList itself.
+            // is -1 and the rebind is skipped.
+            //
+            // Re-submitting currentList().toMutableList() is NOT enough either -
+            // that was a real defect. The list is a new object but its
+            // ImageResult is still the stale copy the adapter holds, so the diff
+            // sees nothing changed, onBindViewHolder is never called, and the
+            // new progress sat in liveImageItems with nobody to read it. The
+            // merged item has to be planted into the list being submitted.
             // Throttled, because a rebind re-creates the row and a submit per
             // frame is exactly the flicker this avoids.
             if (item.isGenerating) {
                 val now = SystemClock.elapsedRealtime()
                 val last = lastRebindAt[item.id] ?: 0L
                 if (now - last >= REBIND_INTERVAL_MS) {
-                    lastRebindAt[item.id] = now
-                    submitList(currentList.toMutableList())
+                    val list = currentList.toMutableList()
+                    val at = list.indexOfFirst { it.id == item.id }
+                    if (at >= 0) {
+                        lastRebindAt[item.id] = now
+                        list[at] = merged
+                        submitList(list)
+                    }
                 }
             } else {
                 liveImageItems.remove(item.id)

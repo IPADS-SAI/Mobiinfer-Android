@@ -561,7 +561,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 .show()
         }
-        btnSend.setOnClickListener { handleUserInput() }
+        btnSend.setOnClickListener { if (isBusy()) explainBusy() else handleUserInput() }
         tvTitleModel.setOnClickListener { showModelSelector() }
         btnModelSelect.setOnClickListener { showModelSelector() }
         btnModelManager.setOnClickListener {
@@ -784,7 +784,8 @@ class MainActivity : AppCompatActivity() {
                     is LlamaState.PrefillingImage -> {
                         isModelReady = true
                         etInput.isEnabled = true
-                        btnSend.isEnabled = !isProcessingVideo
+                        btnSend.isEnabled = true
+                        btnSend.alpha = if (isProcessingVideo) 0.38f else 1f
                         btnImage.isEnabled = false
                     }
                     is LlamaState.UnloadingModel -> {
@@ -802,12 +803,32 @@ class MainActivity : AppCompatActivity() {
 
     private fun enableInput(enable: Boolean) {
         etInput.isEnabled = enable
-        btnSend.isEnabled = enable
+        // The send button stays clickable on purpose. Disabling it made a tap
+        // during a draw or a reply do nothing at all - no toast, no change - so
+        // the screen looked frozen and the user could not tell whether the
+        // message had been sent. Dimming it keeps the "not now" signal, and the
+        // click handler explains the wait instead of ignoring it.
+        btnSend.isEnabled = true
+        btnSend.alpha = if (enable) 1f else 0.38f
         if (!enable) {
             btnImage.isEnabled = false
         } else {
             btnImage.isEnabled = engine.isVisionSupported
         }
+    }
+
+    /** True while a draw or a stream owns the conversation. */
+    private fun isBusy(): Boolean =
+        imageJob?.isActive == true || generationJob?.isActive == true || isInlineModelLoad
+
+    /** Says why a send was not accepted instead of swallowing it. */
+    private fun explainBusy() {
+        val text = when {
+            imageJob?.isActive == true -> getString(R.string.image_generating)
+            isInlineModelLoad -> getString(R.string.model_loading_in_progress)
+            else -> getString(R.string.thinking_in_progress)
+        }
+        Toast.makeText(this, text, Toast.LENGTH_SHORT).show()
     }
 
     /**
@@ -819,6 +840,7 @@ class MainActivity : AppCompatActivity() {
     private fun enableTextInput() {
         etInput.isEnabled = true
         btnSend.isEnabled = true
+        btnSend.alpha = 1f
         btnImage.isEnabled = false
         btnImage.visibility = View.GONE
         val supportsThinking = LlamaEngine.getSelectedModel(applicationContext).supportsThinking
@@ -1833,7 +1855,14 @@ class MainActivity : AppCompatActivity() {
 
             // What this draw would cost if a measurement of the same model under
             // the same settings existed; otherwise the model's defaults.
+            // The checkpoint check is essential: fp16 and q4 differ by roughly
+            // 3x, so reusing one's numbers for the other parks the bar at 99%
+            // for tens of seconds while the estimate runs out early. A record
+            // without a model id predates this tracking and cannot be
+            // attributed to a checkpoint, so it is not used either.
+            val sameModel = stored.modelId.isNotEmpty() && stored.modelId == modelId
             val base: BaseTiming = if (
+                sameModel &&
                 stored.encodeMs >= MIN_PLAUSIBLE_ENCODE_MS &&
                 stored.perStepMs >= MIN_PLAUSIBLE_STEP_MS &&
                 stored.decodeMs > 0L
@@ -2060,6 +2089,8 @@ class MainActivity : AppCompatActivity() {
         val current = messages[index] as? ChatMessage.AiMessage ?: return
         if (current.waitingForImage == waiting) return
         messages[index] = current.copy(waitingForImage = waiting)
+        // Every later state change reads `messages` and copies from it, so the
+        // flag survives on its own; the submit only has to make it visible.
         chatAdapter.submitList(messages.toList())
     }
 
