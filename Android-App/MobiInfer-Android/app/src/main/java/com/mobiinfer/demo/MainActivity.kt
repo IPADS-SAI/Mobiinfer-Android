@@ -1899,9 +1899,28 @@ class MainActivity : AppCompatActivity() {
             // this used to) overestimated the first two and underestimated the
             // last at large sizes.
             val areaScale = areaThis.toDouble() / areaRef.toDouble()
-            val encodeArea = 1.0 + (areaScale - 1.0) * 0.04
-            val stepArea = 1.0 + (areaScale - 1.0) * if (isFp16) 0.05 else 0.42
-            val decodeArea = 1.0 + (areaScale - 1.0) * 1.57
+            // The encoder is dominated by the text model: 3.94x the pixels moved
+            // it 1.12x, 4x -> 4x the steps moved it 0.99x. A mild multiplier is
+            // enough.
+            val encodeArea = 1.0 + (areaScale - 1.0) * 0.03
+            // One denoising step scales sub-linearly, by a different exponent per
+            // precision. Measured as (denoise total / steps): fp16 4162 ms at
+            // 256x256, 4711 at 3.94x the pixels, 5354 at 4.00x (k~0.09-0.18, so
+            // 0.14); q4 991 -> 2204 (k~0.58). Deriving it from the gaps between
+            // step events instead gives ~0.35 and is wrong: the first step event
+            // is emitted when that step completes, so a divide by the step count
+            // is the honest figure.
+            val stepArea = Math.pow(areaScale, if (isFp16) 0.14 else 0.58)
+            // The VAE decode is not a smooth function of pixels at all - it is
+            // the tile grid. Measured: 448x576 (258k px) is 6 tiles and 15.7 s,
+            // 512x512 (262k px, almost identical area) is 9 tiles and 23.4 s.
+            // Per tile it is a constant 2.6 s for both precisions and all sizes,
+            // so the estimate counts tiles and multiplies.
+            val decodeArea = vaeTileCount(request.width, request.height).toDouble() /
+                vaeTileCount(
+                    if (ref.width > 0) ref.width else REFERENCE_SIDE,
+                    if (ref.height > 0) ref.height else REFERENCE_SIDE
+                ).toDouble()
             // CFG > 1 doubles the denoiser work per step; the ratio against the
             // measurement uses the same rule on both sides.
             fun cfgFactor(cfg: Float) = if (cfg > 1.05f) 2.0 else 1.0
@@ -1947,8 +1966,9 @@ class MainActivity : AppCompatActivity() {
             return BaseTiming(
                 // Independent factors: encode is precision-agnostic and only
                 // mildly size-dependent, per-step is the opposite way round.
-                encodeMs = if (isFp16) 10_100L else 10_600L,
-                perStepMs = if (isFp16) 4_160L else 990L,
+                // Reference: 256x256, 4 steps, CFG 1.0, short prompt.
+                encodeMs = if (isFp16) 9_500L else 10_600L,
+                perStepMs = if (isFp16) 4_180L else 991L,
                 decodeMs = 2_790L,
                 // The reference the figures above were measured at. Using the
                 // request's own size here (as this did) made areaScale come out
@@ -1965,6 +1985,36 @@ class MainActivity : AppCompatActivity() {
                 )
             )
         }
+
+        /**
+         * Number of VAE tiles the decoder splits an image into.
+         *
+         * Mirrors sd_tiling_plan_axis() in sdcpp-hexagon/src/runtime/tiling.cpp:
+         * the tiling runs on latent dimensions (pixels / 8) with 32-latent
+         * tiles and a 0.25 target overlap. Checked against the device: 256x256
+         * -> 1 tile, 448x576 -> 6, 512x512 -> 9, which is what the native
+         * progress stream reports and what the decode time divides by.
+         */
+        private fun vaeTileCount(width: Int, height: Int): Int {
+            val latentW = (width.coerceAtLeast(8) / 8).coerceAtLeast(1)
+            val latentH = (height.coerceAtLeast(8) / 8).coerceAtLeast(1)
+            return axisTiles(latentW) * axisTiles(latentH)
+        }
+
+        private fun axisTiles(dimension: Int): Int {
+            if (VAE_TILE_LATENT >= dimension) return 1
+            val extent = dimension - VAE_TILE_LATENT
+            val target = extent / ((1.0 - VAE_TILE_OVERLAP) * VAE_TILE_LATENT)
+            val minIntervals = 1 + (extent - 1) / (VAE_TILE_LATENT - 1)
+            val maxIntervals = maxOf(1, 2 * extent / VAE_TILE_LATENT)
+            fun clamp(v: Int) = v.coerceIn(minIntervals, maxIntervals)
+            val lower = clamp(kotlin.math.floor(target).toInt())
+            val upper = clamp(kotlin.math.ceil(target).toInt())
+            fun error(count: Int) = kotlin.math.abs(1.0 / count - 1.0 / target)
+            val intervals = if (error(upper) < error(lower)) upper else lower
+            return intervals + 1
+        }
+
 
         /**
          * Remaining time, from the clock only.
@@ -3490,6 +3540,9 @@ class MainActivity : AppCompatActivity() {
         private const val REFERENCE_SIDE = 256
         private const val REFERENCE_STEPS = 4
         private const val REFERENCE_PROMPT_CHARS = 12
+        // VAE tiling geometry (sdcpp runtime/tiling.cpp), in latent units.
+        private const val VAE_TILE_LATENT = 32
+        private const val VAE_TILE_OVERLAP = 0.25
         private const val PREVIEW_FIRST_STEP = 2
         // Two previews per second is plenty for a thumbnail and keeps the
         // downsampled JPEG-free bitmap churn off the UI thread budget.
