@@ -231,6 +231,8 @@ class ModelManagerActivity : AppCompatActivity() {
             onModelSelected = { model ->
                 LlamaEngine.setSelectedModel(this, model.id)
                 updateMemoryBudgetVisibility()
+                // Steps are per checkpoint build, so re-read them for the new pick.
+                refreshImageParameters()
                 // Selection is lazy: never unload/load here. Loading happens on
                 // the home page when the user sends a request.
                 if (!LlamaEngine.modelsExist(this, model)) {
@@ -268,6 +270,8 @@ class ModelManagerActivity : AppCompatActivity() {
             onModelSelected = { model ->
                 LlamaEngine.setSelectedModel(this, model.id)
                 updateMemoryBudgetVisibility()
+                // Steps are per checkpoint build, so re-read them for the new pick.
+                refreshImageParameters()
                 if (!LlamaEngine.modelsExist(this, model)) {
                     Toast.makeText(this, R.string.model_not_downloaded_hint, Toast.LENGTH_SHORT).show()
                 } else {
@@ -431,7 +435,9 @@ class ModelManagerActivity : AppCompatActivity() {
         findViewById<MaterialButton>(R.id.btn_image_reset).setOnClickListener {
             LlamaEngine.setImageGenWidth(this, LlamaEngine.DEFAULT_IMAGE_GEN_SIDE)
             LlamaEngine.setImageGenHeight(this, LlamaEngine.DEFAULT_IMAGE_GEN_SIDE)
-            LlamaEngine.setImageGenSteps(this, LlamaEngine.DEFAULT_IMAGE_GEN_STEPS)
+            // Reset means "back to what this checkpoint was trained for", which
+            // is 4 steps for the distill DiT and 8 for the turbo one.
+            LlamaEngine.resetImageGenSteps(this)
             LlamaEngine.setImageGenCfg(this, LlamaEngine.DEFAULT_IMAGE_GEN_CFG)
             LlamaEngine.setImageNegativePrompt(this, "")
             LlamaEngine.setImageGenSeed(this, LlamaEngine.RANDOM_IMAGE_SEED)
@@ -501,9 +507,15 @@ class ModelManagerActivity : AppCompatActivity() {
         String.format(java.util.Locale.getDefault(), "%.1f", value)
 
     private fun fractionOf(model: ModelInfo): Float {
-        if (model.totalBytes <= 0L) return 0f
-        val downloaded = LlamaEngine.downloadedBytes(this, model)
-        return (downloaded.toDouble() / model.totalBytes.toDouble()).toFloat().coerceIn(0f, 1f)
+        // Model-owned bytes only, on both sides of the ratio: the shared text
+        // encoder / VAE / tokenizer are excluded from the denominator by
+        // ownNeededBytes() and from the numerator by ownDownloadedBytes().
+        // Mixing in downloadedBytes() (which walks the shared dir too) made the
+        // row read 131% -> clamped to 100% as soon as the 6 GB TE was present.
+        val needed = LlamaEngine.ownNeededBytes(this, model)
+        if (needed <= 0L) return 0f
+        val own = LlamaEngine.ownDownloadedBytes(this, model)
+        return (own.toDouble() / needed.toDouble()).toFloat().coerceIn(0f, 1f)
     }
 
     private fun refreshStates() {
@@ -572,7 +584,26 @@ class ModelManagerActivity : AppCompatActivity() {
                             ).show()
                             ModelDownloadController.acknowledge()
                         }
+                        // Delivered on busyEvents instead; nothing to render here.
+                        is ModelDownloadController.Status.Busy -> Unit
                     }
+                }
+            }
+        }
+        // "That tap did nothing because another model is downloading." Comes on
+        // its own channel so it never replaces the live Running state.
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                ModelDownloadController.busyEvents.collect { busy ->
+                    val running = ModelInfo.AVAILABLE_MODELS.firstOrNull { it.id == busy.runningModelId }
+                    Toast.makeText(
+                        this@ModelManagerActivity,
+                        getString(
+                            R.string.download_busy_other_model,
+                            running?.displayName ?: busy.runningModelId
+                        ),
+                        Toast.LENGTH_SHORT
+                    ).show()
                 }
             }
         }
@@ -623,7 +654,14 @@ class ModelManagerActivity : AppCompatActivity() {
                 runCatching { engine.unloadModel() }
             }
             val dir = File(LlamaEngine.modelDirFor(applicationContext, model))
-            val deleted = dir.exists() && dir.deleteRecursively()
+            // Two independent steps, never short-circuited: the ownership
+            // records in shared/ must be released even when the model's own
+            // directory still exists (or was deleted partially). With `||`,
+            // deleting a fully downloaded model left its shared-file claims
+            // behind, and the last 6 GB claim could then never be released.
+            val deletedDir = dir.exists() && dir.deleteRecursively()
+            val releasedExtras = releaseOwnedExtras(model)
+            val deleted = deletedDir || releasedExtras
             withContext(Dispatchers.Main) {
                 refreshStates()
                 val messageRes = if (deleted) R.string.model_files_deleted else R.string.toast_no_files_to_delete
@@ -631,6 +669,15 @@ class ModelManagerActivity : AppCompatActivity() {
             }
         }
     }
+
+    /**
+     * Removes the shared accessory files whose last user is [model].
+     * Deleting one model while the other still needs the text encoder / VAE /
+     * tokenizer keeps them in place, so switching back never re-downloads
+     * ~6 GB. Returns true when at least one file was removed.
+     */
+    private fun releaseOwnedExtras(model: ModelInfo): Boolean =
+        LlamaEngine.releaseExtraFiles(applicationContext, model)
 
     override fun onResume() {
         super.onResume()

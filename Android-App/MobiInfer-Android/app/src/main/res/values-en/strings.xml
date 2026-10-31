@@ -107,6 +107,7 @@
     <string name="toast_load_success">%1$s loaded successfully!</string>
     <string name="toast_load_failed">Load failed: %1$s</string>
     <string name="toast_downloading">Downloading…</string>
+    <string name="download_busy_other_model">%1$s is downloading; pause it before starting another model</string>
     <string name="toast_already_downloaded">Model files already exist, no need to re-download</string>
     <string name="toast_already_loading">Model is loading…</string>
     <string name="toast_model_not_found">Model file not found, please download first</string>
@@ -247,7 +248,7 @@
     <string name="image_generating">Generating image…</string>
     <string name="image_generate_failed">Image generation failed</string>
     <string name="image_error">Error: %1$s</string>
-    <string name="model_desc_moss_fp16">MOSS-Image text-to-image, FP16 8-step (best quality, ~16GB)</string>
+    <string name="model_desc_moss_fp16">MOSS-Image text-to-image, FP16 4-step distill (best quality, ~16GB)</string>
     <string name="model_desc_moss_q4">MOSS-Image text-to-image, Q4 8-step (smaller/faster, ~9GB)</string>
 
     <!-- Text-to-image UI -->
@@ -310,6 +311,7 @@
     <string name="config_reload_for_prompt">The image tool setting changed; the language model reloads on your next message.</string>
     <string name="tool_download_image_model_short">Downloading image model %1$s</string>
     <string name="image_model_download_failed">The image model download did not finish</string>
+    <string name="image_model_paused_hint">Image model download is paused; tap Resume to continue</string>
     <string name="image_load_failed">Could not load the image model</string>
     <string name="image_copy_error">Copy error</string>
     <string name="image_error_copied">Copied</string>
@@ -329,8 +331,8 @@
     <string name="image_stage_decoding_title">Decoding</string>
     <string name="tool_reloading_model">Reloading the model…</string>
     <string name="image_progress_label_short">%1$d%% · %2$s</string>
-    <string name="image_param_steps_hint">Denoising iterations. MOSS needs 8; past 12 the gain is small and the wait is not.</string>
-    <string name="image_param_cfg_hint">Higher CFG follows the prompt more strictly but saturates and blurs the picture; 3.0 is stable for MOSS.</string>
+    <string name="image_param_steps_hint">Denoising iterations, matched to the checkpoint: 8 for the 8-step turbo build, 4 for the 4-step distill build. Straying far from that degrades the image.</string>
+    <string name="image_param_cfg_hint">Higher CFG follows the prompt more strictly but saturates and blurs the picture. MOSS distilled checkpoints default to 1.0; around 3.0 tracks the prompt harder but oversaturates easily.</string>
     <string name="image_param_seed_hint">Same seed + same prompt = the same picture, handy for tweaking</string>
     <string name="image_param_seed">Seed</string>
     <string name="image_param_seed_random_action">New seed</string>
@@ -338,4 +340,6 @@
     <string name="image_param_height">Height (px)</string>
     <string name="tool_restoring_context">Restoring the conversation…</string>
     <string name="image_param_seed_box">0–9999, leave empty for a new seed each time</string>
+    <string name="tool_generating_image_short">Generating the image…</string>
+    <string name="tool_loading_image_model">Loading the image model…</string>
 </resources>

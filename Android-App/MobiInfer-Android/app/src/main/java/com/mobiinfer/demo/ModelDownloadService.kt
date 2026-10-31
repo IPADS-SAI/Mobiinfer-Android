@@ -19,8 +19,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
@@ -60,6 +63,12 @@ class ModelDownloadService : Service() {
         if (action == ACTION_PAUSE || action == ACTION_CANCEL) {
             val modelId = currentModelId ?: ModelDownloadController.runningModelId()
             Log.i(TAG, "Pause/cancel requested (model=$modelId)")
+            // Flag the stop *before* cancelling: the job may already be past
+            // every suspension point (inside a blocking socket read), and the
+            // flag is what keeps it from resuming or reporting completion.
+            if (modelId != null) {
+                LlamaEngine.flagDownloadStop(modelId)
+            }
             downloadJob?.cancel()
             if (modelId != null) {
                 if (action == ACTION_CANCEL) {
@@ -86,10 +95,22 @@ class ModelDownloadService : Service() {
             if (currentModelId == modelId) {
                 startForegroundWithNotification(buildNotification(getString(R.string.status_downloading)))
             } else {
+                // Tell the user instead of dropping the request silently: the
+                // UI would otherwise show "not downloaded" as if the tap did
+                // nothing.
                 Log.w(TAG, "Download already running for $currentModelId, ignoring $modelId")
+                ModelDownloadController.markBusy(modelId, currentModelId ?: "")
             }
             return START_NOT_STICKY
         }
+
+        // Starting a download is an explicit user action (or the chat asking
+        // to fetch the image model), so it lifts a previous pause of *this*
+        // model. Scoped to modelId on purpose: pausing A and immediately
+        // starting B must not clear A's stop marker, or A's loop keeps running
+        // and the pause looks ignored. Placed after the busy check so a request
+        // that is dropped does not clear anything either.
+        LlamaEngine.resumeRequested(modelId)
 
         currentModelId = modelId
         lastFraction = 0f
@@ -104,8 +125,14 @@ class ModelDownloadService : Service() {
                     ModelDownloadController.publishProgress(modelId, progress.message, progress.fraction)
                     updateNotification(progress.message, progress.fraction)
                 }
-                ModelDownloadController.markCompleted(modelId)
-                updateNotification(getString(R.string.download_complete_short))
+                // Publish "completed" only if nothing replaced this session
+                // meanwhile. The stop marker is checked rather than the
+                // controller status, because a resume clears the status to
+                // Running while the paused loop is still draining.
+                if (ModelDownloadController.runningModelId() == modelId) {
+                    ModelDownloadController.markCompleted(modelId)
+                    updateNotification(getString(R.string.download_complete_short))
+                }
             } catch (e: CancellationException) {
                 // Pause/cancel path already updated the controller; keep .tmp
                 // so the next start() resumes via HTTP Range.
@@ -115,7 +142,11 @@ class ModelDownloadService : Service() {
                 ModelDownloadController.markFailed(modelId, e.message ?: e::class.java.simpleName)
                 updateNotification(getString(R.string.download_failed, e.message))
             } finally {
-                currentModelId = null
+                // Only clean up what this session still owns: a paused session
+                // can finish unwinding after its successor already started, and
+                // an unconditional reset would wipe the new session's state.
+                if (currentModelId == modelId) currentModelId = null
+                LlamaEngine.clearDownloadJob(modelId)
                 releaseWakeLock()
                 stopForegroundCompat()
                 stopSelf()
@@ -299,10 +330,22 @@ object ModelDownloadController {
         data class Completed(val modelId: String) : Status()
         data class Cancelled(val modelId: String) : Status()
         data class Failed(val modelId: String, val message: String) : Status()
+
+        /**
+         * A start request was dropped because [runningModelId] is already
+         * downloading. Carries both ids so the UI can explain why nothing
+         * happened; it is transient and never becomes the running state.
+         */
+        data class Busy(val modelId: String, val runningModelId: String) : Status()
     }
 
     private val _status = MutableStateFlow<Status>(Status.Idle)
     val status: StateFlow<Status> = _status.asStateFlow()
+
+    // One-shot "this tap did nothing" notices, kept apart from [status] so they
+    // cannot replace the live Running state of the download in progress.
+    private val _busyEvents = MutableSharedFlow<Status.Busy>(extraBufferCapacity = 4)
+    val busyEvents: SharedFlow<Status.Busy> = _busyEvents.asSharedFlow()
 
     val isRunning: Boolean
         get() = _status.value is Status.Running
@@ -335,6 +378,17 @@ object ModelDownloadController {
 
     internal fun markCancelled(modelId: String) {
         _status.value = Status.Cancelled(modelId)
+    }
+
+    /**
+     * A start request was dropped because another model is downloading.
+     *
+     * Deliberately published through a separate channel instead of [status]:
+     * overwriting the live [Status.Running] would blank the row and the
+     * notification of the download that is actually running.
+     */
+    internal fun markBusy(modelId: String, runningModelId: String) {
+        _busyEvents.tryEmit(Status.Busy(modelId, runningModelId))
     }
 
     /** Drop a terminal state (Completed/Cancelled/Failed/Paused) back to Idle once acknowledged. */

@@ -78,11 +78,12 @@ data class ModelInfo(
      */
     val draftFileName: String? = null,
     /**
-     * Total size in bytes of every file this model downloads. Used only to
-     * render the single overall progress bar: the downloader accumulates
-     * bytes across all files and divides by this constant. Hardcoded from the
-     * upstream artefacts (verified against the on-device copies) rather than
-     * probed at runtime, so the bar is determinate from the first byte.
+     * Size in bytes of the payload the downloader cannot count from
+     * [ggufBytes] / [mmprojBytes] / [extraFileBytes] (bundle models, whose
+     * payloads are enumerated by [bundleManifestFile]). For a plain
+     * gguf/mmproj/extra-file model leave this at 0 and use [downloadBytes],
+     * which sums only the files that still have to be fetched — accessory
+     * files shared with an already-installed model do not inflate the bar.
      * 0 means "unknown" -> the UI keeps the bar indeterminate.
      */
     val totalBytes: Long = 0L,
@@ -97,9 +98,13 @@ data class ModelInfo(
     val bundleManifestFile: String? = null,
     /**
      * Additional downloadable files (relative to [msRepo]) beyond
-     * [ggufFileName], fetched into the per-model directory when no bundle
-     * manifest is used. Used by text-to-image models (MOSS-Image) which need
-     * a text encoder, VAE and tokenizer alongside the diffusion checkpoint.
+     * [ggufFileName], fetched when no bundle manifest is used. Used by
+     * text-to-image models (MOSS-Image) which need a text encoder, VAE and
+     * tokenizer alongside the diffusion checkpoint.
+     *
+     * These are stored once per app (see `LlamaEngine.extraFilePath`) and
+     * shared by every model that lists the same file name, so switching
+     * between MOSS-Image checkpoints does not re-download the text encoder.
      */
     val extraFiles: List<String> = emptyList(),
     /**
@@ -107,7 +112,18 @@ data class ModelInfo(
      * size lets the downloader skip files that are already complete instead of
      * re-fetching them on every run.
      */
-    val extraFileBytes: Map<String, Long> = emptyMap()
+    val extraFileBytes: Map<String, Long> = emptyMap(),
+    /**
+     * Default denoising step count for a text-to-image checkpoint, tied to how
+     * the diffusion transformer was trained (8 for the turbo build, 4 for the
+     * distilled build). Null keeps the app-wide default.
+     */
+    val defaultSteps: Int? = null,
+    /**
+     * Default CFG scale for a text-to-image checkpoint. Null keeps the
+     * app-wide default.
+     */
+    val defaultCfg: Float? = null
 ) {
     /** True for text-only models that have no vision projector. */
     val isTextOnly: Boolean
@@ -164,6 +180,36 @@ data class ModelInfo(
     /** Whether the model registers at least one HF / MS repo for racing. */
     val hasRemoteSources: Boolean
         get() = !hfRepo.isNullOrBlank() || !msRepo.isNullOrBlank()
+
+    /**
+     * Bytes this model still has to fetch, given the accessory files that are
+     * already installed by another model ([sharedExtraBytes] = the summed size
+     * of [extraFiles] entries that are already on disk anywhere).
+     *
+     * Plain multi-file models derive this from the pinned per-file sizes, so
+     * the progress bar stays determinate from the first byte without a model
+     * hard-coding (and having to maintain) a grand total. Bundle models keep
+     * their declared [totalBytes], which is the only source for manifest
+     * payloads.
+     */
+    fun downloadBytes(sharedExtraBytes: Long): Long {
+        val payload = if (bundleManifestFile == null) {
+            (ggufBytes ?: 0L) + (mmprojBytes ?: 0L) + (acousticBytes ?: 0L) +
+                extraFiles.sumOf { extraFileBytes[it] ?: 0L } - sharedExtraBytes
+        } else {
+            totalBytes
+        }
+        return payload.coerceAtLeast(0L)
+    }
+
+    /** Total bytes this model occupies on disk once every file is present. */
+    val installedBytes: Long
+        get() = if (bundleManifestFile != null) {
+            totalBytes
+        } else {
+            (ggufBytes ?: 0L) + (mmprojBytes ?: 0L) + (acousticBytes ?: 0L) +
+                extraFiles.sumOf { extraFileBytes[it] ?: 0L }
+        }
 
     companion object {
         /**
@@ -257,27 +303,30 @@ data class ModelInfo(
                 mmprojBytes = 836_180_256L,
                 totalBytes = 3_333_461_920L
             ),
-            // MOSS-Image text-to-image, fp16 8-step (best quality). Runs on the
-            // Hexagon NPU via the sdcpp-hexagon fork (libimagegen). ggufFileName
-            // is the DiT; extraFiles carry the text encoder, VAE and tokenizer.
+            // MOSS-Image text-to-image, fp16 4-step distill (best quality).
+            // Runs on the Hexagon NPU via the sdcpp-hexagon fork (libimagegen).
+            // ggufFileName is the DiT; extraFiles carry the text encoder, VAE
+            // and tokenizer, which are stored once per app and shared with the
+            // q4 variant below.
             ModelInfo(
                 id = "sd-moss-image-fp16",
-                displayName = "MOSS-Image FP16 (8-step)",
+                displayName = "MOSS-Image FP16 (4-step distill)",
                 descriptionResName = "model_desc_moss_fp16",
-                ggufFileName = "moss-sft-official-f16.gguf",
-                msRepo = "YYDH21/moss-image-hexagon",
+                ggufFileName = "moss-4step-distill-f16.gguf",
+                msRepo = "fengerhu1/moss-image-hexagon",
                 extraFiles = listOf(
                     "qwen3.5-9b-q4km.gguf",
                     "flux2-vae.safetensors",
                     "tokenizer.json"
                 ),
                 ggufBytes = 10_164_640_640L,
+                defaultSteps = 4,
+                defaultCfg = 1.0f,
                 extraFileBytes = mapOf(
                     "qwen3.5-9b-q4km.gguf" to 5_680_522_464L,
                     "flux2-vae.safetensors" to 336_211_292L,
                     "tokenizer.json" to 19_989_325L
-                ),
-                totalBytes = 16_201_363_721L
+                )
             ),
             // MOSS-Image q4 8-step (smaller, faster). Same TE/VAE/tokenizer
             // as the fp16 variant; only the DiT is quantized.
@@ -286,19 +335,20 @@ data class ModelInfo(
                 displayName = "MOSS-Image Q4 (8-step)",
                 descriptionResName = "model_desc_moss_q4",
                 ggufFileName = "moss-turbo8-q4km-f16t.gguf",
-                msRepo = "YYDH21/moss-image-hexagon",
+                msRepo = "fengerhu1/moss-image-hexagon",
                 extraFiles = listOf(
                     "qwen3.5-9b-q4km.gguf",
                     "flux2-vae.safetensors",
                     "tokenizer.json"
                 ),
                 ggufBytes = 3_600_669_568L,
+                defaultSteps = 8,
+                defaultCfg = 1.0f,
                 extraFileBytes = mapOf(
                     "qwen3.5-9b-q4km.gguf" to 5_680_522_464L,
                     "flux2-vae.safetensors" to 336_211_292L,
                     "tokenizer.json" to 19_989_325L
-                ),
-                totalBytes = 9_637_392_649L
+                )
             )
         )
 

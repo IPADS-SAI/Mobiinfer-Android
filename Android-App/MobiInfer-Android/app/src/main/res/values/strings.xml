@@ -112,6 +112,7 @@
     <string name="toast_load_success">%1$s 加载成功!</string>
     <string name="toast_load_failed">加载失败: %1$s</string>
     <string name="toast_downloading">正在下载中...</string>
+    <string name="download_busy_other_model">正在下载 %1$s，请先暂停再下载其他模型</string>
     <string name="toast_already_downloaded">模型文件已存在，无需重复下载</string>
     <string name="toast_already_loading">模型正在加载中...</string>
     <string name="toast_model_not_found">模型文件不存在，请先下载</string>
@@ -255,7 +256,7 @@
     <string name="image_generating">正在生成图片…</string>
     <string name="image_generate_failed">图片生成失败</string>
     <string name="image_error">错误: %1$s</string>
-    <string name="model_desc_moss_fp16">MOSS-Image 文生图，FP16 8 步（画质最佳，约 16GB）</string>
+    <string name="model_desc_moss_fp16">MOSS-Image 文生图，FP16 4 步蒸馏（画质最佳，约 16GB）</string>
     <string name="model_desc_moss_q4">MOSS-Image 文生图，Q4 8 步（更小更快，约 9GB）</string>
 
     <!-- Text-to-image UI -->
@@ -318,6 +319,7 @@
     <string name="config_reload_for_prompt">已切换生成图片工具，语言模型将在下次对话时重新加载。</string>
     <string name="tool_download_image_model_short">正在下载文生图模型 %1$s</string>
     <string name="image_model_download_failed">文生图模型下载没有完成</string>
+    <string name="image_model_paused_hint">文生图模型下载已暂停，点「继续」后再试</string>
     <string name="image_load_failed">文生图模型加载失败</string>
     <string name="image_copy_error">复制错误信息</string>
     <string name="image_error_copied">已复制</string>
@@ -337,8 +339,8 @@
     <string name="image_stage_decoding_title">解码图片</string>
     <string name="tool_reloading_model">正在重新加载模型…</string>
     <string name="image_progress_label_short">%1$d%% · %2$s</string>
-    <string name="image_param_steps_hint">去噪迭代次数。MOSS 用 8 步即可，12 步以上收益很小，只会更慢。</string>
-    <string name="image_param_cfg_hint">CFG 越大越贴提示词，但画面容易过饱和、发糊；MOSS 用 3.0 比较稳。</string>
+    <string name="image_param_steps_hint">去噪迭代次数，按所选模型的训练步数来：8 步 Turbo 用 8，4 步蒸馏用 4。偏离太多画面会变差。</string>
+    <string name="image_param_cfg_hint">CFG 越大越贴提示词，但画面容易过饱和、发糊。MOSS 蒸馏权重默认 1.0；调到 3.0 附近更贴提示词，但易过饱和。</string>
     <string name="image_param_seed_hint">相同种子 + 相同提示词 = 同一张图，方便微调对比</string>
     <string name="image_param_seed">随机种子</string>
     <string name="image_param_seed_random_action">换个种子</string>
@@ -346,4 +348,6 @@
     <string name="image_param_height">高（像素）</string>
     <string name="tool_restoring_context">正在恢复对话上下文…</string>
     <string name="image_param_seed_box">0–9999，留空则每张随机</string>
+    <string name="tool_generating_image_short">正在生成图片…</string>
+    <string name="tool_loading_image_model">正在加载文生图模型…</string>
 </resources>

@@ -46,6 +46,8 @@ import kotlinx.coroutines.flow.takeWhile
 import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -476,7 +478,18 @@ class MainActivity : AppCompatActivity() {
     private fun clearEngineContext() {
         if (!::engine.isInitialized || engine.state.value !is LlamaState.ModelReady) return
         lifecycleScope.launch(Dispatchers.IO) {
-            try { engine.clearContext() } catch (e: Exception) { Log.w(TAG, "clearContext failed", e) }
+            try {
+                engine.clearContext()
+                // clearContext() frees and rebuilds the context, so the system
+                // prompt that was in the old KV cache is gone. Without this the
+                // next turn ran with no instructions at all - which is how a
+                // new conversation lost the image tool.
+                applyChatSystemPrompt()
+                CriticalLog.log("chat", "context cleared and system prompt re-applied")
+            } catch (e: Exception) {
+                Log.w(TAG, "clearContext failed", e)
+                CriticalLog.log("chat", "clearContext failed: ${e.javaClass.simpleName}")
+            }
         }
     }
 
@@ -1012,6 +1025,14 @@ class MainActivity : AppCompatActivity() {
                 lastImagePreparationError = getString(R.string.image_model_download_failed)
                 return null
             }
+            // The files can all be on disk already (text encoder/VAE/tokenizer
+            // shared with the other checkpoint) while this model has not been
+            // downloaded yet; a no-op download run would leave it unclaimed and
+            // modelsExist() would stay false. Claiming is free in that case.
+            if (!LlamaEngine.modelsExist(ctx, imageModel)) {
+                lastImagePreparationError = getString(R.string.image_model_download_failed)
+                return null
+            }
         }
 
         val engine = (imageEngine ?: ImageEngine.getInstance(ctx)).let {
@@ -1099,6 +1120,13 @@ class MainActivity : AppCompatActivity() {
             updateAiStatus(statusMessageId, getString(R.string.toast_downloading))
             return false
         }
+        // The user paused this download on purpose; drawing again must not
+        // silently restart it. Resume goes through the explicit resume action.
+        val paused = ModelDownloadController.status.value as? ModelDownloadController.Status.Paused
+        if (paused?.modelId == imageModel.id) {
+            updateAiStatus(statusMessageId, getString(R.string.image_model_paused_hint))
+            return false
+        }
         ModelDownloadService.start(applicationContext, imageModel.id)
         val outcome = try {
             var terminal = DownloadOutcome.Progress
@@ -1124,7 +1152,7 @@ class MainActivity : AppCompatActivity() {
         return outcome == DownloadOutcome.Done
     }
 
-    private enum class DownloadOutcome { Progress, Done, Aborted }
+    private enum class DownloadOutcome { Progress, Done, Paused, Aborted }
 
     private fun ModelDownloadController.Status.modelIdOrNull(): String? = when (this) {
         is ModelDownloadController.Status.Idle -> null
@@ -1133,6 +1161,7 @@ class MainActivity : AppCompatActivity() {
         is ModelDownloadController.Status.Completed -> modelId
         is ModelDownloadController.Status.Cancelled -> modelId
         is ModelDownloadController.Status.Failed -> modelId
+        is ModelDownloadController.Status.Busy -> modelId
     }
 
     private fun ModelDownloadController.Status.toDownloadOutcome(): DownloadOutcome = when (this) {
@@ -1145,6 +1174,10 @@ class MainActivity : AppCompatActivity() {
             ModelDownloadController.acknowledge()
             DownloadOutcome.Aborted
         }
+        // A pause is a user decision: leave the status in place so the card
+        // shows "paused" (with a resume action) instead of falling through to
+        // "aborted", which let the next draw start the download again.
+        is ModelDownloadController.Status.Paused -> DownloadOutcome.Paused
         else -> DownloadOutcome.Progress
     }
 
@@ -1182,9 +1215,9 @@ class MainActivity : AppCompatActivity() {
      * files are not all present yet.
      */
     private fun imageStackBytes(imageModel: ModelInfo): Long {
-        val files = listOf(imageModel.ggufFileName) + imageModel.extraFiles
-        val onDisk = files.sumOf { modelFileSize(imageModel, it) }
-        return if (onDisk > 0) onDisk else imageModel.totalBytes
+        val onDisk = modelFileSize(imageModel, imageModel.ggufFileName) +
+            imageModel.extraFiles.sumOf { LlamaEngine.extraFilePath(applicationContext, it).length() }
+        return if (onDisk > 0) onDisk else imageModel.installedBytes
     }
 
     private fun modelFileSize(model: ModelInfo, fileName: String): Long =
@@ -1277,7 +1310,10 @@ class MainActivity : AppCompatActivity() {
 
                 imageEngine.setProgressListener(
                     token,
-                    ImageProgressUi(resultId).also { it.onStart() }
+                    ImageProgressUi(resultId, request).also {
+                        it.expectSteps(request.steps)
+                        it.onStart()
+                    }
                 )
                 CriticalLog.log("image", "generate start: native heap ${nativeHeapMb()} MB")
                 val usedSeed = withContext(NonCancellable) {
@@ -1299,8 +1335,14 @@ class MainActivity : AppCompatActivity() {
                     return@launch
                 }
 
-                (imageEngine.progressListener as? ImageProgressUi)?.saveTiming(request.steps)
-                finishImageResult(resultId, outFile.absolutePath, request, usedSeed, (SystemClock.elapsedRealtime() - startNs))
+                (imageEngine.progressListener as? ImageProgressUi)?.also {
+                    it.stop()
+                    it.saveTiming(request.steps)
+                }
+                // Stopped before finishImageResult(): that shows the picture and
+                // saves the conversation, and none of that is drawing time.
+                val drawMs = SystemClock.elapsedRealtime() - startNs
+                finishImageResult(resultId, outFile.absolutePath, request, usedSeed, drawMs)
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -1335,7 +1377,8 @@ class MainActivity : AppCompatActivity() {
     private fun addImageResultPlaceholder(
         prompt: String,
         requestedByModel: Boolean,
-        beforeId: Long? = null
+        beforeId: Long? = null,
+        imageModelName: String? = null
     ): Long {
         val id = messageIdCounter++
         val result = ChatMessage.ImageResult(
@@ -1346,7 +1389,8 @@ class MainActivity : AppCompatActivity() {
             isGenerating = true,
             requestedByModel = requestedByModel,
             progress = 0f,
-            stage = getString(R.string.image_stage_loading)
+            stage = getString(R.string.image_stage_loading),
+            imageModelName = imageModelName
         )
         val at = beforeId?.let { anchor -> messages.indexOfFirst { it.id == anchor } } ?: -1
         if (at >= 0) messages.add(at, result) else messages.add(result)
@@ -1362,31 +1406,57 @@ class MainActivity : AppCompatActivity() {
      * and replaced in place through the adapter, because re-submitting the
      * whole list would restart the RecyclerView's animations every step.
      */
+    /**
+     * One draw's cost, as measured (or as defaulted) for a given checkpoint.
+     * [recorded] carries the settings the measurement belongs to.
+     */
+    private class BaseTiming(
+        val encodeMs: Long,
+        val perStepMs: Long,
+        val decodeMs: Long,
+        val recorded: LlamaEngine.Companion.ImageTiming
+    )
+
     private inner class ImageProgressUi(
-        private val resultId: Long
+        private val resultId: Long,
+        /**
+         * What is being drawn. The estimate needs it: the cost depends on the
+         * step count, the pixel count, the CFG scale, the prompt length and the
+         * checkpoint (fp16 vs q4). Null while the model is only loading, which
+         * has no draw to estimate yet.
+         */
+        private val request: ImageRequest? = null
     ) : ImageEngine.ProgressListener {
 
-        // Wall clock of the run and of each phase, for the remaining-time
-        // estimate. Phases are timed independently because they run at wildly
-        // different speeds (weights: seconds per tensor, sampling: seconds per
-        // step, decode: milliseconds per tile).
+        // Wall clock of the bubble, and the two marks the estimate needs:
+        // when sampling began and when the decode announced itself. The phase
+        // durations themselves live on the engine (see ImageEngine.encodeMs).
         private val startedAt = SystemClock.elapsedRealtime()
-        private var phaseStartedAt = startedAt
-        private var currentStage = ImageEngine.STAGE_LOADING
-        private var samplingStepMs = 0L
-        private var lastSamplingAt = 0L
-        private var measuredEncodeMs = 0L
-        private var measuredDecodeMs = 0L
+        // Written by the native generation thread (onStep) and read by the UI
+        // tick, so it must be volatile: without it the tick could keep seeing
+        // the initial value and the label stayed on "loading weights" for the
+        // whole draw while the phases advanced underneath.
+        @Volatile private var currentStage = ImageEngine.STAGE_LOADING
+        @Volatile private var samplingStartedAt = 0L
+        @Volatile private var decodeStartedAt = 0L
+        // When the text encoder began. Distinct from startedAt (the start of the
+        // whole draw) because the weights load first and would otherwise be
+        // counted as encoding time.
+        @Volatile private var encodingStartedAt = 0L
+        // Steps this draw will take, taken from the request: the native side
+        // only says so once denoising starts, which is too late for the
+        // estimate of the phases before it.
+        private var expectedSteps = 0
 
         private var lastPreviewStep = -1
         private var lastPreviewMs = 0L
         // Counters are per phase: loading counts tensors (426), sampling counts
         // steps (8) and decode counts tiles (140). Sharing one counter let the
         // previous phase's high-water mark swallow the next phase entirely.
-        private var loadStepSeen = 0
-        private var decodeStepSeen = 0
-        private var lastStepSeen = 0
-        private var totalSteps = 0
+        @Volatile private var loadStepSeen = 0
+        @Volatile private var decodeStepSeen = 0
+        @Volatile private var lastStepSeen = 0
+        @Volatile private var totalSteps = 0
         private var shownPercent = 0
         private var lastStageTitle = 0
 
@@ -1394,9 +1464,15 @@ class MainActivity : AppCompatActivity() {
         // values on every event.
         private var cachedEta = ""
         private var cachedEtaStage = -1
-        // Last fraction handed to the bar; a phase switch may lower the
-        // "within this phase" value, so the bar is only ever moved forward.
+        // Highest fraction published so far. The bar never moves backwards.
         private var shownFraction = 0f
+        // Drives the bar during the phases that emit no events (see startTicking).
+        private var tickJob: Job? = null
+
+        /** Told up front so the first phases can be estimated at all. */
+        fun expectSteps(steps: Int) {
+            if (steps > 0) expectedSteps = steps
+        }
 
         /**
          * The native wrapper announces the phase explicitly: it emits a
@@ -1407,58 +1483,27 @@ class MainActivity : AppCompatActivity() {
         override fun onStep(
             samplePass: Int, stage: Int, step: Int, steps: Int, elapsedMs: Double
         ): Boolean {
+            // Events only update the phase (for the label words) and the counts
+            // used for the next draw's estimate. The percentage and the
+            // countdown come from the clock in tickSecond(): the events arrive
+            // 426 times during the 4% weight load and then not at all for the
+            // ~44% text encode, so driving the bar from them was what made it
+            // jump and stall.
             when (stage) {
                 ImageEngine.STAGE_LOADING -> {
+                    if (steps > 0 && step > loadStepSeen) loadStepSeen = step
                     enterStage(ImageEngine.STAGE_LOADING)
-                    // Weight loading shares the channel with denoising but
-                    // counts tensors; it owns the first slice of the bar.
-                    if (steps > 0 && step > loadStepSeen) {
-                        loadStepSeen = step
-                        val within = (step.toFloat() / steps).coerceIn(0f, 1f)
-                        postProgress(LOADING_END * within, R.string.image_stage_loading_title)
-                    }
                 }
                 ImageEngine.STAGE_SAMPLING -> {
+                    if (step > lastStepSeen) lastStepSeen = step
+                    if (steps > 0) totalSteps = steps
                     enterStage(ImageEngine.STAGE_SAMPLING)
-                    if (steps > 0) {
-                        // Per-step clock. enterStage() zeroes lastSamplingAt,
-                        // so the first step is measured from the phase start -
-                        // measuring it from a stale clock (or skipping it)
-                        // made the estimate lurch on the first step.
-                        val now = SystemClock.elapsedRealtime()
-                        val base = if (lastSamplingAt > 0L) lastSamplingAt else phaseStartedAt
-                        if (step > lastStepSeen) {
-                            samplingStepMs = (now - base) / (step - lastStepSeen)
-                        }
-                        lastSamplingAt = now
-                        lastStepSeen = step
-                        totalSteps = steps
-                        val within = (step.toFloat() / steps).coerceIn(0f, 1f)
-                        postProgress(
-                            ENCODING_END + (SAMPLING_END - ENCODING_END) * within,
-                            R.string.image_stage_sampling_title
-                        )
-                    } else {
-                        postProgress(ENCODING_END, R.string.image_stage_sampling_title)
-                    }
                 }
                 ImageEngine.STAGE_DECODING -> {
+                    if (steps > 0 && step > decodeStepSeen) decodeStepSeen = step
                     enterStage(ImageEngine.STAGE_DECODING)
-                    // Tiles keep arriving for a while; the bar follows them
-                    // instead of sitting still at the top of the sampling band.
-                    if (steps > 0 && step > decodeStepSeen) {
-                        decodeStepSeen = step
-                        val within = (step.toFloat() / steps).coerceIn(0f, 1f)
-                        postProgress(
-                            SAMPLING_END + (1f - SAMPLING_END) * within,
-                            R.string.image_stage_decoding_title
-                        )
-                    } else {
-                        postProgress(SAMPLING_END, R.string.image_stage_decoding_title)
-                    }
                 }
-                ImageEngine.STAGE_ENCODING ->
-                    postProgress(LOADING_END, R.string.image_stage_encoding_title)
+                ImageEngine.STAGE_ENCODING -> enterStage(ImageEngine.STAGE_ENCODING)
                 else -> Unit
             }
             // The draw itself is independent of the screen; only an explicit
@@ -1492,55 +1537,170 @@ class MainActivity : AppCompatActivity() {
                     bitmap.recycle()
                     return@runOnUiThread
                 }
-                if (!chatAdapter.showImagePreview(resultId, bitmap)) bitmap.recycle()
+                // Keep the frame on the message as well as on the row. Only
+                // handing it to the bound holder meant any rebind - and the
+                // progress label rebinds every couple of percent - restored
+                // the item's (null) previewBitmap and hid the thumbnail again,
+                // so the picture flickered and mostly stayed invisible.
+                val index = messages.indexOfFirst { it.id == resultId }
+                val current = messages.getOrNull(index) as? ChatMessage.ImageResult
+                // A late frame must never be painted onto a row that already
+                // finished or failed: the id is gone from the list.
+                if (current == null || !current.isGenerating) {
+                    bitmap.recycle()
+                    return@runOnUiThread
+                }
+                val updated = current.copy(previewBitmap = bitmap)
+                messages[index] = updated
+                // Recorded for later rebinds and painted into the bound row in
+                // one step. Not submitList(): diffing and rebinding the row on
+                // every frame is what made the thumbnail and the bar flicker.
+                chatAdapter.updateImageItem(updated)
+                // The frame being replaced is NOT recycled here. submitList()
+                // commits asynchronously and DefaultItemAnimator can keep the
+                // previous drawable alive while the row cross-fades; recycling it
+                // now made the thumbnail render as an empty box. It is small
+                // (a 64 px thumbnail), it is dropped with the message, and the
+                // next frame only allocates one more, so letting the collector
+                // handle it is the safe trade.
             }
         }
 
-        /** Records how long the phase we are leaving actually took. */
+        /** Marks the start of the phases the estimate needs to know about. */
         private fun enterStage(stage: Int) {
             if (stage == currentStage) return
-            val spent = SystemClock.elapsedRealtime() - phaseStartedAt
-            when (currentStage) {
-                ImageEngine.STAGE_ENCODING -> measuredEncodeMs = spent
-                ImageEngine.STAGE_DECODING -> measuredDecodeMs = spent
-            }
             currentStage = stage
-            phaseStartedAt = SystemClock.elapsedRealtime()
-            if (stage == ImageEngine.STAGE_SAMPLING) lastSamplingAt = 0L
+            // The tick keeps running across every phase now: it is the only
+            // thing that moves the bar and the countdown.
+            val now = SystemClock.elapsedRealtime()
+            when (stage) {
+                // The encoder's own clock starts here. It must not reuse
+                // startedAt, which already includes the weight loading.
+                ImageEngine.STAGE_ENCODING -> if (encodingStartedAt == 0L) encodingStartedAt = now
+                ImageEngine.STAGE_SAMPLING -> if (samplingStartedAt == 0L) samplingStartedAt = now
+                ImageEngine.STAGE_DECODING -> if (decodeStartedAt == 0L) decodeStartedAt = now
+            }
+            // Show the new phase name immediately rather than up to a second
+            // later at the next tick. This runs on the native generation thread,
+            // so it has to hop to the UI thread.
+            val title = currentStageTitleFor(stage)
+            runOnUiThread { if (!isDestroyed) publish(title) }
+        }
+
+        private fun currentStageTitleFor(stage: Int): Int = when (stage) {
+            ImageEngine.STAGE_ENCODING -> R.string.image_stage_encoding_title
+            ImageEngine.STAGE_SAMPLING -> R.string.image_stage_sampling_title
+            ImageEngine.STAGE_DECODING -> R.string.image_stage_decoding_title
+            else -> R.string.image_stage_loading_title
         }
 
         /**
-         * Persists the measured phase times for the next draw. Called once the
-         * picture is done, when every phase has run at least once.
+         * Persists the measured step time for the next draw. Encode and decode
+         * come from the engine (ImageProgressUi does not see the native-side
+         * boundaries for them); the whole record is written anyway because the
+         * three values are stored together.
          */
         fun saveTiming(steps: Int) {
-            // The draw ends inside the decode phase, so it is never "left" the
-            // normal way; settle it here or the stored decode time is 1 ms and
-            // the next estimate promises a finish that is still 140 tiles away.
-            if (currentStage == ImageEngine.STAGE_DECODING) {
-                measuredDecodeMs = SystemClock.elapsedRealtime() - phaseStartedAt
-            }
-            if (steps <= 0 || samplingStepMs <= 0L) return
+            val stats = imageEngine ?: return
+            val perStep = stats.stepMs
+            val encode = stats.encodeMs
+            val decode = stats.decodeMs
+            // Only real measurements are stored. Filling a missing phase with
+            // the built-in default would write a guess to disk and it would be
+            // served as if it had been measured; an implausibly short encode is
+            // a measurement error too, and storing it poisons every later draw.
+            if (steps <= 0 || perStep < MIN_PLAUSIBLE_STEP_MS ||
+                encode < MIN_PLAUSIBLE_ENCODE_MS || decode <= 0L
+            ) return
+            val req = request ?: return
+            // Stored together with the settings it was measured under: the next
+            // draw scales by steps, area, CFG and prompt length, and the numbers
+            // are only valid for the same checkpoint (fp16 vs q4 differ ~3x).
             LlamaEngine.setImageTiming(
                 applicationContext,
-                encodeMs = maxOf(measuredEncodeMs, 1L),
-                perStepMs = samplingStepMs,
-                decodeMs = measuredDecodeMs
+                LlamaEngine.Companion.ImageTiming(
+                    encodeMs = encode,
+                    perStepMs = perStep,
+                    decodeMs = decode,
+                    steps = steps,
+                    width = req.width,
+                    height = req.height,
+                    cfg = req.cfg,
+                    promptChars = req.prompt.length,
+                    modelId = req.model.id
+                )
             )
         }
 
         /** First paint: the indeterminate moment before any native event. */
         fun onStart() {
-            postProgress(0f, R.string.image_stage_loading_title)
+            publish(R.string.image_stage_loading_title)
+            startTicking()
+        }
+
+        /** Stops the tick; called when the draw ends, however it ends. */
+        fun stop() {
+            tickJob?.cancel()
+            tickJob = null
         }
 
         /** Called once the model is in memory and the prompt is being read. */
         fun onEncoding() {
-            // Only record the phase. Emitting LOADING_END straight away is what
-            // made the bar snap to 40% and sit there while the native side was
-            // still starting up.
+            // Only record the phase. Emitting the end of the loading band
+            // straight away is what made the bar snap to 40% and sit there
+            // while the native side was still starting up.
             enterStage(ImageEngine.STAGE_ENCODING)
+            // The encoder emits nothing while it runs - ~12 s of silence on
+            // this device - so the bar and the countdown are driven by a tick
+            // instead of by events that never arrive.
+            startTicking()
         }
+
+        /**
+         * Repaints every second during the silent phases. Cancelled as soon as
+         * the denoising steps take over, and it never outlives the bubble.
+         */
+        /**
+         * Repaints the bubble once per second for the whole draw, in every
+         * phase.
+         *
+         * The single clock for both numbers: percentage and countdown are
+         * derived from elapsed time against one overall estimate, so they move
+         * together and neither can jump when a phase starts or ends. Stops when
+         * the row stops generating (finished, failed) or the screen goes away.
+         */
+        private fun startTicking() {
+            if (tickJob?.isActive == true) return
+            tickJob = lifecycleScope.launch {
+                while (isActive) {
+                    delay(TICK_INTERVAL_MS)
+                    if (isDestroyed || isChangingConfigurations) break
+                    val message = messages.firstOrNull { it.id == resultId } as? ChatMessage.ImageResult
+                    if (message == null || !message.isGenerating) break
+                    tickSecond()
+                }
+            }
+        }
+
+        /**
+         * Where the bar is right now.
+         *
+         * Driven by the clock against the overall estimate, not by the phase
+         * events: those arrive 426 times for the 4% weight load and then not at
+         * all for the ~44% text encode, so they cannot produce an even bar. It
+         * is capped at 99% - the picture is what marks the end, never the bar.
+         */
+        private fun currentFraction(): Float {
+            if (!startedTickingYet()) return shownFraction
+            val elapsed = (SystemClock.elapsedRealtime() - startedAt).coerceAtLeast(0L)
+            val fraction = elapsed.toFloat() / totalEstimateMs().coerceAtLeast(1L)
+            return fraction.coerceIn(0f, PROGRESS_MAX)
+        }
+
+        /** True while the draw is still running (the tick has a start mark). */
+        private fun startedTickingYet(): Boolean = startedAt > 0L
+
+        private fun currentStageTitle(): Int = currentStageTitleFor(currentStage)
 
         /**
          * One entry point for the bubble: a single percentage for the whole
@@ -1548,22 +1708,35 @@ class MainActivity : AppCompatActivity() {
          * time of the whole draw. Per-phase counters ("27 / 32 tensors") are
          * noise to the user, so they never reach the label.
          */
-        private fun postProgress(fraction: Float, stageTitleRes: Int) {
-            // A draw outlives the screen; never touch the adapter once this
-            // Activity is gone.
+        /**
+         * One repaint of the bubble. Reports the phase that is running (for the
+         * words) and the clock-driven percentage and countdown.
+         *
+         * The phase still decides the label text; the numbers come from the
+         * clock, so the bar and the countdown always agree with each other and
+         * with the elapsed time - no phase event can make either jump.
+         */
+        private fun publish(stageTitleRes: Int) {
             if (isDestroyed || isChangingConfigurations) return
-            val clamped = maxOf(shownFraction, fraction.coerceIn(0f, 1f))
-            val percent = (clamped * 100f).roundToInt().coerceIn(0, 100)
-            // Repaint only when the percentage moves by a visible step or the
-            // phase changes. Every event used to rebind the row, which is what
-            // made the bar and the label flicker.
-            if (stageTitleRes == lastStageTitle && percent - shownPercent < PROGRESS_STEP) return
-            shownPercent = maxOf(shownPercent, percent)
+            val fraction = maxOf(shownFraction, currentFraction()).coerceIn(0f, PROGRESS_MAX)
+            shownFraction = fraction
+            // The repaint is a full second apart, so the label is always fresh;
+            // the old "only every 10%" cache is what let the countdown sit still.
+            cachedEta = etaText()
+            cachedEtaStage = currentStage
             lastStageTitle = stageTitleRes
-            if (currentStage != cachedEtaStage || percent % 10 == 0) {
-                cachedEta = etaText()
-                cachedEtaStage = currentStage
-            }
+            shownPercent = (fraction * 100f).roundToInt().coerceIn(0, 100)
+            postLabel(shownPercent)
+        }
+
+        /** Repaints when the next whole second of the countdown is due. */
+        private fun tickSecond() {
+            publish(currentStageTitle())
+        }
+
+        /** Pushes the label for [percent] into the bubble, on the UI thread. */
+        private fun postLabel(percent: Int) {
+            val stageTitleRes = lastStageTitle
             val label = if (cachedEta.isEmpty()) {
                 getString(R.string.image_progress_label_short, percent, getString(stageTitleRes))
             } else {
@@ -1571,76 +1744,167 @@ class MainActivity : AppCompatActivity() {
                     R.string.image_progress_label, percent, getString(stageTitleRes), cachedEta
                 )
             }
+            val fraction = shownFraction
             runOnUiThread {
                 val index = messages.indexOfFirst { it.id == resultId }
                 if (index < 0) return@runOnUiThread
                 val current = messages[index] as? ChatMessage.ImageResult ?: return@runOnUiThread
                 if (!current.isGenerating) return@runOnUiThread
                 if (current.stage == label) return@runOnUiThread
-                shownFraction = clamped
-                // previewBitmap must be carried over: copy() defaults it to
-                // null, and any later submitList would then rebind the row with
-                // no picture - the preview visibly flashed away.
-                messages[index] = current.copy(
-                    progress = clamped,
-                    stage = label,
-                    previewBitmap = current.previewBitmap
-                )
-                chatAdapter.notifyImageProgress(resultId, clamped, label)
+                // copy() keeps previewBitmap; it must be stated explicitly only
+                // when it has to change from the item being replaced.
+                val updated = current.copy(progress = fraction, stage = label)
+                messages[index] = updated
+                // Repaint the bound row only. submitList() here started a diff
+                // plus a rebind on every 2%, and a rebound Material bar restarts
+                // its animation - the visible flicker. The live map keeps the
+                // newest value for when the row is rebound for another reason.
+                chatAdapter.updateImageItem(updated)
             }
         }
 
         /**
-         * Remaining time for the whole draw.
+         * Remaining time for the whole draw: the sum of the phases still ahead.
          *
-         * The denoising phase is the only one with a reliable clock (one event
-         * per step), so it is computed from the measured step time. Every other
-         * phase extrapolates from how much of the bar is already behind us:
-         * that needs no assumptions about how fast this device is, which is
-         * exactly what made the earlier estimate climb instead of fall.
+         * Why not "elapsed / progress": that needs the bar to reflect real time,
+         * and it cannot. Measured on the vivo (256x256, 8 steps), one draw is
+         * ~11.7 s of text encoding (52%), ~8.2 s of denoising (36%) and ~2.8 s
+         * of VAE decode (12%) - the encoder alone is the longest part, while
+         * the bar gave it 5% (40-45%) and sat at "45%" for half the run. Any
+         * estimate derived from that share is wrong by the same factor.
+         *
+         * The numbers come from the engine, so a draw that starts long after its
+         * model was loaded (the tool flow reloads the chat model in between)
+         * still measures its real encode phase. Only the first draw of a
+         * process falls back to the previous run's values.
          */
-        private fun etaText(): String {
-            val now = SystemClock.elapsedRealtime()
-            val overall = shownFraction
-            val remaining: Long = when (currentStage) {
-                ImageEngine.STAGE_SAMPLING -> {
-                    val perStep = samplingStepMs.takeIf { it > 0L }
-                        ?: LlamaEngine.getImageTiming(applicationContext).perStepMs
-                            .takeIf { it > 0L } ?: DEFAULT_PER_STEP_MS
-                    val left = (totalSteps - lastStepSeen).coerceAtLeast(0)
-                    left * perStep + decodeEstimateMs()
-                }
-                else -> {
-                    val elapsed = now - startedAt
-                    // Before anything is known, fall back to a flat estimate so
-                    // the label is not empty for the first seconds.
-                    if (overall < 0.05f) return defaultTotalText()
-                    (elapsed * (1f - overall) / overall).toLong()
-                }
+        /**
+         * Overall estimate for one draw, in ms.
+         *
+         * Per-phase extrapolation turned out to be more trouble than it was
+         * worth: the phases report progress with wildly different granularity
+         * (426 tensor events for ~4% of the run, then 12 s of complete silence
+         * for the text encoder), so any estimate derived from "how far into
+         * this phase am I" lurched. What the user actually wants is one honest
+         * number for the whole draw that only ever goes down, so this is just
+         * the measured total of the previous draw (or a sane default).
+         */
+        /**
+         * Overall estimate for one draw, in ms.
+         *
+         * Built from the last completed draw of the SAME checkpoint, scaled to
+         * the settings of this one. Everything that moves the time is applied:
+         *
+         *  - steps: the denoising loop runs once per step (linear).
+         *  - pixel count: every phase is dominated by HTP work proportional to
+         *    the latent area, so 512x512 costs about 4x a 256x256 draw.
+         *  - CFG: with CFG > 1 the denoiser evaluates the unconditional branch
+         *    as well, so a step costs close to twice as much; CFG <= 1 is a
+         *    single evaluation (that is what makes the q4 8-step build usable).
+         *  - prompt length: it only affects the text encoder, and only by the
+         *    number of tokens, so it is a small correction on that phase.
+         *  - weights precision: fp16 and q4 are different checkpoints with
+         *    very different costs, so a measurement is only reused for the
+         *    model it was taken on; otherwise the defaults for that model are
+         *    used instead.
+         *
+         * Measurements taken without these settings recorded (older builds) are
+         * treated as unknown rather than believed.
+         */
+        private fun totalEstimateMs(): Long {
+            val request = request
+                ?: return DEFAULT_ENCODE_MS + DEFAULT_DECODE_MS +
+                    DEFAULT_PER_STEP_MS * expectedSteps.coerceAtLeast(1)
+            val stored = LlamaEngine.getImageTiming(applicationContext)
+            val modelId = request.model.id
+
+            // What this draw would cost if a measurement of the same model under
+            // the same settings existed; otherwise the model's defaults.
+            val base: BaseTiming = if (
+                stored.encodeMs >= MIN_PLAUSIBLE_ENCODE_MS &&
+                stored.perStepMs >= MIN_PLAUSIBLE_STEP_MS &&
+                stored.decodeMs > 0L
+            ) {
+                BaseTiming(stored.encodeMs, stored.perStepMs, stored.decodeMs, stored)
+            } else {
+                defaultsFor(modelId, request)
             }
-            // Below a second the number is noise; the draw is finishing.
-            if (remaining < 1000L) return ""
+
+            val ref = base.recorded
+            val stepsThis = request.steps.coerceAtLeast(1)
+            val stepsRef = if (ref.steps > 0) ref.steps else stepsThis
+            val areaThis = (request.width.toLong() * request.height).coerceAtLeast(1L)
+            val areaRef = if (ref.width > 0 && ref.height > 0) {
+                (ref.width.toLong() * ref.height).coerceAtLeast(1L)
+            } else {
+                areaThis
+            }
+            val areaScale = areaThis.toDouble() / areaRef
+            // CFG > 1 doubles the denoiser work per step; the ratio against the
+            // measurement uses the same rule on both sides.
+            fun cfgFactor(cfg: Float) = if (cfg > 1.05f) 2.0 else 1.0
+            val cfgScale = cfgFactor(request.cfg) / cfgFactor(ref.cfg)
+            // Only the text encoder sees the prompt; 40 characters is about the
+            // length of the prompts the model writes, and the effect is mild.
+            val promptScale = if (ref.promptChars > 0) {
+                (0.75 + 0.25 * (request.prompt.length.coerceAtLeast(1).toDouble() /
+                    ref.promptChars.coerceAtLeast(1))).coerceIn(0.75, 1.6)
+            } else {
+                1.0
+            }
+
+            val encode = (base.encodeMs * areaScale * promptScale).toLong()
+            val perStep = (base.perStepMs * areaScale * cfgScale).toLong()
+            val decode = (base.decodeMs * areaScale).toLong()
+            return (encode + perStep * stepsThis + decode).coerceAtLeast(MIN_TOTAL_ESTIMATE_MS)
+        }
+
+        /** First-run figures for a checkpoint, in the units the phases use. */
+        private fun defaultsFor(modelId: String, request: ImageRequest): BaseTiming {
+            // The q4 build is roughly a third of the fp16 cost on this device;
+            // these are the 256x256 / 8-step figures measured on the vivo.
+            val fp16 = modelId.contains("fp16", ignoreCase = true)
+            val scale = if (fp16) 1.0 else 0.34
+            return BaseTiming(
+                encodeMs = (DEFAULT_ENCODE_MS * scale).toLong(),
+                perStepMs = (DEFAULT_PER_STEP_MS * scale).toLong(),
+                decodeMs = (DEFAULT_DECODE_MS * scale).toLong(),
+                recorded = LlamaEngine.Companion.ImageTiming(
+                    encodeMs = 0L,
+                    perStepMs = 0L,
+                    decodeMs = 0L,
+                    steps = request.steps,
+                    width = request.width,
+                    height = request.height,
+                    cfg = request.cfg,
+                    promptChars = request.prompt.length
+                )
+            )
+        }
+
+        /**
+         * Remaining time, from the clock only.
+         *
+         * Falls by exactly the time that has passed, so it is smooth and can
+         * never increase - no phase change, no event gap and no fresh estimate
+         * can make it jump. When the estimate runs out before the draw does, the
+         * countdown stops at "1 second" rather than showing 0 or going negative;
+         * the caller keeps showing that until the picture arrives.
+         */
+        private fun remainingMs(): Long {
+            val elapsed = SystemClock.elapsedRealtime() - startedAt
+            return (totalEstimateMs() - elapsed).coerceAtLeast(MIN_REMAINING_MS)
+        }
+
+        private fun etaText(): String {
+            val remaining = remainingMs()
             return if (remaining < 60_000L) {
-                getString(R.string.image_eta_seconds, (remaining + 500L) / 1000L)
+                getString(R.string.image_eta_seconds, (remaining + 999L) / 1000L)
             } else {
                 getString(R.string.image_eta_minutes, (remaining + 30_000L) / 60_000L)
             }
         }
 
-        private fun decodeEstimateMs(): Long {
-            val measured = measuredDecodeMs
-            if (measured > 0L) return measured
-            val stored = LlamaEngine.getImageTiming(applicationContext).decodeMs
-            return if (stored > 0L) stored else DEFAULT_DECODE_MS
-        }
-
-        private fun defaultTotalText(): String = getString(
-            R.string.image_eta_seconds,
-            (
-                DEFAULT_ENCODE_MS + DEFAULT_DECODE_MS +
-                    DEFAULT_PER_STEP_MS * totalSteps.coerceAtLeast(1)
-                ) / 1000L
-        )
     }
 
     /**
@@ -1703,6 +1967,10 @@ class MainActivity : AppCompatActivity() {
             ),
             isGenerating = false,
             error = null,
+            // Dropped, not recycled: the last frame may still be the bitmap an
+            // ImageView or a pending diff is showing. The reference is all this
+            // needs to release - the finished picture comes from pngPath.
+            previewBitmap = null,
             elapsedMs = elapsedMs
         )
         submitMessages(scrollToEnd = true)
@@ -1754,7 +2022,8 @@ class MainActivity : AppCompatActivity() {
         val index = messages.indexOfFirst { it.id == id }
         if (index < 0) return
         val current = messages[index] as? ChatMessage.ImageResult ?: return
-        messages[index] = current.copy(isGenerating = false, error = reason)
+        // Same as the success path: drop the transient frame reference.
+        messages[index] = current.copy(isGenerating = false, error = reason, previewBitmap = null)
         submitMessages(scrollToEnd = true)
         persistCurrentConversation()
     }
@@ -1769,6 +2038,16 @@ class MainActivity : AppCompatActivity() {
         if (selected.isImage) return selected
         return ModelInfo.AVAILABLE_MODELS.firstOrNull { it.id == ModelInfo.DEFAULT_IMAGE_MODEL_ID }
             ?: ModelInfo.AVAILABLE_MODELS.first { it.isImage }
+    }
+
+    /** Switches the assistant bubble between "thinking" and "drawing". */
+    private fun markAssistantWaitingForImage(id: Long, waiting: Boolean) {
+        val index = messages.indexOfFirst { it.id == id }
+        if (index < 0) return
+        val current = messages[index] as? ChatMessage.AiMessage ?: return
+        if (current.waitingForImage == waiting) return
+        messages[index] = current.copy(waitingForImage = waiting)
+        chatAdapter.submitList(messages.toList())
     }
 
     /**
@@ -1786,10 +2065,16 @@ class MainActivity : AppCompatActivity() {
         val ctx = applicationContext
         val imageModel = imageModelForTool()
         val prompt = call.prompt
+        markAssistantWaitingForImage(aiMsgId, true)
         lockOrientationWhileGenerating(true)
         // Picture first, the model's sentence under it: the bubble is inserted
         // ahead of the assistant message that asked for it.
-        val resultId = addImageResultPlaceholder(prompt, requestedByModel = true, beforeId = aiMsgId)
+        val resultId = addImageResultPlaceholder(
+            prompt,
+            requestedByModel = true,
+            beforeId = aiMsgId,
+            imageModelName = imageModel.displayName
+        )
         submitMessages(scrollToEnd = true)
 
         val startNs = SystemClock.elapsedRealtime()
@@ -1819,6 +2104,7 @@ class MainActivity : AppCompatActivity() {
             null
         }
         if (imageEngine == null) {
+            markAssistantWaitingForImage(aiMsgId, false)
             if (messages.any { it.id == aiMsgId }) {
                 failImageResult(resultId, lastImagePreparationError ?: getString(R.string.image_generate_failed))
             }
@@ -1830,7 +2116,10 @@ class MainActivity : AppCompatActivity() {
         updateAiStatus(aiMsgId, getString(R.string.tool_generating_image, prompt))
         imageEngine.setProgressListener(
             imageGenerationToken,
-            ImageProgressUi(resultId).also { it.onStart() }
+            ImageProgressUi(resultId, request).also {
+                it.expectSteps(request.steps)
+                it.onStart()
+            }
         )
         Log.i(TAG, "Image tool: drawing ${request.width}x${request.height} steps=${request.steps} cfg=${request.cfg}")
         CriticalLog.log("image", "tool generate start: native heap ${nativeHeapMb()} MB")
@@ -1853,6 +2142,13 @@ class MainActivity : AppCompatActivity() {
             )
         }
         imageEngine.setProgressListener(imageGenerationToken, null)
+        // The draw is over; from here the model is the one that will be busy.
+        markAssistantWaitingForImage(aiMsgId, false)
+        // Put the bubble on screen now, before the reload: the chat model may
+        // have been unloaded to make room for the image stack, and reloading it
+        // takes tens of seconds during which the reply used to be invisible.
+        setAiText(aiMsgId, "", isGenerating = true)
+        chatAdapter.showPendingReply(aiMsgId, waiting = false)
         CriticalLog.log("image", "tool generate end: seed=$usedSeed, native heap ${nativeHeapMb()} MB")
         if (usedSeed == null) {
             failImageResult(resultId, imageEngine.lastError ?: getString(R.string.image_generate_failed))
@@ -2387,9 +2683,30 @@ class MainActivity : AppCompatActivity() {
         // A changed memory budget is only consumed while loading the model, so
         // force one reload on the next request instead of reusing the old one.
         val budgetReload = LlamaEngine.consumeRuntimeReloadPending(applicationContext)
-        if (isModelReady && loadedModelId == selected.id && !budgetReload) {
+        CriticalLog.log(
+            "chat",
+            "handleUserInput: isModelReady=$isModelReady loaded=$loadedModelId " +
+                "selected=${selected.id} budgetReload=$budgetReload " +
+                "expectedTool=${lastSystemPromptHadImageTool}"
+        )
+        // isModelReady only says *a* model is loaded; it says nothing about
+        // whether the prompt currently inside it carries the image tool. Every
+        // path that reloads the model has to re-apply it, and any path that
+        // forgot left the model convinced it cannot draw - it answers "draw a
+        // cat" with drawing instructions instead of calling the tool. Verify
+        // the applied state instead of trusting the flag.
+        val appliedTool = lastSystemPromptHadImageTool
+        val promptStaleForTool = appliedTool != null &&
+            appliedTool != LlamaEngine.isImageToolEnabled(applicationContext)
+        if (isModelReady && loadedModelId == selected.id && !budgetReload && !promptStaleForTool) {
             sendPrompt(userMsg)
             return
+        }
+        if (promptStaleForTool) {
+            CriticalLog.log(
+                "chat",
+                "system prompt out of date (applied=$lastSystemPromptHadImageTool): reloading"
+            )
         }
 
         beginModelFlow(userMsg)
@@ -2403,6 +2720,13 @@ class MainActivity : AppCompatActivity() {
     private fun beginModelFlow(userMsg: String) {
         if (isInlineDownloading || isInlineModelLoad) {
             Toast.makeText(this, R.string.toast_please_wait_model, Toast.LENGTH_SHORT).show()
+            return
+        }
+        // A stream is already answering (or the model is being prepared for
+        // one): a second send would start a parallel load and fight for the
+        // same context.
+        if (generationJob?.isActive == true) {
+            CriticalLog.log("chat", "beginModelFlow ignored: a stream is already active")
             return
         }
         pendingPrompt = userMsg
@@ -2580,6 +2904,9 @@ class MainActivity : AppCompatActivity() {
                             ModelDownloadController.acknowledge()
                         }
                     }
+                    // Published on busyEvents only, never on status; present
+                    // here so the when stays exhaustive.
+                    is ModelDownloadController.Status.Busy -> Unit
                 }
             }
         }
@@ -2705,7 +3032,10 @@ class MainActivity : AppCompatActivity() {
         try {
             val turns = ConversationStore.toHistoryTurns(ConversationStore.load(applicationContext, id))
             if (turns.isEmpty()) return
-            engine.clearContext()
+            // No clearContext() here: on a fresh load the context is already
+            // empty, and fullReset() also drops the tool schema, the replayed
+            // tool history and the chat templates - wiping exactly what
+            // applyChatSystemPrompt() had just installed a moment earlier.
             engine.restoreConversation(turns)
             CriticalLog.log("chat", "history replayed: ${turns.size} turns")
         } catch (e: Exception) {
@@ -2867,6 +3197,13 @@ class MainActivity : AppCompatActivity() {
                 val visible = ImageTool.strip(fullResponse.toString())
                 withContext(Dispatchers.Main) {
                     setAiText(aiMsgId, visible, isGenerating = true)
+                    // The model usually emits nothing before the call. An empty
+                    // assistant bubble above the picture reads as a second
+                    // "Qwen3-VL" header with nothing under it, so drop the
+                    // placeholder until the continuation fills it.
+                    if (visible.isBlank()) {
+                        markAssistantWaitingForImage(aiMsgId, true)
+                    }
                     persistCurrentConversation()
                 }
                 // Dedicated scope: generationJob is cancelled above, and a
@@ -3040,31 +3377,48 @@ class MainActivity : AppCompatActivity() {
         private const val STATE_CURRENT_CONVERSATION = "state_current_conversation"
         private const val KEY_IMAGE_PROMPTS = "recent_image_prompts"
         private const val MAX_IMAGE_PROMPTS = 10
-        // Share of the bar that belongs to loading + text encoding; the rest
-        // is the denoising loop, which reports its own step counts.
-        // Bar layout: weights 0-40%, encoding 40-45%, denoising 45-90%, VAE
-        // decode 90-100%. The native stages are disjoint, so switching phase
-        // can never move the bar backwards.
-        // The native stages are disjoint, so a phase switch can never move the
-        // bar backwards (that is what produced the 426/426 -> 70/426 jump).
-        private const val LOADING_END = 0.40f
-        private const val ENCODING_END = 0.45f
-        private const val SAMPLING_END = 0.90f
+        // Share of the bar that belongs to each phase.
+        //
+        // Weight loading reports 426 tensors one by one, encoding reports
+        // nothing at all (a single "the encoder is running" event), denoising
+        // counts steps and the decode counts tiles. The bands have to match how
+        // long the phases really take, or the bar and the ETA disagree with the
+        // clock. Measured on the vivo, 256x256 / 8 steps: weights ~0.9 s
+        // (4%), text encoding ~11.7 s (52%), denoising ~8.2 s (36%), decode
+        // ~2.8 s (12%). Encoding used to get 40-45%, so the bar sat at "45%"
+        // for half the run while the honest answer was "halfway".
+        // The bar is driven by the clock against one overall estimate, so the
+        // per-phase bandwidths are gone; only the cap is left. 99% is the most
+        // the bar may show - the picture itself marks the end.
+        private const val PROGRESS_MAX = 0.99f
+        // Floor for the countdown once the estimate has run out: the draw is
+        // still going, so it must not read 0.
+        private const val MIN_REMAINING_MS = 1_000L
+        private const val MIN_TOTAL_ESTIMATE_MS = 3_000L
         private const val PROGRESS_EPSILON = 0.01f
         private const val PREVIEW_FIRST_STEP = 2
         // Two previews per second is plenty for a thumbnail and keeps the
         // downsampled JPEG-free bitmap churn off the UI thread budget.
         private const val PREVIEW_INTERVAL_MS = 500L
-        // First-run estimates, replaced by the measured values as soon as one
-        // draw completes (measured on a vivo V2546A with MOSS-Image Q4 at
-        // 256x256, 8 steps: ~1.5 s encode, ~2.2 s per step, ~4 s decode).
-        private const val DEFAULT_ENCODE_MS = 1_500L
+        // First-run estimates, replaced by measured values after one draw.
+        // Measured on a vivo V2546A with MOSS-Image Q4 at 256x256, 8 steps:
+        // ~0.9 s of weights, ~11.7 s of text encoding, ~1.0 s per denoising
+        // step, ~2.8 s of VAE decode (22.7 s in total). The encoding figure was
+        // 1.5 s, which is what made the very first estimate promise a finish
+        // that was still ten seconds away.
+        private const val DEFAULT_ENCODE_MS = 11_500L
+        // Below this a stored encode time cannot be a real text encode; it is
+        // treated as "unknown" rather than believed.
+        private const val MIN_PLAUSIBLE_ENCODE_MS = 1_000L
+        // Same idea for one denoising step.
+        private const val MIN_PLAUSIBLE_STEP_MS = 50L
         // Minimum percentage change that repaints the bubble.
-        private const val PROGRESS_STEP = 2
+        // How often the bar moves during a phase that emits no events.
+        private const val TICK_INTERVAL_MS = 1_000L
         // Files younger than this are never treated as orphans: a draw may be
         // between writing the PNG and committing it to the conversation.
         private const val PRUNE_GRACE_MS = 5 * 60_000L
-        private const val DEFAULT_PER_STEP_MS = 2_200L
-        private const val DEFAULT_DECODE_MS = 4_000L
+        private const val DEFAULT_PER_STEP_MS = 1_060L
+        private const val DEFAULT_DECODE_MS = 2_800L
     }
 }
