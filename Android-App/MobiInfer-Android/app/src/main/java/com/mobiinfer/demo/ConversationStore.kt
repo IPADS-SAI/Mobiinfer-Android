@@ -124,13 +124,17 @@ object ConversationStore {
         // that escapes: a throw here propagates into save()/setCurrentId() and
         // the turn that had already been written to messages.json never reaches
         // the index.
-        val dirs = runCatching { root(context).listFiles() }.getOrNull()
-            ?.filter { it.isDirectory } ?: emptyList()
+        val dirs = runCatching {
+            root(context).listFiles()?.filter { it.isDirectory }.orEmpty()
+        }.getOrDefault(emptyList())
         for (dir in dirs) {
             val messages = File(dir, MESSAGES_FILE)
-            if (!messages.exists()) continue
+            // isDirectory/exists/lastModified all touch the filesystem and can
+            // throw; a single unreadable directory must not abort the rebuild
+            // for every other conversation.
+            if (runCatching { messages.exists() && messages.isFile }.getOrDefault(false).not()) continue
             var title = DEFAULT_TITLE
-            var createdAt = dir.lastModified()
+            var createdAt = runCatching { dir.lastModified() }.getOrDefault(0L)
             var updatedAt = createdAt
             runCatching {
                 val arr = JSONArray(messages.readText())
@@ -173,8 +177,11 @@ object ConversationStore {
         // directory (the cost it meant to save), and after that no save ever
         // looked again - so a conversation whose entry was lost, and which the
         // user then saved, stayed invisible for the rest of the run.
-        // A directory listing is one readdir of a handful of names, far cheaper
-        // than the messages.json write that always precedes it.
+        // save() runs on Dispatchers.IO, and the streaming path throttles to one
+        // save per second, so this is one readdir plus a stat per conversation
+        // directory per second - 251 on the test device. That is milliseconds
+        // against the messages.json write that always precedes it, and the
+        // exists() probe only runs for names the index does not know.
         val maybeLost = runCatching { root(context).listFiles() }.getOrNull()
             ?.filter { it.isDirectory && it.name !in known && File(it, MESSAGES_FILE).exists() }
             ?: emptyList()
@@ -183,7 +190,11 @@ object ConversationStore {
             index.conversations.addAll(adopted)
             index.conversations.sortByDescending { it.updatedAt }
             Log.i(TAG, "Adopted ${adopted.size} conversation(s) present on disk but missing from the index")
-            CriticalLog.log("chat", "index adopted ${adopted.size} orphaned conversation(s)")
+            // Guarded: this runs inside saveIndex(), before the index is
+            // written, so a throwing logger would abort the save itself.
+            runCatching {
+                CriticalLog.log("chat", "index adopted ${adopted.size} orphaned conversation(s)")
+            }
         }
         val arr = JSONArray()
         for (meta in index.conversations) {
@@ -300,17 +311,33 @@ object ConversationStore {
         // was immediately re-adopted and the conversation the user just deleted
         // reappeared in the drawer.
         val dir = dirFor(context, id)
-        val removed = !dir.exists() || dir.deleteRecursively()
-        index.conversations.removeAll { it.id == id }
-        if (index.currentId == id) index.currentId = index.conversations.firstOrNull()?.id
-        if (removed) {
-            saveIndex(context, index)
-        } else {
-            // Still on disk with content: keep the entry so the list matches
-            // what the user would find after a restart.
+        if (dir.exists() && !dir.deleteRecursively()) {
+            // Still on disk: keep the entry, so the list matches what a restart
+            // would show. This has to be decided BEFORE touching `index`:
+            // loadIndex() hands back the cached object itself, so removing the
+            // entry and then logging "kept" left the live cache without it and
+            // the next saveIndex() persisted the loss.
             Log.w(TAG, "Could not delete conversation $id; keeping its index entry")
             runCatching {
                 CriticalLog.log("chat", "delete failed for $id; entry kept")
+            }
+            return
+        }
+        // The directory is gone, so the operation has already happened; the
+        // index must now follow it. If the write fails, roll the cache back:
+        // otherwise the cache says "deleted" while the disk index still lists
+        // the conversation, and the next launch shows a row that loads empty.
+        val previous = index.conversations.toList()
+        val previousCurrent = index.currentId
+        index.conversations.removeAll { it.id == id }
+        if (index.currentId == id) index.currentId = index.conversations.firstOrNull()?.id
+        runCatching { saveIndex(context, index) }.onFailure { e ->
+            index.conversations.clear()
+            index.conversations.addAll(previous)
+            index.currentId = previousCurrent
+            Log.e(TAG, "Deleted $id but could not persist the index", e)
+            runCatching {
+                CriticalLog.log("chat", "delete of $id: index write failed, cache rolled back")
             }
         }
     }
