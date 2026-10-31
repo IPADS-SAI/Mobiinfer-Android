@@ -435,21 +435,73 @@
                                 tools:text="512 × 512" />
                         </LinearLayout>
 
+                        <!-- Two sliders with no labels are indistinguishable; each
+                             gets its own caption plus a live value. -->
+                        <LinearLayout
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:gravity="center_vertical"
+                            android:orientation="horizontal">
+
+                            <TextView
+                                android:layout_width="0dp"
+                                android:layout_height="wrap_content"
+                                android:layout_weight="1"
+                                android:text="@string/image_param_width"
+                                android:textColor="?attr/colorOnSurfaceVariant"
+                                android:textSize="12sp" />
+
+                            <TextView
+                                android:id="@+id/tv_image_width_value"
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:textColor="?attr/colorPrimary"
+                                android:textSize="12sp"
+                                android:textStyle="bold"
+                                tools:text="512" />
+                        </LinearLayout>
+
                         <com.google.android.material.slider.Slider
                             android:id="@+id/slider_image_width"
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
-                            android:contentDescription="@string/image_param_size"
+                            android:layout_marginTop="-4dp"
+                            android:contentDescription="@string/image_param_width"
                             android:valueFrom="256"
                             android:valueTo="1024"
                             android:stepSize="64"
                             app:tickVisible="false" />
 
+                        <LinearLayout
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:gravity="center_vertical"
+                            android:orientation="horizontal">
+
+                            <TextView
+                                android:layout_width="0dp"
+                                android:layout_height="wrap_content"
+                                android:layout_weight="1"
+                                android:text="@string/image_param_height"
+                                android:textColor="?attr/colorOnSurfaceVariant"
+                                android:textSize="12sp" />
+
+                            <TextView
+                                android:id="@+id/tv_image_height_value"
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:textColor="?attr/colorPrimary"
+                                android:textSize="12sp"
+                                android:textStyle="bold"
+                                tools:text="512" />
+                        </LinearLayout>
+
                         <com.google.android.material.slider.Slider
                             android:id="@+id/slider_image_height"
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
-                            android:contentDescription="@string/image_param_size"
+                            android:layout_marginTop="-4dp"
+                            android:contentDescription="@string/image_param_height"
                             android:valueFrom="256"
                             android:valueTo="1024"
                             android:stepSize="64"
@@ -505,10 +557,19 @@
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
                             android:contentDescription="@string/image_param_steps"
-                            android:valueFrom="1"
-                            android:valueTo="50"
+                            android:valueFrom="4"
+                            android:valueTo="16"
                             android:stepSize="1"
                             app:tickVisible="false" />
+
+                        <TextView
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="2dp"
+                            android:paddingHorizontal="2dp"
+                            android:text="@string/image_param_steps_hint"
+                            android:textColor="?attr/colorOnSurfaceVariant"
+                            android:textSize="12sp" />
                     </LinearLayout>
                 </com.google.android.material.card.MaterialCardView>
 
@@ -564,6 +625,15 @@
                             android:valueTo="10.0"
                             android:stepSize="0.1"
                             app:tickVisible="false" />
+
+                        <TextView
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:layout_marginTop="2dp"
+                            android:paddingHorizontal="2dp"
+                            android:text="@string/image_param_cfg_hint"
+                            android:textColor="?attr/colorOnSurfaceVariant"
+                            android:textSize="12sp" />
                     </LinearLayout>
                 </com.google.android.material.card.MaterialCardView>
 
@@ -600,7 +670,8 @@
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
                             android:layout_marginTop="8dp"
-                            android:hint="@string/image_param_seed">
+                            android:hint="@string/image_param_seed_box"
+                            app:helperText="@string/image_param_seed_hint">
 
                             <com.google.android.material.textfield.TextInputEditText
                                 android:id="@+id/et_image_seed"
@@ -609,6 +680,7 @@
                                 android:inputType="number"
                                 android:maxLines="1"
                                 android:textSize="14sp" />
+
                         </com.google.android.material.textfield.TextInputLayout>
 
                         <TextView
@@ -627,14 +699,14 @@
 
                             <com.google.android.material.button.MaterialButton
                                 android:id="@+id/btn_image_seed_random"
-                                style="@style/Widget.Material3.Button.TextButton"
+                                style="@style/Widget.Material3.Button.OutlinedButton"
                                 android:layout_width="wrap_content"
-                                android:layout_height="30dp"
+                                android:layout_height="40dp"
                                 android:insetTop="0dp"
                                 android:insetBottom="0dp"
                                 android:minWidth="0dp"
                                 android:minHeight="0dp"
-                                android:paddingHorizontal="8dp"
+                                android:paddingHorizontal="14dp"
                                 android:text="@string/image_param_seed_random_action"
                                 android:textSize="12sp" />
 
@@ -642,12 +714,12 @@
                                 android:id="@+id/btn_image_seed_last"
                                 style="@style/Widget.Material3.Button.TextButton"
                                 android:layout_width="wrap_content"
-                                android:layout_height="30dp"
+                                android:layout_height="40dp"
                                 android:insetTop="0dp"
                                 android:insetBottom="0dp"
                                 android:minWidth="0dp"
                                 android:minHeight="0dp"
-                                android:paddingHorizontal="8dp"
+                                android:paddingHorizontal="10dp"
                                 android:text="@string/image_param_seed_use_last"
                                 android:textSize="12sp"
                                 android:visibility="gone" />

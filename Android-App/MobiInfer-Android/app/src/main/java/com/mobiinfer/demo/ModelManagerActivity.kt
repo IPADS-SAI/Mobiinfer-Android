@@ -381,6 +381,12 @@ class ModelManagerActivity : AppCompatActivity() {
         // Seed: empty field means "random every time" (-1). A number pins the
         // sampler so the same prompt reproduces the same picture.
         val seed = findViewById<TextInputEditText>(R.id.et_image_seed)
+        // Four digits: the input filter keeps stray characters out and the
+        // range check stops a value that would not fit the field.
+        seed.filters = arrayOf(
+            android.text.InputFilter.LengthFilter(4),
+            android.text.method.DigitsKeyListener.getInstance("0123456789")
+        )
         seed.addTextChangedListener(object : android.text.TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) = Unit
@@ -395,16 +401,21 @@ class ModelManagerActivity : AppCompatActivity() {
             }
         })
         findViewById<MaterialButton>(R.id.btn_image_seed_random).setOnClickListener {
-            seed.setText("")
-            LlamaEngine.setImageGenSeed(this, LlamaEngine.RANDOM_IMAGE_SEED)
+            // Rolls a fresh four-digit seed instead of clearing the field: an
+            // empty field looked like "no seed" rather than "a random one".
+            val next = LlamaEngine.randomImageSeed()
+            seed.setText(next.toString())
+            seed.setSelection(seed.text?.length ?: 0)
+            LlamaEngine.setImageGenSeed(this, next)
             updateSeedHint()
         }
         findViewById<MaterialButton>(R.id.btn_image_seed_last).setOnClickListener {
             val last = LlamaEngine.getLastImageSeed(this)
             if (last >= 0) {
-                seed.setText(last.toString())
+                val shown = last % (LlamaEngine.IMAGE_SEED_MAX + 1)
+                seed.setText(shown.toString())
                 seed.setSelection(seed.text?.length ?: 0)
-                LlamaEngine.setImageGenSeed(this, last)
+                LlamaEngine.setImageGenSeed(this, shown)
                 updateSeedHint()
             }
         }
@@ -433,11 +444,15 @@ class ModelManagerActivity : AppCompatActivity() {
     private fun updateSeedHint() {
         val fixed = LlamaEngine.getImageGenSeed(this) != LlamaEngine.RANDOM_IMAGE_SEED
         val last = LlamaEngine.getLastImageSeed(this)
-        findViewById<TextView>(R.id.tv_image_seed_hint).setText(
-            if (fixed) R.string.image_param_seed_fixed else R.string.image_param_seed_random
-        )
+        // "Use the previous seed" only makes sense while a seed is pinned;
+        // it used to disappear exactly then, which is the opposite of useful.
+        findViewById<MaterialButton>(R.id.btn_image_seed_last).visibility =
+            if (fixed && last >= 0) View.VISIBLE else View.GONE
+        // The syntax is already in the helperText; this line only says what the
+        // field currently does, and the buttons carry the rest.
+        findViewById<TextView>(R.id.tv_image_seed_hint).text =
+            if (fixed) getString(R.string.image_param_seed_fixed) else ""
         val useLast = findViewById<MaterialButton>(R.id.btn_image_seed_last)
-        useLast.visibility = if (!fixed && last >= 0) View.VISIBLE else View.GONE
         useLast.text = getString(R.string.image_param_seed_use_last, last)
     }
 
@@ -472,6 +487,8 @@ class ModelManagerActivity : AppCompatActivity() {
         val h = sliderImageHeight?.value?.let { snapSide(it) } ?: LlamaEngine.getImageGenHeight(this)
         findViewById<TextView>(R.id.tv_image_size_value).text =
             getString(R.string.image_param_size_value, w, h)
+        findViewById<TextView>(R.id.tv_image_width_value).text = w.toString()
+        findViewById<TextView>(R.id.tv_image_height_value).text = h.toString()
     }
 
     private fun snapSide(value: Float): Int {

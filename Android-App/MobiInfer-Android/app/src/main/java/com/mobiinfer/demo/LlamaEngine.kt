@@ -176,6 +176,9 @@ class LlamaEngine private constructor(
         private const val KEY_IMAGE_WIDTH = "image_gen_width"
         private const val KEY_IMAGE_HEIGHT = "image_gen_height"
         private const val KEY_IMAGE_STEPS = "image_gen_steps"
+        private const val KEY_IMAGE_ENCODE_MS = "image_timing_encode_ms"
+        private const val KEY_IMAGE_PER_STEP_MS = "image_timing_per_step_ms"
+        private const val KEY_IMAGE_DECODE_MS = "image_timing_decode_ms"
         private const val KEY_IMAGE_CFG = "image_gen_cfg"
         private const val KEY_IMAGE_NEGATIVE = "image_gen_negative_prompt"
         private const val KEY_IMAGE_SEED = "image_gen_seed"
@@ -192,6 +195,15 @@ class LlamaEngine private constructor(
         // -1 means "pick a fresh random seed for every image". Any other value
         // is reused verbatim so the same prompt can be reproduced.
         const val RANDOM_IMAGE_SEED = -1L
+
+        /**
+         * Seeds are shown and typed as four digits: long enough to feel like a
+         * code one can share, short enough to read out loud. The picker stays
+         * inside 0..9999 so every seed fits the field.
+         */
+        const val IMAGE_SEED_MAX = 9999L
+
+        fun randomImageSeed(): Long = java.util.Random().nextInt(10_000).toLong()
 
         fun getImageGenWidth(context: Context): Int =
             prefs(context).getInt(KEY_IMAGE_WIDTH, DEFAULT_IMAGE_GEN_SIDE)
@@ -235,6 +247,32 @@ class LlamaEngine private constructor(
 
         fun setLastImageSeed(context: Context, seed: Long) {
             prefs(context).edit().putLong(KEY_IMAGE_LAST_SEED, seed).apply()
+        }
+
+        /**
+         * Milliseconds the last draw spent in each phase, used to predict the
+         * remaining time of the next one. Zero means "never measured", and the
+         * caller falls back to its own defaults.
+         */
+        data class ImageTiming(
+            val encodeMs: Long,
+            val perStepMs: Long,
+            val decodeMs: Long
+        )
+
+        fun getImageTiming(context: Context): ImageTiming = ImageTiming(
+            encodeMs = prefs(context).getLong(KEY_IMAGE_ENCODE_MS, 0L),
+            perStepMs = prefs(context).getLong(KEY_IMAGE_PER_STEP_MS, 0L),
+            decodeMs = prefs(context).getLong(KEY_IMAGE_DECODE_MS, 0L)
+        )
+
+        fun setImageTiming(context: Context, encodeMs: Long, perStepMs: Long, decodeMs: Long) {
+            if (encodeMs <= 0 || perStepMs <= 0 || decodeMs <= 0) return
+            prefs(context).edit()
+                .putLong(KEY_IMAGE_ENCODE_MS, encodeMs)
+                .putLong(KEY_IMAGE_PER_STEP_MS, perStepMs)
+                .putLong(KEY_IMAGE_DECODE_MS, decodeMs)
+                .apply()
         }
 
         fun getImageGenSeed(context: Context): Long =
@@ -1572,6 +1610,16 @@ class LlamaEngine private constructor(
     private val _state = MutableStateFlow<LlamaState>(LlamaState.Uninitialized)
     val state: StateFlow<LlamaState> = _state.asStateFlow()
 
+    /**
+     * True when the model is loaded, readable without a round trip through the
+     * StateFlow. loadModel() sets ModelReady on the llama dispatcher while its
+     * caller is still on that dispatcher, so anything that checked
+     * `state.value` right after loading raced the main-thread collector and
+     * failed - it is why replaying the history after a reload silently did
+     * nothing and the model lost the conversation (and the tool instructions).
+     */
+    val isReady: Boolean get() = _state.value is LlamaState.ModelReady
+
     @Volatile
     private var _cancelGeneration = false
 
@@ -1979,7 +2027,7 @@ class LlamaEngine private constructor(
 
     suspend fun clearContext() =
         withContext(llamaDispatcher) {
-            check(_state.value is LlamaState.ModelReady) {
+            check(isReady) {
                 "Cannot clear context in ${_state.value.javaClass.simpleName}"
             }
             try {
@@ -2004,7 +2052,7 @@ class LlamaEngine private constructor(
      * the graceful degradation we agreed on for reference-only storage).
      */
     suspend fun restoreConversation(turns: List<ChatHistoryTurn>) = withContext(llamaDispatcher) {
-        check(_state.value is LlamaState.ModelReady) {
+        check(isReady) {
             "Cannot restore conversation in ${_state.value.javaClass.simpleName}"
         }
         val roles = ArrayList<String>(turns.size)
