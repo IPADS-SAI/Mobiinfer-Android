@@ -1904,23 +1904,19 @@ class MainActivity : AppCompatActivity() {
             // enough.
             val encodeArea = 1.0 + (areaScale - 1.0) * 0.03
             // One denoising step scales sub-linearly, by a different exponent per
-            // precision. Measured as (denoise total / steps): fp16 4162 ms at
-            // 256x256, 4711 at 3.94x the pixels, 5354 at 4.00x (k~0.09-0.18, so
-            // 0.14); q4 991 -> 2204 (k~0.58). Deriving it from the gaps between
-            // step events instead gives ~0.35 and is wrong: the first step event
-            // is emitted when that step completes, so a divide by the step count
-            // is the honest figure.
-            val stepArea = Math.pow(areaScale, if (isFp16) 0.14 else 0.58)
+            // precision. Measured as (denoise total / steps):
+            //   fp16 4162 ms at 256x256, 4711 at 3.94x the pixels, 5354 at 4.00x
+            //        (k ~ 0.09-0.18, so 0.14)
+            //   q4    991 -> 2204 at 3.94x, 2452 at 4.00x (k ~ 0.58-0.65, so 0.62)
+            // Deriving it from the gaps between step events instead gives ~0.35
+            // for fp16 and is wrong: the first step event is emitted when that
+            // step completes, so a divide by the step count is the honest figure.
+            val stepArea = Math.pow(areaScale, if (isFp16) 0.22 else 0.62)
             // The VAE decode is not a smooth function of pixels at all - it is
             // the tile grid. Measured: 448x576 (258k px) is 6 tiles and 15.7 s,
             // 512x512 (262k px, almost identical area) is 9 tiles and 23.4 s.
-            // Per tile it is a constant 2.6 s for both precisions and all sizes,
-            // so the estimate counts tiles and multiplies.
-            val decodeArea = vaeTileCount(request.width, request.height).toDouble() /
-                vaeTileCount(
-                    if (ref.width > 0) ref.width else REFERENCE_SIDE,
-                    if (ref.height > 0) ref.height else REFERENCE_SIDE
-                ).toDouble()
+            // Per tile it is a constant ~2.55 s for both precisions and all
+            // sizes; the estimate counts tiles (see the decode line below).
             // CFG is a step function, not a gradual cost. Measured at 256x256,
             // fp16, 4 steps: 1.0 -> 4162 ms/step and 9534 ms encode; 1.5 -> 9422
             // and 16628; 2.0 -> 7798 and 17490; 3.0 -> 10171 and 15932. Anything
@@ -1931,20 +1927,27 @@ class MainActivity : AppCompatActivity() {
             fun cfgEncodeFactor(cfg: Float) = if (cfg > 1.05f) 1.7 else 1.0
             val cfgScale = cfgFactor(request.cfg) / cfgFactor(ref.cfg)
             val cfgEncodeScale = cfgEncodeFactor(request.cfg) / cfgEncodeFactor(ref.cfg)
-            // Only the text encoder sees the prompt; 40 characters is about the
-            // length of the prompts the model writes, and the effect is mild.
-            val promptScale = if (ref.promptChars > 0) {
-                (0.75 + 0.25 * (request.prompt.length.coerceAtLeast(1).toDouble() /
-                    ref.promptChars.coerceAtLeast(1))).coerceIn(0.75, 1.6)
-            } else {
-                1.0
-            }
+            // Prompt length is ADDITIVE cost on the text encoder, not a ratio:
+            // measured at 256x256 fp16, 4 steps, CFG 1.0, encode went 9534 ms
+            // (13 chars) -> 12865 (230) -> 14356 (294) -> 19452 (551), i.e.
+            // ~18.6 ms per character on top of a fixed ~9.2 s. Denoise and decode
+            // did not move. A multiplier against the reference length could not
+            // express that (it matched at one length and drifted everywhere else).
+            val promptExtraMs =
+                ((request.prompt.length - ref.promptChars).coerceAtLeast(0)) * PROMPT_MS_PER_CHAR
 
             // The measurement is already a per-step figure for ref.steps steps,
             // so scaling to this draw's step count is a plain multiply.
-            val encode = (base.encodeMs * encodeArea * promptScale * cfgEncodeScale).toLong()
+            val encode =
+                (base.encodeMs * encodeArea * cfgEncodeScale).toLong() + promptExtraMs.toLong()
             val perStep = (base.perStepMs * stepArea * cfgScale).toLong()
-            val decode = (base.decodeMs * decodeArea).toLong()
+            // Affine in the tile count, not proportional. Seven measurements
+            // (both precisions, 1/6/9/25 tiles) fit a=287 ms, b=2554 ms/tile to
+            // within 1.9%; scaling a single-tile reference instead (2790 x tiles)
+            // overstated every multi-tile draw by 6-9%, because that reference
+            // carries setup cost that is paid once, not per tile.
+            val decode =
+                (DECODE_SETUP_MS + DECODE_MS_PER_TILE * vaeTileCount(request.width, request.height)).toLong()
             return (encode + perStep * stepsThis + decode).coerceAtLeast(MIN_TOTAL_ESTIMATE_MS)
         }
 
@@ -3545,7 +3548,12 @@ class MainActivity : AppCompatActivity() {
         // the per-phase area coefficients were measured at (vivo, 2026-10-31).
         private const val REFERENCE_SIDE = 256
         private const val REFERENCE_STEPS = 4
-        private const val REFERENCE_PROMPT_CHARS = 12
+        private const val REFERENCE_PROMPT_CHARS = 13
+        // Extra encoder time per prompt character beyond the reference length.
+        private const val PROMPT_MS_PER_CHAR = 18.6
+        // VAE decode: fixed setup plus a constant per tile (see totalEstimateMs).
+        private const val DECODE_SETUP_MS = 287L
+        private const val DECODE_MS_PER_TILE = 2_554L
         // VAE tiling geometry (sdcpp runtime/tiling.cpp), in latent units.
         private const val VAE_TILE_LATENT = 32
         // 0.5, not the 0.25 the API documents as a default: the overlap is
