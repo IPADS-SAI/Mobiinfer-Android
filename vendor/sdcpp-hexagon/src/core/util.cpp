@@ -633,14 +633,27 @@ bool sd_progress_is_uploading() {
     return tls_progress_uploading;
 }
 
+// RAII so the flag is cleared even when the embedder callback throws: leaving
+// it set would relabel every later event of the *same* run, including the
+// denoising steps, as weight loading.
+struct ProgressUploadingGuard {
+    explicit ProgressUploadingGuard(bool uploading) {
+        sd_progress_mark_uploading(uploading);
+    }
+    ~ProgressUploadingGuard() {
+        sd_progress_mark_uploading(false);
+    }
+    ProgressUploadingGuard(const ProgressUploadingGuard &)            = delete;
+    ProgressUploadingGuard & operator=(const ProgressUploadingGuard &) = delete;
+};
+
 void pretty_bytes_progress(int step, int steps, uint64_t bytes_processed, float elapsed_seconds) {
     if (sd_progress_cb) {
         float time = elapsed_seconds / (step + 1e-6f);
         // Weight/tensor loading shares the callback with denoising; flag it so
         // the receiver can tell "426 of 426 tensors" from "426 of 426 steps".
-        sd_progress_mark_uploading(true);
+        const ProgressUploadingGuard guard(true);
         sd_progress_cb(step, steps, time, sd_progress_cb_data);
-        sd_progress_mark_uploading(false);
         return;
     }
     if (step == 0) {

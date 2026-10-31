@@ -101,10 +101,13 @@ std::vector<std::pair<std::string, float>> split_quotation_attention(
 
 sd_progress_cb_t sd_get_progress_callback();
 
-// Set right before a byte-progress event is dispatched, cleared right after.
-// The callback signature cannot say whether a step/steps pair means "tensor 3
-// of 426 loaded" or "denoising step 3 of 4", and embedders were mixing them.
-// A thread-local keeps it correct for the single-threaded generation path.
+// Set right before a byte-progress event is dispatched, cleared right after
+// (RAII, so it is also cleared when the callback throws). The callback
+// signature cannot say whether a step/steps pair means "tensor 3 of 426
+// loaded" or "denoising step 3 of 4", and embedders were mixing them.
+// A thread-local is correct because weight loading emits its byte progress
+// from the caller's polling loop (model_loader.cpp), not from the tensor
+// workers, and the tiled VAE decode is synchronous on the same thread.
 void        sd_progress_mark_uploading(bool uploading);
 bool        sd_progress_is_uploading();
 void* sd_get_progress_callback_data();

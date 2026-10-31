@@ -222,6 +222,9 @@ class MainActivity : AppCompatActivity() {
         chatAdapter = ChatAdapter(MarkdownRenderer.create(this))
         chatAdapter.setOnStopClick {
             engine.cancelGeneration()
+            // A draw is not part of the llama stream: without this the stop
+            // button left the image job running for its full minute.
+            cancelImageJob()
         }
         chatAdapter.setOnImageClick { path -> ImageViewer.show(this, path) }
         chatAdapter.setOnImageLongClick { path -> ImageViewer.saveToGallery(this, path) }
@@ -334,10 +337,16 @@ class MainActivity : AppCompatActivity() {
             job.cancel()
         }
         generationJob = null
-        // An image request belongs to the conversation that started it (or is
-        // superseded by a newer one); never let it render into another chat.
-        // Bumping the token once is enough: it invalidates every callback the
-        // old draw could still deliver, whatever thread it lands on.
+    }
+
+    /**
+     * Stops an in-flight draw. Never call this from inside the image job: the
+     * generate_image flow used to reach it through prepareImageEngine(), so a
+     * tool call cancelled its own coroutine and reported a failure while the
+     * untouched surface was still starting up. Bumping the token invalidates
+     * every callback the old draw could still deliver.
+     */
+    private fun cancelImageJob() {
         imageJob?.cancel()
         imageJob = null
         imageGenerationToken++
@@ -346,8 +355,10 @@ class MainActivity : AppCompatActivity() {
     private fun openConversation(id: String, restoreContext: Boolean) {
         // Switching conversations must abort the in-flight generation; otherwise
         // it keeps running against a cleared message list (wasted compute, and
-        // the new chat's input stays disabled until it finishes).
+        // the new chat's input stays disabled until it finishes). The draw goes
+        // with it: its result would otherwise land in the new conversation.
         cancelActiveGeneration()
+        cancelImageJob()
         persistCurrentConversation()
         currentConversationId = id
         ConversationStore.setCurrentId(applicationContext, id)
@@ -377,17 +388,25 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Persist and wait for the write. Used before maintenance that inspects
-     * the saved files (image pruning, history replay).
+     * Saves now, then runs [afterwards] in the same IO task. Ordering is what
+     * matters here, not blocking: image pruning must not read an older
+     * messages.json than the one that references the new PNG, or it deletes a
+     * picture that is already on screen. Sequencing them avoids that without
+     * freezing the main thread on disk I/O.
      */
-    private fun persistCurrentConversationBlocking() {
-        val id = currentConversationId ?: return
+    private fun persistCurrentConversationThen(afterwards: () -> Unit) {
+        val id = currentConversationId
+        if (id == null) {
+            afterwards()
+            return
+        }
         val snapshot = ArrayList<ChatMessage>(messages.size).apply { addAll(messages) }
-        runCatching {
-            kotlinx.coroutines.runBlocking(Dispatchers.IO) {
-                ConversationStore.save(applicationContext, id, snapshot)
-            }
-        }.onFailure { Log.w(TAG, "Synchronous conversation save failed", it) }
+        lifecycleScope.launch(Dispatchers.IO) {
+            runCatching { ConversationStore.save(applicationContext, id, snapshot) }
+                .onFailure { Log.w(TAG, "Conversation save failed", it) }
+            runCatching(afterwards)
+                .onFailure { Log.w(TAG, "Post-save maintenance failed", it) }
+        }
     }
 
     private fun persistCurrentConversation() {
@@ -938,7 +957,6 @@ class MainActivity : AppCompatActivity() {
     ): ImageEngine? {
         lastImagePreparationError = null
         val ctx = applicationContext
-        cancelActiveGeneration()
 
         if (!LlamaEngine.modelsExist(ctx, imageModel)) {
             updateAiStatus(
@@ -1429,13 +1447,14 @@ class MainActivity : AppCompatActivity() {
             elapsedMs = elapsedMs
         )
         submitMessages(scrollToEnd = true)
-        // Persist synchronously before pruning: save() runs on IO, and pruning
-        // on another IO thread could otherwise see the old messages.json, treat
-        // the fresh PNG as unreferenced and delete it - the history then loses
-        // the picture even though the bubble was shown.
-        persistCurrentConversationBlocking()
-        refreshConversationList()
-        pruneUnusedImages()
+        // Prune only after the save that references this PNG has landed:
+        // pruning on a separate IO task could otherwise read the old
+        // messages.json, treat the fresh file as unreferenced and delete it -
+        // the history then loses the picture even though the bubble was shown.
+        persistCurrentConversationThen {
+            runOnUiThread { refreshConversationList() }
+            pruneUnusedImages()
+        }
         // Tell the native side, so the next prompt sees this turn as a real
         // generate_image call + tool result (see tool_history_append_image_turn).
         // Only while a language model is resident: the history it renders is
@@ -1511,7 +1530,9 @@ class MainActivity : AppCompatActivity() {
         val outFile = ImageOutput.newOutputFile(ctx)
         // The stream that produced this call still owns the llama context; it
         // has to stop before the image stack can take the NPU (and before the
-        // chat model may be unloaded).
+        // chat model may be unloaded). Only the chat stream: cancelling the
+        // image job here would cancel this very coroutine, since the tool flow
+        // runs inside it.
         cancelActiveGeneration()
         val imageEngine = try {
             // Preparation runs detached: it unloads the chat model (which may
