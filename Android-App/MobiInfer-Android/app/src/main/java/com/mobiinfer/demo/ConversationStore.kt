@@ -62,7 +62,26 @@ object ConversationStore {
         var currentId: String?
     )
 
+    // Parsed index, replaced on every write. list() and currentId() run on the
+    // main thread and used to re-read and re-parse the whole file each time; a
+    // rebuild over hundreds of directories made that visibly slow, and it could
+    // happen on every call while the index was unreadable.
+    @Volatile
+    private var cachedIndex: Index? = null
+
+    // Whether the on-disk directories have been reconciled with the index in
+    // this process (see saveIndex).
+    @Volatile
+    private var indexReconciled = false
+
     private fun loadIndex(context: Context): Index {
+        cachedIndex?.let { return it }
+        val parsed = parseIndex(context)
+        cachedIndex = parsed
+        return parsed
+    }
+
+    private fun parseIndex(context: Context): Index {
         val file = File(root(context), INDEX_FILE)
         val conversations = mutableListOf<ConversationMeta>()
         var currentId: String? = null
@@ -135,6 +154,9 @@ object ConversationStore {
             )
         }
         conversations.sortByDescending { it.updatedAt }
+        // This pass visited every directory, so a later save() has nothing
+        // left to reconcile.
+        indexReconciled = true
         Log.i(TAG, "Rebuilt conversation index from disk: ${conversations.size} conversation(s)")
         CriticalLog.log("chat", "index rebuilt from disk: ${conversations.size} conversation(s)")
         return Index(conversations, conversations.firstOrNull()?.id)
@@ -145,10 +167,23 @@ object ConversationStore {
         // is kept rather than dropped. The index only caches titles and times,
         // so a stale one must never delete conversations that still exist.
         val known = index.conversations.mapTo(HashSet()) { it.id }
-        val orphans = root(context).listFiles()
-            ?.filter { it.isDirectory && it.name !in known && File(it, MESSAGES_FILE).exists() }
-            ?: emptyList()
-        if (orphans.isNotEmpty()) {
+        // Reconciled once per process, not on every save: save() runs on the
+        // main thread during a stream, and a directory listing per save is
+        // wasted work as soon as the index is known to be complete. A count
+        // mismatch is enough to decide - an entry pointing at a deleted
+        // directory and a directory the index never saw cancel out numerically,
+        // so the first pass always scans and only a clean pass sets the flag.
+        val maybeLost = if (!indexReconciled) {
+            root(context).listFiles()
+                ?.filter { it.isDirectory && it.name !in known && File(it, MESSAGES_FILE).exists() }
+                ?: emptyList()
+        } else {
+            emptyList()
+        }
+        if (!indexReconciled) {
+            indexReconciled = true
+        }
+        if (maybeLost.isNotEmpty()) {
             val adopted = rebuildIndex(context).conversations.filter { it.id !in known }
             index.conversations.addAll(adopted)
             index.conversations.sortByDescending { it.updatedAt }
@@ -185,6 +220,9 @@ object ConversationStore {
                 temp.delete()
             }
         }
+        // Adopted orphans were appended to this very object, so publishing it
+        // keeps the cache identical to what just hit the disk.
+        cachedIndex = index
     }
 
     // ------------------------------------------------------------------- api
