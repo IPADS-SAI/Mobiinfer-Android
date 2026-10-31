@@ -1337,6 +1337,10 @@ class MainActivity : AppCompatActivity() {
         val token = ++imageGenerationToken
         imageJob = imageWorkScope.launch {
             val startNs = SystemClock.elapsedRealtime()
+            // Declared outside the try so the finally stops it on every exit
+            // path: generate() returning null (the ordinary native failure) and
+            // cancellation both used to skip the stop.
+            var drawUi: ImageProgressUi? = null
             try {
                 val imageEngine = prepareImageEngine(model, resultId) ?: run {
                     failImageResult(resultId, lastImagePreparationError ?: getString(R.string.image_generate_failed))
@@ -1344,13 +1348,15 @@ class MainActivity : AppCompatActivity() {
                 }
                 if (token != imageGenerationToken) return@launch
 
-                imageEngine.setProgressListener(
-                    token,
-                    ImageProgressUi(resultId, request).also {
-                        it.expectSteps(request.steps)
-                        it.onStart()
-                    }
-                )
+                // Held so the finally can stop exactly this instance. Reading
+                // engine.progressListener there instead would stop whatever
+                // happens to be installed at that moment, which is only the same
+                // object because imageJob keeps the two draw paths exclusive.
+                drawUi = ImageProgressUi(resultId, request).also {
+                    it.expectSteps(request.steps)
+                    it.onStart()
+                }
+                imageEngine.setProgressListener(token, drawUi)
                 CriticalLog.log("image", "generate start: native heap ${nativeHeapMb()} MB")
                 val usedSeed = withContext(NonCancellable) {
                     imageEngine.generate(
@@ -1375,7 +1381,7 @@ class MainActivity : AppCompatActivity() {
                 // happens in the finally below, because generate() returning
                 // null is the ordinary native-failure path and it used to leave
                 // a ticker appending to the error card.
-                (imageEngine.progressListener as? ImageProgressUi)?.saveTiming(request.steps)
+                drawUi?.saveTiming(request.steps)
                 // Stopped before finishImageResult(): that shows the picture and
                 // saves the conversation, and none of that is drawing time.
                 val drawMs = SystemClock.elapsedRealtime() - startNs
@@ -1388,7 +1394,7 @@ class MainActivity : AppCompatActivity() {
                     failImageResult(resultId, e.message ?: getString(R.string.image_generate_failed))
                 }
             } finally {
-                (imageEngine?.progressListener as? ImageProgressUi)?.stop()
+                drawUi?.stop()
                 lockOrientationWhileGenerating(false)
                 imageEngine?.setProgressListener(token, null)
                 if (token == imageGenerationToken) {

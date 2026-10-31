@@ -179,11 +179,14 @@ class ChatAdapter(
         }
         liveImageItems[item.id] = merged
         val holder = activeImageHolder
-        // The decision has to use the merged item: the caller may hand us a copy
-        // that predates a finish/fail write, and reading `item` here made a row
-        // whose draw had already stopped look permanently bound, so the rebind
-        // below was skipped exactly when the row needed repainting.
-        val isBound = merged.id == activeImageId && holder != null
+        // A finished row is not "live" even when its holder is still the active
+        // one: failImageResult()/finishImageResult() do not notify the adapter,
+        // so a failed draw left activeImageId pointing at the dead row and every
+        // later write took the bound branch - repainting a row that no longer
+        // needs it and never scheduling the rebind that shows the error. (An
+        // earlier attempt compared `merged.id` here instead of `item.id`, which
+        // was a no-op: merged is item or item.copy, so the ids are always equal.)
+        val isBound = merged.isGenerating && merged.id == activeImageId && holder != null
         if (!isBound) {
             // The row is not the one currently bound: either another image is
             // drawing, or this row is not on screen yet. The frames must not be
