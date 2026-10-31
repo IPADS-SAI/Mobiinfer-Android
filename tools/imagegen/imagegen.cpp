@@ -180,7 +180,6 @@ void step_cb(int step, int steps, float /*secs*/, void * /*data*/) {
     }
     const int64_t t      = now_us();
     const double elapsed = tls_last_step_us > 0 ? (t - tls_last_step_us) / 1000.0 : 0.0;
-    tls_last_step_us     = t;
 
     // The wrapper owns the phase; this callback only carries step numbers that
     // are meaningful inside it (denoising steps, or decode tiles). Weight
@@ -209,9 +208,22 @@ void step_cb(int step, int steps, float /*secs*/, void * /*data*/) {
                                 ? static_cast<int>(IMAGEGEN_STAGE_LOADING)
                                 : static_cast<int>(tls_stage);
     if (g_trace_cb != nullptr) {
+        // Log the stage that is actually reported, not the raw flags. The old
+        // line preferred the byte-progress flag, so during the VAE decode -
+        // where that flag is also raised while the tile weights load - the log
+        // said "UPLOAD" even though the UI was correctly told "decoding". That
+        // mismatch is what made "the weights reloading during decode" look like
+        // a real phase error and sent this investigation the wrong way.
         imagegen_trace("progress stage=%s pass=%d step=%d/%d upload=%d tls=%d",
-                       uploading ? "UPLOAD" : stage_name(static_cast<imagegen_stage_t>(tls_stage)),
+                       stage_name(static_cast<imagegen_stage_t>(stage)),
                        pass, step, steps, uploading ? 1 : 0, static_cast<int>(tls_stage));
+    }
+    // Advance the per-step clock only for events that actually are steps. The
+    // wrapper's phase announcements arrive here with step == 0; resetting the
+    // clock on those made the first real step report ~1 ms, which was then
+    // stored as the per-step time and made every later estimate nonsense.
+    if (step > 0) {
+        tls_last_step_us = t;
     }
     if (!p->on_step(pass, stage, step, steps, elapsed, p->on_step_user_data)) {
         if (g_active_ctx != nullptr && g_active_ctx->sd != nullptr) {
