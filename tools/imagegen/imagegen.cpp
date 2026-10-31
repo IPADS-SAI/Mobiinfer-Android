@@ -62,12 +62,17 @@ const char * stage_name(imagegen_stage_t stage) {
     return "?";
 }
 
+void imagegen_trace(const char * fmt, ...);  // defined below
+
 // Announces a phase change once, so listeners do not have to infer it.
+// The trace line is what makes the phase durations measurable: each boundary is
+// written once with the stage name, so a profile can subtract them.
 void announce_stage(imagegen_stage_t stage) {
     if (tls_stage == stage) {
         return;
     }
     tls_stage = stage;
+    imagegen_trace("PHASE %s", stage_name(stage));
     const imagegen_gen_params * p = tls_params;
     if (p != nullptr && p->on_step != nullptr) {
         p->on_step(0, static_cast<int>(stage), 0, 0, 0.0, p->on_step_user_data);
@@ -202,9 +207,23 @@ void step_cb(int step, int steps, float /*secs*/, void * /*data*/) {
         return;
     }
     const bool decoding = sd_progress_get_stage() == SD_PROGRESS_STAGE_DECODING;
+    // The decode announces itself here, on its first tile, because the line
+    // below the generate_image() call runs only after the whole decode is
+    // done - announcing there made the phase look 11 ms long and dumped all of
+    // its real cost into denoising.
+    if (decoding) {
+        announce_stage(IMAGEGEN_STAGE_DECODING);
+    }
+    // The real weight load happens in imagegen_init() and is forwarded through
+    // on_load_step, so it never reaches this point. By the time a draw runs,
+    // "uploading" only means the text encoder is lazily (re)loading its own
+    // weights, which happens *during* encoding - reporting that as LOADING made
+    // the label flicker loading -> encoding -> loading -> ... and hid the real
+    // phase. Keep uploading only for the case where no phase has been entered
+    // yet, so the very first draw of a process still says "loading weights".
     const int stage = decoding
                           ? static_cast<int>(IMAGEGEN_STAGE_DECODING)
-                          : uploading
+                          : (uploading && tls_stage == IMAGEGEN_STAGE_LOADING)
                                 ? static_cast<int>(IMAGEGEN_STAGE_LOADING)
                                 : static_cast<int>(tls_stage);
     if (g_trace_cb != nullptr) {

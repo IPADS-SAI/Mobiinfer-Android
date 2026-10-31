@@ -18,6 +18,7 @@
 #include <android/log.h>
 
 #include <cstdarg>
+#include <ctime>
 #include <mutex>
 #include <cstdio>
 #include <cstdlib>
@@ -40,7 +41,13 @@ static void crit(const char *fmt, ...) {
     const char *path = "/data/user/0/com.mobiinfer.demo/files/pipeline.log";
     FILE *f = fopen(path, "a");
     if (f) {
-        fprintf(f, "[image_jni] %s\n", msg);
+        // Timestamp in ms since boot: the phase boundaries (weights / encode /
+        // denoise / decode) are only visible as these lines, so without a clock
+        // the log can say what happened but not how long it took.
+        struct timespec ts{};
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        fprintf(f, "[image_jni] %lld %s\n",
+                static_cast<long long>(ts.tv_sec) * 1000LL + ts.tv_nsec / 1000000LL, msg);
         fclose(f);
     }
 }
