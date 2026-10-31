@@ -6,6 +6,7 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.util.Log
 import com.mobiinfer.demo.imagegen.ImagePromptMarker
+import com.mobiinfer.demo.imagegen.ImageTool
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -411,8 +412,21 @@ object ConversationStore {
                 // text-to-image engine, which is a separate native stack. While
                 // in image mode the chat model is not even loaded.
                 is ChatMessage.ImageResult -> {
-                    // The acknowledgement was already emitted above, next to
-                    // the prompt; the result cell itself is UI only.
+                    // UI only by itself, but a picture produced by the model
+                    // through generate_image has to appear in the context: the
+                    // user turn above it was not marked as an image prompt, so
+                    // nothing else records that a tool ran. Without this the
+                    // model replays its own request with no answer and concludes
+                    // it has no drawing tool at all.
+                    if (!m.isGenerating && m.pngPath != null) {
+                        turns.add(
+                            ChatHistoryTurn(
+                                role = "assistant",
+                                text = "I called ${ImageTool.NAME} and the picture is ready: " +
+                                    "${m.prompt}. See it in the chat above."
+                            )
+                        )
+                    }
                 }
                 else -> Unit
             }

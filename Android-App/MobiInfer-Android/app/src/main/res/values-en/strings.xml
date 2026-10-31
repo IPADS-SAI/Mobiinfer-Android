@@ -271,7 +271,7 @@
     <string name="image_param_size">Size</string>
     <string name="image_param_size_value">%1$d × %2$d</string>
     <string name="image_param_steps">Steps</string>
-    <string name="image_param_cfg">CFG</string>
+    <string name="image_param_cfg">CFG (prompt guidance)</string>
     <string name="image_param_negative">Negative prompt</string>
     <string name="image_param_negative_hint">Leave empty to use the model default</string>
     <string name="image_param_reset">Reset to defaults</string>
@@ -303,11 +303,9 @@
     <string name="tool_image_done_no_reply">The image is ready, but the language model has to be reloaded to keep chatting.</string>
     <string name="config_image_tool_title">Let chat models generate images</string>
     <string name="config_image_tool_description">Adds the generate_image tool to the system prompt so a chat model can call text-to-image directly. The Q4 image model is downloaded automatically if needed.</string>
-    <string name="image_param_seed">Seed</string>
-    <string name="image_param_seed_random">Random (a new image every time)</string>
+    <string name="image_param_seed_random"></string>
     <string name="image_param_seed_fixed">Fixed seed - reproduces the same picture</string>
-    <string name="image_param_seed_random_action">Use random</string>
-    <string name="image_param_seed_use_last">Use the previous seed %1$d</string>
+    <string name="image_param_seed_use_last">Use the last seed (%1$d)</string>
     <string name="image_result_seed">seed %1$d</string>
     <string name="config_reload_for_prompt">The image tool setting changed; the language model reloads on your next message.</string>
     <string name="tool_download_image_model_short">Downloading image model %1$s</string>
@@ -321,4 +319,23 @@
     <string name="image_stage_decoding">Decoding the image…</string>
     <string name="image_stage_sampling">Drawing the picture…</string>
     <string name="image_stage_loading_progress">Loading model %1$d / %2$d</string>
+    <string name="image_eta_seconds">~%1$ds left</string>
+    <string name="image_eta_minutes">~%1$d min left</string>
+    <string name="image_stage_with_eta">%1$s · %2$s</string>
+    <string name="image_progress_label">%1$d%% · %2$s · %3$s</string>
+    <string name="image_stage_loading_title">Loading weights</string>
+    <string name="image_stage_encoding_title">Reading prompt</string>
+    <string name="image_stage_sampling_title">Drawing</string>
+    <string name="image_stage_decoding_title">Decoding</string>
+    <string name="tool_reloading_model">Reloading the model…</string>
+    <string name="image_progress_label_short">%1$d%% · %2$s</string>
+    <string name="image_param_steps_hint">Denoising iterations. MOSS needs 8; past 12 the gain is small and the wait is not.</string>
+    <string name="image_param_cfg_hint">Higher CFG follows the prompt more strictly but saturates and blurs the picture; 3.0 is stable for MOSS.</string>
+    <string name="image_param_seed_hint">Same seed + same prompt = the same picture, handy for tweaking</string>
+    <string name="image_param_seed">Seed</string>
+    <string name="image_param_seed_random_action">New seed</string>
+    <string name="image_param_width">Width (px)</string>
+    <string name="image_param_height">Height (px)</string>
+    <string name="tool_restoring_context">Restoring the conversation…</string>
+    <string name="image_param_seed_box">0–9999, leave empty for a new seed each time</string>
 </resources>

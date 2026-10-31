@@ -62,6 +62,13 @@ class ImageEngine private constructor(
             instance ?: synchronized(this) {
                 ImageEngine(context.applicationContext).also { instance = it }
             }
+
+        /** Forgets a destroyed engine so the next request builds a fresh one. */
+        private fun forget(engine: ImageEngine) {
+            synchronized(this) {
+                if (instance === engine) instance = null
+            }
+        }
     }
 
     // Dedicated single thread: native work must stay serialised, but it must
@@ -315,8 +322,14 @@ class ImageEngine private constructor(
             _state.value = ImageState.Ready
             Log.i(TAG, "Imagegen ready ($modelVersion)")
             return@withContext true
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // The caller went away mid-load. Rethrow so the cancellation
+            // propagates instead of being reported as a load failure.
+            CriticalLog.log("imagegen", "loadModel cancelled")
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "Error loading image model", e)
+            CriticalLog.log("imagegen", "loadModel failed: ${e.javaClass.simpleName}: ${e.message}")
             lastError = e.message
             _state.value = ImageState.Error(e)
             return@withContext false
@@ -433,15 +446,33 @@ class ImageEngine private constructor(
         }
     }
 
+    /**
+     * Frees the context and then the thread. Both are queued on the native
+     * thread in that order, so a draw that is still running there finishes and
+     * the free cannot land on top of it. Shutting the thread down from the
+     * caller (as this used to) raced the free: the context was never released
+     * and the multi-GB stack leaked.
+     */
+    @Volatile
+    private var destroyed = false
+
     fun destroy() {
+        if (destroyed) return
+        destroyed = true
         imageScope.launch {
-            // Queued behind any in-flight generate on the same thread.
             freeNative()
             Log.i(TAG, "Image engine destroyed")
         }.invokeOnCompletion {
+            shutdownThread()
             imageScope.cancel()
+            // The executor is gone: keeping this instance cached made every
+            // later call queue forever on a dead thread.
+            forget(this)
         }
     }
+
+    /** True once destroy() ran; such an engine can no longer be used. */
+    val isDestroyed: Boolean get() = destroyed
 
     /** Releases the dedicated native thread; call when the engine is replaced. */
     fun shutdownThread() {

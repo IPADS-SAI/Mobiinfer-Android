@@ -279,7 +279,7 @@
     <string name="image_param_size">尺寸</string>
     <string name="image_param_size_value">%1$d × %2$d</string>
     <string name="image_param_steps">步数</string>
-    <string name="image_param_cfg">CFG</string>
+    <string name="image_param_cfg">CFG（提示词引导强度）</string>
     <string name="image_param_negative">反向提示词</string>
     <string name="image_param_negative_hint">留空则使用模型默认值</string>
     <string name="image_param_reset">恢复默认值</string>
@@ -311,11 +311,9 @@
     <string name="tool_image_done_no_reply">图片已生成，但继续对话需要重新加载语言模型。</string>
     <string name="config_image_tool_title">允许聊天模型生成图片</string>
     <string name="config_image_tool_description">在系统提示中加入 generate_image 工具：聊天时模型可以直接调用文生图；若模型未下载会自动下载（默认 Q4）。</string>
-    <string name="image_param_seed">种子</string>
-    <string name="image_param_seed_random">随机（每个提示词都不一样）</string>
+    <string name="image_param_seed_random"></string>
     <string name="image_param_seed_fixed">固定种子，可复现同一张图</string>
-    <string name="image_param_seed_random_action">改为随机</string>
-    <string name="image_param_seed_use_last">使用上一张的种子 %1$d</string>
+    <string name="image_param_seed_use_last">用上一张的种子（%1$d）</string>
     <string name="image_result_seed">种子 %1$d</string>
     <string name="config_reload_for_prompt">已切换生成图片工具，语言模型将在下次对话时重新加载。</string>
     <string name="tool_download_image_model_short">正在下载文生图模型 %1$s</string>
@@ -329,4 +327,23 @@
     <string name="image_stage_decoding">正在解码图片…</string>
     <string name="image_stage_sampling">正在生成画面…</string>
     <string name="image_stage_loading_progress">加载模型 %1$d / %2$d</string>
+    <string name="image_eta_seconds">剩余约 %1$d 秒</string>
+    <string name="image_eta_minutes">剩余约 %1$d 分钟</string>
+    <string name="image_stage_with_eta">%1$s · %2$s</string>
+    <string name="image_progress_label">%1$d%% · %2$s · %3$s</string>
+    <string name="image_stage_loading_title">加载权重</string>
+    <string name="image_stage_encoding_title">理解提示词</string>
+    <string name="image_stage_sampling_title">生成画面</string>
+    <string name="image_stage_decoding_title">解码图片</string>
+    <string name="tool_reloading_model">正在重新加载模型…</string>
+    <string name="image_progress_label_short">%1$d%% · %2$s</string>
+    <string name="image_param_steps_hint">去噪迭代次数。MOSS 用 8 步即可，12 步以上收益很小，只会更慢。</string>
+    <string name="image_param_cfg_hint">CFG 越大越贴提示词，但画面容易过饱和、发糊；MOSS 用 3.0 比较稳。</string>
+    <string name="image_param_seed_hint">相同种子 + 相同提示词 = 同一张图，方便微调对比</string>
+    <string name="image_param_seed">随机种子</string>
+    <string name="image_param_seed_random_action">换个种子</string>
+    <string name="image_param_width">宽（像素）</string>
+    <string name="image_param_height">高（像素）</string>
+    <string name="tool_restoring_context">正在恢复对话上下文…</string>
+    <string name="image_param_seed_box">0–9999，留空则每张随机</string>
 </resources>

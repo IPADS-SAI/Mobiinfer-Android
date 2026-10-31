@@ -114,6 +114,19 @@ object ImageTool {
         "[image generated: $prompt] ($filename)"
 
     /**
+     * What the model is told right after the picture appears. It has to know
+     * the draw is done (otherwise it denies having a tool) without inviting an
+     * essay about it: the picture is already on screen, so one short line of
+     * confirmation is all the user wants.
+     */
+    fun continuationInstruction(prompt: String, filename: String): String =
+        "[image generated: $prompt] ($filename)\n" +
+            "The picture is already shown to the user. Reply with one short sentence " +
+            "(at most 20 words) confirming it, or answer their earlier question if they " +
+            "asked one. Do not describe the picture, do not repeat the prompt, and do " +
+            "not call the tool again."
+
+    /**
      * Minimal reader for the call object.
      *
      * Deliberately not org.json: the format is fixed and tiny, a hand parser

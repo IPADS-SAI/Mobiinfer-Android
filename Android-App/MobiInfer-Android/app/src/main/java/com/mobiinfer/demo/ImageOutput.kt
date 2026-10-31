@@ -65,12 +65,21 @@ object ImageOutput {
      * Deletes PNGs that no conversation refers to any more. Keeps the disk
      * cost bounded without touching pictures the user can still scroll back to.
      */
-    fun pruneOrphans(context: android.content.Context, referencedPaths: Collection<String>) {
+    fun pruneOrphans(
+        context: android.content.Context,
+        referencedPaths: Collection<String>,
+        graceMs: Long = 0L
+    ) {
         val referenced = referencedPaths.toSet()
+        // A file can exist before the conversation that references it is
+        // written (the draw finishes, the save follows). Anything younger than
+        // the grace period is left alone so that window cannot delete it.
+        val cutoff = System.currentTimeMillis() - graceMs
         LlamaEngine.imageOutputDir(context).listFiles()?.forEach { file ->
-            if (file.isFile && file.name.endsWith(".png") && file.absolutePath !in referenced) {
-                runCatching { file.delete() }
-            }
+            if (!file.isFile || !file.name.endsWith(".png")) return@forEach
+            if (file.absolutePath in referenced) return@forEach
+            if (graceMs > 0L && file.lastModified() > cutoff) return@forEach
+            runCatching { file.delete() }
         }
     }
 }
