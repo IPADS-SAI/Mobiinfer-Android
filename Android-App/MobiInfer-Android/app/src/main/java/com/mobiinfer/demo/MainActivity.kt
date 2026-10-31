@@ -1179,6 +1179,13 @@ class MainActivity : AppCompatActivity() {
         collapseAppBar()
         autoFollowStreaming = true
 
+        // A chat stream may still be running (the user can send while the
+        // model is answering). It owns the llama context that prepareImageEngine
+        // unloads when memory is tight, so it has to stop first. Called here,
+        // on the main thread and before the draw is launched: calling it from
+        // inside the image job would cancel the job itself.
+        cancelActiveGeneration()
+
         lockOrientationWhileGenerating(true)
         val userMsgId = messageIdCounter++
         messages.add(
