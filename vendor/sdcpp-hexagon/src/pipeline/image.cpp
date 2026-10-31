@@ -7,6 +7,7 @@
 #include <optional>
 
 #include "core/rng.hpp"
+#include "core/util.h"
 #include "diffusion_engine.h"
 #include "model/vae/vae.hpp"
 #include "request.h"
@@ -1125,8 +1126,14 @@ namespace sd::pipeline {
             final_latents = std::move(hires_final_latents);
         }
 
+        // Denoising is over; everything that reports progress from here on is
+        // the VAE decode. Without this the embedder cannot tell "tile 40 of
+        // 140 decoded" from "denoising step 40", because both arrive through
+        // the same progress channel.
+        sd_progress_set_stage(SD_PROGRESS_STAGE_DECODING);
         int num_images = 0;
         auto result    = decode_image_outputs(sd, request, final_latents, &num_images);
+        sd_progress_set_stage(SD_PROGRESS_STAGE_SAMPLING);
         if (result == nullptr) {
             return false;
         }

@@ -68,8 +68,14 @@ static JNIEnv * attach_env() {
     return g_vm->AttachCurrentThread(&env, nullptr) == JNI_OK ? env : nullptr;
 }
 
+// Forwards one diagnostic line from the wrapper into pipeline.log.
+static void trace_trampoline(const char * line, void *) {
+    crit("%s", line);
+}
+
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM * vm, void *) {
     g_vm = vm;
+    imagegen_set_trace_callback(trace_trampoline, nullptr);
     return JNI_VERSION_1_6;
 }
 
@@ -185,6 +191,10 @@ Java_com_mobiinfer_demo_ImageEngine_nativeInit(
     params.n_threads            = nThreads;
     params.backend              = be.empty() ? nullptr : be.c_str();
     params.enable_mmap          = true;
+    // Weight loading reports through the same listener the draw uses, so the
+    // progress bar starts at 0 instead of appearing at "loading done".
+    params.on_load_step         = step_trampoline;
+    params.on_load_step_user_data = nullptr;
 
     LOG_I("imagegen init: dit=%s te=%s vae=%s tok=%s threads=%d backend=%s",
           model.c_str(), llm.c_str(), vae.c_str(), tok.c_str(), nThreads, be.c_str());

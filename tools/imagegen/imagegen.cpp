@@ -7,6 +7,7 @@
 #include "core/util.h"
 
 #include <atomic>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -46,6 +47,20 @@ thread_local imagegen_stage_t tls_stage = IMAGEGEN_STAGE_LOADING;
 // Set at the first preview of the sampling pass, so nothing before it can be
 // mistaken for denoising.
 thread_local bool tls_sampling_seen = false;
+// Set only while imagegen_init() builds the context; the step callback uses it
+// to forward weight-loading progress through imagegen_params::on_load_step.
+thread_local const imagegen_params * tls_load_params = nullptr;
+
+const char * stage_name(imagegen_stage_t stage) {
+    switch (stage) {
+        case IMAGEGEN_STAGE_LOADING:  return "loading";
+        case IMAGEGEN_STAGE_ENCODING: return "encoding";
+        case IMAGEGEN_STAGE_SAMPLING: return "sampling";
+        case IMAGEGEN_STAGE_DECODING: return "decoding";
+        case IMAGEGEN_STAGE_DONE:     return "done";
+    }
+    return "?";
+}
 
 // Announces a phase change once, so listeners do not have to infer it.
 void announce_stage(imagegen_stage_t stage) {
@@ -64,6 +79,23 @@ int64_t now_us() {
     return std::chrono::duration_cast<std::chrono::microseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
+}
+
+// Optional trace hook a host can install (the Android JNI layer appends to
+// pipeline.log through it). Kept dumb on purpose: a null hook costs one branch.
+static imagegen_trace_cb g_trace_cb   = nullptr;
+static void *            g_trace_data = nullptr;
+
+void imagegen_trace(const char * fmt, ...) {
+    if (g_trace_cb == nullptr) {
+        return;
+    }
+    char msg[256];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    g_trace_cb(msg, g_trace_data);
 }
 
 // Keeps the preview cheap: latent-resolution RGB is blown up by
@@ -105,21 +137,32 @@ DownsampledPreview downsample_rgb(const sd_image_t & img) {
 
 void preview_cb(int step, int frame_count, sd_image_t * frames, bool /*is_noisy*/, void * /*data*/) {
     ++g_preview_calls;
+    const sd_preview_info_t info = sd_get_preview_info();
+    const int pass               = info.sample_pass;
     // A preview only exists once the denoising pass runs, so this is the most
-    // reliable end-of-encoding signal even when the listener is not interested
-    // in the frames themselves.
-    const int pass = sd_get_preview_info().sample_pass;
+    // reliable end-of-encoding signal even when nobody wants the frames.
     if (pass == 1 && !tls_sampling_seen) {
         tls_sampling_seen = true;
+        imagegen_trace("first preview: encoding -> sampling (pass=%d step=%d/%d)",
+                       pass, step, info.total_steps);
         announce_stage(IMAGEGEN_STAGE_SAMPLING);
     }
     const imagegen_gen_params * p = tls_params;
-    if (p == nullptr || p->on_preview == nullptr || frame_count <= 0 || frames == nullptr) {
+    if (p == nullptr) {
         return;
     }
-    // Pass 1 only: later passes start from noise and would make the thumbnail
+    // sdcpp's progress callback only fires for steps it considers "complete",
+    // which for MOSS is about one in eight - useless for a progress bar. The
+    // preview fires on every step, so it reports the step count as well; the
+    // Android side drives both the bar and the ETA from it.
+    // It honours the same contract as step_cb: false means "stop".
+    // sdcpp's own progress callback now fires for every denoising step, so this
+    // path no longer has to synthesise one: reporting both made every step
+    // arrive twice and skewed the per-step timing.
+    (void) 0;
+    // Pass 1 only: later passes start from noise again and the thumbnail would
     // jump back to an unreadable blur.
-    if (pass != 1) {
+    if (pass != 1 || p->on_preview == nullptr || frame_count <= 0 || frames == nullptr) {
         return;
     }
     const DownsampledPreview small = downsample_rgb(frames[0]);
@@ -144,10 +187,32 @@ void step_cb(int step, int steps, float /*secs*/, void * /*data*/) {
     // loading reports through the same callback with tensor counts (426 of
     // 426!), so it is tagged as its own stage instead of being mistaken for a
     // sampling step.
-    const int pass = std::max(0, sd_get_preview_info().sample_pass);
-    const int stage = sd_progress_is_uploading()
-                          ? static_cast<int>(IMAGEGEN_STAGE_LOADING)
-                          : static_cast<int>(tls_stage);
+    const int pass       = std::max(0, sd_get_preview_info().sample_pass);
+    const bool uploading = sd_progress_is_uploading();
+    // sdcpp knows when denoising ends and the tiled VAE decode begins; the
+    // wrapper only sees the two as one call. Trust sdcpp for that split, and
+    // keep the byte-progress flag for the lazily (re)loaded text encoder,
+    // which also reports through this channel during a draw.
+    // Weight loading during imagegen_init(): forward through the load hook.
+    if (tls_load_params != nullptr) {
+        if (tls_load_params->on_load_step != nullptr) {
+            tls_load_params->on_load_step(std::max(0, sd_get_preview_info().sample_pass),
+                                          static_cast<int>(IMAGEGEN_STAGE_LOADING),
+                                          step, steps, elapsed, tls_load_params->on_load_step_user_data);
+        }
+        return;
+    }
+    const bool decoding = sd_progress_get_stage() == SD_PROGRESS_STAGE_DECODING;
+    const int stage = decoding
+                          ? static_cast<int>(IMAGEGEN_STAGE_DECODING)
+                          : uploading
+                                ? static_cast<int>(IMAGEGEN_STAGE_LOADING)
+                                : static_cast<int>(tls_stage);
+    if (g_trace_cb != nullptr) {
+        imagegen_trace("progress stage=%s pass=%d step=%d/%d upload=%d tls=%d",
+                       uploading ? "UPLOAD" : stage_name(static_cast<imagegen_stage_t>(tls_stage)),
+                       pass, step, steps, uploading ? 1 : 0, static_cast<int>(tls_stage));
+    }
     if (!p->on_step(pass, stage, step, steps, elapsed, p->on_step_user_data)) {
         if (g_active_ctx != nullptr && g_active_ctx->sd != nullptr) {
             sd_cancel_generation(g_active_ctx->sd, SD_CANCEL_ALL);
@@ -165,6 +230,11 @@ bool install_callbacks() {
 }
 
 }  // namespace
+
+extern "C" IMAGEGEN_API void imagegen_set_trace_callback(imagegen_trace_cb cb, void * user_data) {
+    g_trace_cb   = cb;
+    g_trace_data = user_data;
+}
 
 static const char * kErrInit = "failed to create sd context";
 static const char * kErrGen  = "generate_image failed";
@@ -195,12 +265,21 @@ imagegen_ctx * imagegen_init(const imagegen_params * params) {
     sp.enable_mmap                  = params->enable_mmap;
     sp.release_conditioner_after_encode = params->release_te_after_encode;
 
+    // The weights are the first third of a run on this device, and the SDK
+    // reports their progress through the same channel it uses for denoising.
+    // Arm the hooks before building the context, otherwise the events happen
+    // while nothing is listening and the bar starts at "done".
+    const imagegen_gen_params * prev_params = tls_params;
+    tls_params        = nullptr;   // no generate-level callbacks yet
+    tls_load_params   = params;
+    install_callbacks();
+
     sd_ctx_t * sd = new_sd_ctx(&sp);
+    tls_load_params = nullptr;
+    tls_params      = prev_params;
     if (sd == nullptr) {
         return nullptr;
     }
-
-    install_callbacks();
     auto * ctx = new imagegen_ctx();
     ctx->sd = sd;
     return ctx;
@@ -282,7 +361,11 @@ bool imagegen_generate(imagegen_ctx * ctx,
     g_last_failure.clear();
     g_preview_calls = 0;
     g_step_calls    = 0;
-    tls_stage       = IMAGEGEN_STAGE_LOADING;
+    // Weight loading happens in imagegen_init(); nothing is uploaded during a
+    // draw except the lazily (re)loaded text encoder, which the byte-progress
+    // flag already tags. Starting at LOADING made a second draw open on
+    // "loading weights" with a stale count.
+    tls_stage         = IMAGEGEN_STAGE_ENCODING;
     tls_sampling_seen = false;
     // A listener that threw on the previous run could leave the byte-progress
     // flag behind; it would relabel every later denoising step as loading.

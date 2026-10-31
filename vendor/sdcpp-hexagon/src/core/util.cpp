@@ -633,6 +633,16 @@ bool sd_progress_is_uploading() {
     return tls_progress_uploading;
 }
 
+static thread_local sd_progress_stage_t tls_progress_stage = SD_PROGRESS_STAGE_SAMPLING;
+
+void sd_progress_set_stage(sd_progress_stage_t stage) {
+    tls_progress_stage = stage;
+}
+
+sd_progress_stage_t sd_progress_get_stage() {
+    return tls_progress_stage;
+}
+
 // RAII so the flag is cleared even when the embedder callback throws: leaving
 // it set would relabel every later event of the *same* run, including the
 // denoising steps, as weight loading.

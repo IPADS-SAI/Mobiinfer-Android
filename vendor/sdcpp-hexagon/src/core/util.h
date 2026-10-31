@@ -110,6 +110,18 @@ sd_progress_cb_t sd_get_progress_callback();
 // workers, and the tiled VAE decode is synchronous on the same thread.
 void        sd_progress_mark_uploading(bool uploading);
 bool        sd_progress_is_uploading();
+
+// Coarse phase of the run, so an embedder can attribute a step/steps pair to
+// the right phase. The progress channel is shared by weight loading, the
+// denoising loop and the tiled VAE decode; the numbers only make sense inside
+// one phase.
+enum sd_progress_stage_t {
+    SD_PROGRESS_STAGE_SAMPLING = 0,
+    SD_PROGRESS_STAGE_DECODING = 1,
+};
+
+void sd_progress_set_stage(sd_progress_stage_t stage);
+sd_progress_stage_t sd_progress_get_stage();
 void* sd_get_progress_callback_data();
 
 void sd_begin_preview_pass(int total_steps);

@@ -23,6 +23,11 @@ extern "C" {
 
 struct imagegen_ctx;
 
+typedef bool (*imagegen_step_cb)(int sample_pass, int stage, int step, int steps, double elapsed_ms,
+                                 void * user_data);
+typedef void (*imagegen_preview_cb)(int sample_pass, int step, int width, int height,
+                                    const unsigned char * rgb, void * user_data);
+
 struct imagegen_params {
     // MOSS-Image needs several files. All are required for MOSS.
     const char * diffusion_model_path; // DiT, e.g. moss-image-sft-q4k-f16t.gguf (required)
@@ -40,6 +45,12 @@ struct imagegen_params {
     // Free the TE params+buffers after the prompt is encoded (saves memory,
     // re-loads TE on the next prompt). Useful on memory-tight devices.
     bool release_te_after_encode;
+
+    // Called while the weights are being loaded, so a UI can show the first
+    // part of the run instead of a spinner. Same stage/step convention as
+    // imagegen_step_cb, always with stage IMAGEGEN_STAGE_LOADING. Optional.
+    imagegen_step_cb on_load_step;
+    void * on_load_step_user_data;
 };
 
 // sample_pass counts sampling batches inside one generate_image() call (a
@@ -49,11 +60,6 @@ struct imagegen_params {
 // stage: which phase of the run produced this event, as imagegen_stage_t
 // (declared below). A sampling pass reports its denoising steps (step/steps),
 // the VAE decode reports its tile grid (also step/steps) - do not mix them.
-typedef bool (*imagegen_step_cb)(int sample_pass, int stage, int step, int steps, double elapsed_ms,
-                                 void * user_data);
-typedef void (*imagegen_preview_cb)(int sample_pass, int step, int width, int height,
-                                    const unsigned char * rgb, void * user_data);
-
 typedef enum imagegen_stage_t {
     IMAGEGEN_STAGE_LOADING   = 0,  // weights / context being created
     IMAGEGEN_STAGE_ENCODING  = 1,  // text encoder running
@@ -94,6 +100,12 @@ struct imagegen_gen_params {
 // the library API has no per-step hook); return false to cancel.
 typedef bool (*imagegen_progress_cb)(int step, int steps, void * user_data);
 
+
+// Optional diagnostics sink: receives one line per progress event, so an
+// embedder can see which native phase produced which step/steps pair. Pass
+// NULL to disable. The callback runs on the generation thread.
+typedef void (*imagegen_trace_cb)(const char * line, void * user_data);
+IMAGEGEN_API void imagegen_set_trace_callback(imagegen_trace_cb cb, void * user_data);
 
 // Loads the model. Returns NULL on failure.
 IMAGEGEN_API imagegen_ctx * imagegen_init(const imagegen_params * params);
