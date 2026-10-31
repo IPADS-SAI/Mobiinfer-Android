@@ -1102,7 +1102,8 @@ class MainActivity : AppCompatActivity() {
         // runs here - the listener has to be in place before the load starts,
         // not after it, or the bar first appears at "loading done".
         val loadToken = imageGenerationToken
-        engine.setProgressListener(loadToken, ImageProgressUi(statusMessageId).also { it.onStart() })
+        val loadUi = ImageProgressUi(statusMessageId).also { it.onStart() }
+        engine.setProgressListener(loadToken, loadUi)
 
         val loadStart = SystemClock.elapsedRealtime()
         val ok = withContext(Dispatchers.IO) {
@@ -1122,6 +1123,12 @@ class MainActivity : AppCompatActivity() {
         )
         // The draw installs its own listener; this one only carried the load.
         engine.setProgressListener(loadToken, null)
+        // ...and its one-second tick must stop with it. Leaving it running left
+        // a second ImageProgressUi publishing into the same bubble: the load
+        // instance and the draw instance each repainted with their own phase and
+        // percentage, which is what made the label flicker between
+        // "loading weights" and the real phase for the whole draw.
+        loadUi.stop()
         if (ok) {
             isImageModelLoaded = true
             loadedImageModelId = imageModel.id
@@ -1860,6 +1867,7 @@ class MainActivity : AppCompatActivity() {
             // for tens of seconds while the estimate runs out early. A record
             // without a model id predates this tracking and cannot be
             // attributed to a checkpoint, so it is not used either.
+            val isFp16 = !modelId.contains("q4", ignoreCase = true)
             val sameModel = stored.modelId.isNotEmpty() && stored.modelId == modelId
             val base: BaseTiming = if (
                 sameModel &&
@@ -1881,7 +1889,19 @@ class MainActivity : AppCompatActivity() {
             } else {
                 areaThis
             }
-            val areaScale = areaThis.toDouble() / areaRef
+            // Pixels do not scale the phases equally. Measured at 3.94x the
+            // pixels (256x256 -> 448x576, CFG 1.0), the observed ratios were:
+            //   encode   1.12x fp16 / 0.94x q4   -> encoder is size-blind
+            //   per step 1.13x fp16 / 2.22x q4   -> strong precision dependence
+            //   decode   5.63x fp16 / 5.57x q4   -> tile-grid bound, ~1.58x linear
+            // So each phase gets its own factor, and denoising depends on which
+            // checkpoint is drawing: applying one area ratio to all three (as
+            // this used to) overestimated the first two and underestimated the
+            // last at large sizes.
+            val areaScale = areaThis.toDouble() / areaRef.toDouble()
+            val encodeArea = 1.0 + (areaScale - 1.0) * 0.04
+            val stepArea = 1.0 + (areaScale - 1.0) * if (isFp16) 0.05 else 0.42
+            val decodeArea = 1.0 + (areaScale - 1.0) * 1.57
             // CFG > 1 doubles the denoiser work per step; the ratio against the
             // measurement uses the same rule on both sides.
             fun cfgFactor(cfg: Float) = if (cfg > 1.05f) 2.0 else 1.0
@@ -1895,31 +1915,53 @@ class MainActivity : AppCompatActivity() {
                 1.0
             }
 
-            val encode = (base.encodeMs * areaScale * promptScale).toLong()
-            val perStep = (base.perStepMs * areaScale * cfgScale).toLong()
-            val decode = (base.decodeMs * areaScale).toLong()
+            // The measurement is already a per-step figure for ref.steps steps,
+            // so scaling to this draw's step count is a plain multiply.
+            val encode = (base.encodeMs * encodeArea * promptScale).toLong()
+            val perStep = (base.perStepMs * stepArea * cfgScale).toLong()
+            val decode = (base.decodeMs * decodeArea).toLong()
             return (encode + perStep * stepsThis + decode).coerceAtLeast(MIN_TOTAL_ESTIMATE_MS)
         }
 
         /** First-run figures for a checkpoint, in the units the phases use. */
+        /**
+         * First-run figures for a checkpoint, at the reference size.
+         *
+         * Measured on the vivo at 256x256 and 448x576, CFG 1.0, four draws in
+         * total (fp16 4-step and q4 8-step). The three phases do NOT share a
+         * scaling factor, which is what the old "q4 is 0.34x, multiply
+         * everything" shortcut got wrong:
+         *
+         *   encode   ~9.5-10.9 s for BOTH checkpoints and BOTH sizes - it runs
+         *            the same qwen3.5-9b text encoder, so precision and pixels
+         *            barely move it (q4 1.14x of fp16, larger size 0.94-1.12x).
+         *   step     fp16 4162 ms, q4 991 ms at 256x256: precision dominates
+         *            (q4 = 0.24x). Size moves it less than the pixel count
+         *            suggests (1.13x for fp16 at 3.94x the pixels).
+         *   decode   2790 ms at 256x256 and ~15.6 s at 448x576 for BOTH
+         *            checkpoints: driven by the tile grid, so precision does not
+         *            matter (1.00x) and pixels do (5.6x).
+         */
         private fun defaultsFor(modelId: String, request: ImageRequest): BaseTiming {
-            // The q4 build is roughly a third of the fp16 cost on this device;
-            // these are the 256x256 / 8-step figures measured on the vivo.
-            val fp16 = modelId.contains("fp16", ignoreCase = true)
-            val scale = if (fp16) 1.0 else 0.34
+            val isFp16 = !modelId.contains("q4", ignoreCase = true)
             return BaseTiming(
-                encodeMs = (DEFAULT_ENCODE_MS * scale).toLong(),
-                perStepMs = (DEFAULT_PER_STEP_MS * scale).toLong(),
-                decodeMs = (DEFAULT_DECODE_MS * scale).toLong(),
+                // Independent factors: encode is precision-agnostic and only
+                // mildly size-dependent, per-step is the opposite way round.
+                encodeMs = if (isFp16) 10_100L else 10_600L,
+                perStepMs = if (isFp16) 4_160L else 990L,
+                decodeMs = 2_790L,
+                // The reference the figures above were measured at. Using the
+                // request's own size here (as this did) made areaScale come out
+                // as 1.0 and silently disabled every size correction.
                 recorded = LlamaEngine.Companion.ImageTiming(
                     encodeMs = 0L,
                     perStepMs = 0L,
                     decodeMs = 0L,
-                    steps = request.steps,
-                    width = request.width,
-                    height = request.height,
-                    cfg = request.cfg,
-                    promptChars = request.prompt.length
+                    steps = REFERENCE_STEPS,
+                    width = REFERENCE_SIDE,
+                    height = REFERENCE_SIDE,
+                    cfg = 1.0f,
+                    promptChars = REFERENCE_PROMPT_CHARS
                 )
             )
         }
@@ -2158,13 +2200,11 @@ class MainActivity : AppCompatActivity() {
         CriticalLog.log("image", "prepare returned a loaded engine (isLoaded=${imageEngine.isLoaded})")
 
         updateAiStatus(aiMsgId, getString(R.string.tool_generating_image, prompt))
-        imageEngine.setProgressListener(
-            imageGenerationToken,
-            ImageProgressUi(resultId, request).also {
-                it.expectSteps(request.steps)
-                it.onStart()
-            }
-        )
+        val drawUi = ImageProgressUi(resultId, request).also {
+            it.expectSteps(request.steps)
+            it.onStart()
+        }
+        imageEngine.setProgressListener(imageGenerationToken, drawUi)
         Log.i(TAG, "Image tool: drawing ${request.width}x${request.height} steps=${request.steps} cfg=${request.cfg}")
         CriticalLog.log("image", "tool generate start: native heap ${nativeHeapMb()} MB")
         CriticalLog.log("image", "calling imageEngine.generate(...)")
@@ -2173,19 +2213,25 @@ class MainActivity : AppCompatActivity() {
         // it and would otherwise cancel the generate() coroutine right here
         // (observed: "tool flow ended: JobCancellationException" one ms after
         // the call).
-        val usedSeed = withContext(NonCancellable) {
-            imageEngine.generate(
-                prompt = request.prompt,
-                negativePrompt = request.negativePrompt,
-                width = request.width,
-                height = request.height,
-                steps = request.steps,
-                cfg = request.cfg,
-                seed = request.seed,
-                outputPath = outFile.absolutePath
-            )
+        // Detach the listener and stop its tick in a finally: generate() can
+        // throw, and a surviving ticker keeps repainting the bubble forever.
+        val usedSeed = try {
+            withContext(NonCancellable) {
+                imageEngine.generate(
+                    prompt = request.prompt,
+                    negativePrompt = request.negativePrompt,
+                    width = request.width,
+                    height = request.height,
+                    steps = request.steps,
+                    cfg = request.cfg,
+                    seed = request.seed,
+                    outputPath = outFile.absolutePath
+                )
+            }
+        } finally {
+            imageEngine.setProgressListener(imageGenerationToken, null)
+            drawUi.stop()
         }
-        imageEngine.setProgressListener(imageGenerationToken, null)
         // The draw is over; from here the model is the one that will be busy.
         markAssistantWaitingForImage(aiMsgId, false)
         // Put the bubble on screen now, before the reload: the chat model may
@@ -3439,6 +3485,11 @@ class MainActivity : AppCompatActivity() {
         // still going, so it must not read 0.
         private const val MIN_REMAINING_MS = 1_000L
         private const val MIN_TOTAL_ESTIMATE_MS = 3_000L
+        // Size / step count / CFG / prompt length the DEFAULT_* figures below and
+        // the per-phase area coefficients were measured at (vivo, 2026-10-31).
+        private const val REFERENCE_SIDE = 256
+        private const val REFERENCE_STEPS = 4
+        private const val REFERENCE_PROMPT_CHARS = 12
         private const val PREVIEW_FIRST_STEP = 2
         // Two previews per second is plenty for a thumbnail and keeps the
         // downsampled JPEG-free bitmap churn off the UI thread budget.
