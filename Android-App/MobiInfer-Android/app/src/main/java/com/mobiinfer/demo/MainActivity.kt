@@ -1921,10 +1921,16 @@ class MainActivity : AppCompatActivity() {
                     if (ref.width > 0) ref.width else REFERENCE_SIDE,
                     if (ref.height > 0) ref.height else REFERENCE_SIDE
                 ).toDouble()
-            // CFG > 1 doubles the denoiser work per step; the ratio against the
-            // measurement uses the same rule on both sides.
-            fun cfgFactor(cfg: Float) = if (cfg > 1.05f) 2.0 else 1.0
+            // CFG is a step function, not a gradual cost. Measured at 256x256,
+            // fp16, 4 steps: 1.0 -> 4162 ms/step and 9534 ms encode; 1.5 -> 9422
+            // and 16628; 2.0 -> 7798 and 17490; 3.0 -> 10171 and 15932. Anything
+            // above 1 turns on the unconditional branch and stays there, so the
+            // magnitude barely matters. The encoder is affected too (1.7x),
+            // which the previous "denoiser only" model did not express.
+            fun cfgFactor(cfg: Float) = if (cfg > 1.05f) 2.3 else 1.0
+            fun cfgEncodeFactor(cfg: Float) = if (cfg > 1.05f) 1.7 else 1.0
             val cfgScale = cfgFactor(request.cfg) / cfgFactor(ref.cfg)
+            val cfgEncodeScale = cfgEncodeFactor(request.cfg) / cfgEncodeFactor(ref.cfg)
             // Only the text encoder sees the prompt; 40 characters is about the
             // length of the prompts the model writes, and the effect is mild.
             val promptScale = if (ref.promptChars > 0) {
@@ -1936,7 +1942,7 @@ class MainActivity : AppCompatActivity() {
 
             // The measurement is already a per-step figure for ref.steps steps,
             // so scaling to this draw's step count is a plain multiply.
-            val encode = (base.encodeMs * encodeArea * promptScale).toLong()
+            val encode = (base.encodeMs * encodeArea * promptScale * cfgEncodeScale).toLong()
             val perStep = (base.perStepMs * stepArea * cfgScale).toLong()
             val decode = (base.decodeMs * decodeArea).toLong()
             return (encode + perStep * stepsThis + decode).coerceAtLeast(MIN_TOTAL_ESTIMATE_MS)
@@ -3542,7 +3548,12 @@ class MainActivity : AppCompatActivity() {
         private const val REFERENCE_PROMPT_CHARS = 12
         // VAE tiling geometry (sdcpp runtime/tiling.cpp), in latent units.
         private const val VAE_TILE_LATENT = 32
-        private const val VAE_TILE_OVERLAP = 0.25
+        // 0.5, not the 0.25 the API documents as a default: the overlap is
+        // clamped to [0, 0.5] by resolve_tiling_params() and the measured tile
+        // counts only line up at 0.5. Checked against four sizes at once -
+        // 256x256 -> 1, 448x576 -> 6, 512x512 -> 9, 768x768 -> 25; 0.25 gives
+        // 1/6/9/16 and is wrong for the larger one.
+        private const val VAE_TILE_OVERLAP = 0.5
         private const val PREVIEW_FIRST_STEP = 2
         // Two previews per second is plenty for a thumbnail and keeps the
         // downsampled JPEG-free bitmap churn off the UI thread budget.
