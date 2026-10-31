@@ -69,11 +69,6 @@ object ConversationStore {
     @Volatile
     private var cachedIndex: Index? = null
 
-    // Whether the on-disk directories have been reconciled with the index in
-    // this process (see saveIndex).
-    @Volatile
-    private var indexReconciled = false
-
     private fun loadIndex(context: Context): Index {
         cachedIndex?.let { return it }
         val parsed = parseIndex(context)
@@ -124,7 +119,13 @@ object ConversationStore {
      */
     private fun rebuildIndex(context: Context): Index {
         val conversations = mutableListOf<ConversationMeta>()
-        val dirs = root(context).listFiles()?.filter { it.isDirectory } ?: emptyList()
+        // listFiles() can throw (root missing, EACCES). Rebuilding is the
+        // fallback for an unreadable INDEX, so it must not itself be the thing
+        // that escapes: a throw here propagates into save()/setCurrentId() and
+        // the turn that had already been written to messages.json never reaches
+        // the index.
+        val dirs = runCatching { root(context).listFiles() }.getOrNull()
+            ?.filter { it.isDirectory } ?: emptyList()
         for (dir in dirs) {
             val messages = File(dir, MESSAGES_FILE)
             if (!messages.exists()) continue
@@ -154,11 +155,10 @@ object ConversationStore {
             )
         }
         conversations.sortByDescending { it.updatedAt }
-        // This pass visited every directory, so a later save() has nothing
-        // left to reconcile.
-        indexReconciled = true
         Log.i(TAG, "Rebuilt conversation index from disk: ${conversations.size} conversation(s)")
-        CriticalLog.log("chat", "index rebuilt from disk: ${conversations.size} conversation(s)")
+        runCatching {
+            CriticalLog.log("chat", "index rebuilt from disk: ${conversations.size} conversation(s)")
+        }
         return Index(conversations, conversations.firstOrNull()?.id)
     }
 
@@ -167,22 +167,17 @@ object ConversationStore {
         // is kept rather than dropped. The index only caches titles and times,
         // so a stale one must never delete conversations that still exist.
         val known = index.conversations.mapTo(HashSet()) { it.id }
-        // Reconciled once per process, not on every save: save() runs on the
-        // main thread during a stream, and a directory listing per save is
-        // wasted work as soon as the index is known to be complete. A count
-        // mismatch is enough to decide - an entry pointing at a deleted
-        // directory and a directory the index never saw cancel out numerically,
-        // so the first pass always scans and only a clean pass sets the flag.
-        val maybeLost = if (!indexReconciled) {
-            root(context).listFiles()
-                ?.filter { it.isDirectory && it.name !in known && File(it, MESSAGES_FILE).exists() }
-                ?: emptyList()
-        } else {
-            emptyList()
-        }
-        if (!indexReconciled) {
-            indexReconciled = true
-        }
+        // Scanned on every save, not once per process. The earlier "once"
+        // version was wrong in both directions: a healthy parse never set the
+        // flag, so the FIRST save of each process still listed the whole
+        // directory (the cost it meant to save), and after that no save ever
+        // looked again - so a conversation whose entry was lost, and which the
+        // user then saved, stayed invisible for the rest of the run.
+        // A directory listing is one readdir of a handful of names, far cheaper
+        // than the messages.json write that always precedes it.
+        val maybeLost = runCatching { root(context).listFiles() }.getOrNull()
+            ?.filter { it.isDirectory && it.name !in known && File(it, MESSAGES_FILE).exists() }
+            ?: emptyList()
         if (maybeLost.isNotEmpty()) {
             val adopted = rebuildIndex(context).conversations.filter { it.id !in known }
             index.conversations.addAll(adopted)
@@ -299,10 +294,25 @@ object ConversationStore {
     @Synchronized
     fun delete(context: Context, id: String) {
         val index = loadIndex(context)
+        // Remove the directory FIRST. The index is only a cache and saveIndex()
+        // adopts any directory it does not know about, so saving before the
+        // delete meant a failed deleteRecursively() (partial removal, EACCES)
+        // was immediately re-adopted and the conversation the user just deleted
+        // reappeared in the drawer.
+        val dir = dirFor(context, id)
+        val removed = !dir.exists() || dir.deleteRecursively()
         index.conversations.removeAll { it.id == id }
         if (index.currentId == id) index.currentId = index.conversations.firstOrNull()?.id
-        saveIndex(context, index)
-        dirFor(context, id).deleteRecursively()
+        if (removed) {
+            saveIndex(context, index)
+        } else {
+            // Still on disk with content: keep the entry so the list matches
+            // what the user would find after a restart.
+            Log.w(TAG, "Could not delete conversation $id; keeping its index entry")
+            runCatching {
+                CriticalLog.log("chat", "delete failed for $id; entry kept")
+            }
+        }
     }
 
     @Synchronized
