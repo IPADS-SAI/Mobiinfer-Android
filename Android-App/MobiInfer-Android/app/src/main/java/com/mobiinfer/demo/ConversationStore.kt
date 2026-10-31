@@ -83,13 +83,78 @@ object ConversationStore {
                     )
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "Failed to read conversation index, starting fresh", e)
+                // Do NOT treat an unreadable index as "no conversations". The
+                // list is rewritten on the next save, so starting fresh here
+                // permanently deletes every entry - which is exactly how the
+                // drawer collapsed from 210 rows to 2 while all the data was
+                // still on disk. Rebuild from the directories instead.
+                Log.w(TAG, "Failed to read conversation index, rebuilding from disk", e)
+                return rebuildIndex(context)
             }
         }
         return Index(conversations, currentId)
     }
 
+    /**
+     * Rebuilds the conversation list from the directories on disk.
+     *
+     * Every conversation is a directory with a messages.json, so the index is
+     * only a cache of titles and timestamps. Used when it cannot be parsed, and
+     * when the app finds entries on disk that the index does not know about -
+     * a lost index must never lose the conversations themselves.
+     */
+    private fun rebuildIndex(context: Context): Index {
+        val conversations = mutableListOf<ConversationMeta>()
+        val dirs = root(context).listFiles()?.filter { it.isDirectory } ?: emptyList()
+        for (dir in dirs) {
+            val messages = File(dir, MESSAGES_FILE)
+            if (!messages.exists()) continue
+            var title = DEFAULT_TITLE
+            var createdAt = dir.lastModified()
+            var updatedAt = createdAt
+            runCatching {
+                val arr = JSONArray(messages.readText())
+                // The title is what the user said, not what the model answered.
+                var firstText: String? = null
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val text = o.optString("text", "").takeIf { it.isNotBlank() } ?: continue
+                    if (firstText == null) firstText = text
+                    if (o.optString("type") == "user") { firstText = text; break }
+                }
+                firstText?.let { title = it.lineSequence().first().take(TITLE_MAX).trim() }
+                updatedAt = messages.lastModified()
+            }
+            conversations.add(
+                ConversationMeta(
+                    id = dir.name,
+                    title = title,
+                    createdAt = createdAt,
+                    updatedAt = updatedAt
+                )
+            )
+        }
+        conversations.sortByDescending { it.updatedAt }
+        Log.i(TAG, "Rebuilt conversation index from disk: ${conversations.size} conversation(s)")
+        CriticalLog.log("chat", "index rebuilt from disk: ${conversations.size} conversation(s)")
+        return Index(conversations, conversations.firstOrNull()?.id)
+    }
+
     private fun saveIndex(context: Context, index: Index) {
+        // Adoption pass: a conversation directory the list does not know about
+        // is kept rather than dropped. The index only caches titles and times,
+        // so a stale one must never delete conversations that still exist.
+        val known = index.conversations.mapTo(HashSet()) { it.id }
+        val orphans = root(context).listFiles()
+            ?.filter { it.isDirectory && it.name !in known && File(it, MESSAGES_FILE).exists() }
+            ?: emptyList()
+        if (orphans.isNotEmpty()) {
+            val adopted = rebuildIndex(context).conversations.filter { it.id !in known }
+            index.conversations.addAll(adopted)
+            index.conversations.sortByDescending { it.updatedAt }
+            Log.i(TAG, "Adopted ${adopted.size} conversation(s) present on disk but missing from the index")
+            CriticalLog.log("chat", "index adopted ${adopted.size} orphaned conversation(s)")
+        }
         val arr = JSONArray()
         for (meta in index.conversations) {
             arr.put(
@@ -105,7 +170,21 @@ object ConversationStore {
             put("current", index.currentId ?: JSONObject.NULL)
             put("conversations", arr)
         }
-        File(root(context), INDEX_FILE).writeText(json.toString())
+        // Write to a sibling and rename: a process death or a kill in the
+        // middle of a plain writeText() left a truncated index, and the next
+        // launch then read it as "no conversations".
+        val target = File(root(context), INDEX_FILE)
+        val temp = File(root(context), "$INDEX_FILE.tmp")
+        temp.writeText(json.toString())
+        if (!temp.renameTo(target)) {
+            // renameTo does not replace an existing file on every filesystem.
+            target.delete()
+            if (!temp.renameTo(target)) {
+                Log.w(TAG, "Could not replace $INDEX_FILE atomically, writing in place")
+                target.writeText(json.toString())
+                temp.delete()
+            }
+        }
     }
 
     // ------------------------------------------------------------------- api
@@ -401,14 +480,16 @@ object ConversationStore {
                     // image path rides in the marker so the replay can use the
                     // file name (and therefore find the PNG again).
                     if (m.isImagePrompt) {
-                        // Home-screen image mode: the prompt already has its
-                        // answer here, so the result cell below must not add a
-                        // second one.
+                        // Home-screen image mode: the picture was not drawn by
+                        // the model, so replay it as a completed generate_image
+                        // call rather than as a raw prompt. The \uE000 sentinel
+                        // means nothing to the native side - it would reach the
+                        // model as a stray control character glued to the text.
                         previousImagePrompt = text
                         turns.add(
                             ChatHistoryTurn(
                                 role = "assistant",
-                                text = ImagePromptMarker.encode(text)
+                                text = ImagePromptMarker.toolRecord(text)
                             )
                         )
                     }
@@ -419,10 +500,15 @@ object ConversationStore {
                         if (drawnPrompt != null) {
                             // Fold the sentence into the picture turn that was
                             // just emitted, keeping one assistant turn.
+                            // The record is wrapped in \u0001 markers, so append
+                            // after the closing one without an extra space: the
+                            // native parser must see exactly the JSON object
+                            // between the markers, and anything glued to it -
+                            // even whitespace - changes what it has to accept.
                             val last = turns.lastOrNull()
                             if (last != null && last.role == "assistant") {
                                 turns[turns.size - 1] = last.copy(
-                                    text = last.text + " " + m.text
+                                    text = last.text + m.text
                                 )
                             } else {
                                 turns.add(ChatHistoryTurn(role = "assistant", text = m.text))
