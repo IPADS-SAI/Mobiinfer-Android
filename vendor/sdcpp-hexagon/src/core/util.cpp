@@ -636,7 +636,16 @@ bool sd_progress_is_uploading() {
 static thread_local sd_progress_stage_t tls_progress_stage = SD_PROGRESS_STAGE_SAMPLING;
 
 void sd_progress_set_stage(sd_progress_stage_t stage) {
+    const bool changed = tls_progress_stage != stage;
     tls_progress_stage = stage;
+    // Announce the transition instead of waiting for the next progress event to
+    // carry it. The decode is only observable through per-tile progress, and
+    // with VAE tiling disabled there are no tile events at all - so the whole
+    // decode used to be reported under the sampling stage and the UI said
+    // "denoising" while the VAE was already running.
+    if (changed && stage == SD_PROGRESS_STAGE_DECODING && sd_progress_cb != nullptr) {
+        sd_progress_cb(0, 0, 0.f, sd_progress_cb_data);
+    }
 }
 
 sd_progress_stage_t sd_progress_get_stage() {
