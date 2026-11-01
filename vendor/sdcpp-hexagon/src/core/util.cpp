@@ -377,6 +377,10 @@ static sd_progress_cb_t sd_progress_cb = nullptr;
 void* sd_progress_cb_data              = nullptr;
 
 static sd_preview_info_t sd_preview_info = {};
+// Sampling batches started since the last sd_reset_preview_passes(). Feeds
+// sd_preview_info.sample_pass; reset per draw so the numbering does not describe
+// the process lifetime.
+static int sd_preview_pass_count = 0;
 static sd_preview_cb_t sd_preview_cb     = nullptr;
 static void* sd_preview_cb_data          = nullptr;
 preview_t sd_preview_mode                = PREVIEW_NONE;
@@ -769,6 +773,7 @@ void sd_set_progress_callback(sd_progress_cb_t cb, void* data) {
 }
 void sd_set_preview_callback(sd_preview_cb_t cb, preview_t mode, int interval, bool denoised, bool noisy, void* data) {
     sd_preview_info     = {};
+    sd_preview_pass_count = 0;
     sd_preview_cb       = cb;
     sd_preview_cb_data  = data;
     sd_preview_mode     = mode;
@@ -782,9 +787,21 @@ void sd_set_backend_eval_callback(sd_graph_eval_callback_t cb, void* data) {
     sd_backend_eval_cb_data = data;
 }
 
+void sd_reset_preview_passes() {
+    // Called once per generate_image(), so sample_pass counts the sampling
+    // batches of one draw rather than of the process lifetime. Counting for the
+    // process made every draw after the first report pass 2, 3, ... - and the
+    // embedder only carries frames for pass 1, so previews disappeared.
+    sd_preview_pass_count = 0;
+}
+
 void sd_begin_preview_pass(int total_steps) {
     if (sd_preview_cb != nullptr) {
-        ++sd_preview_info.sample_pass;
+        // One call per sampling batch inside the current draw: the base pass is
+        // 1, a hires or refiner pass is 2. Resetting to 1 on every call would
+        // make a later pass indistinguishable from the base one, and the
+        // thumbnail would jump back to a blur when it restarts from noise.
+        sd_preview_info.sample_pass = ++sd_preview_pass_count;
         sd_preview_info.total_steps = total_steps;
     }
 }

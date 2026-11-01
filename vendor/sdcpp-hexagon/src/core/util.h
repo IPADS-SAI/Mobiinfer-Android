@@ -124,6 +124,9 @@ void sd_progress_set_stage(sd_progress_stage_t stage);
 sd_progress_stage_t sd_progress_get_stage();
 void* sd_get_progress_callback_data();
 
+// Clears the pass counter; call once at the start of each generate_image() so
+// sample_pass numbers the sampling batches of that draw, not of the process.
+void sd_reset_preview_passes();
 void sd_begin_preview_pass(int total_steps);
 sd_preview_cb_t sd_get_preview_callback();
 void* sd_get_preview_callback_data();

@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <deque>
 #include <optional>
+#include <string>
 
 #include "core/rng.hpp"
 #include "core/util.h"
@@ -878,6 +880,10 @@ namespace sd::pipeline {
         sd_img_gen_params = &processed_params;
         request.pm_params = processed_params.pm_params;
         LOG_INFO("generate_image %dx%d", request.width, request.height);
+
+        // Pass numbering restarts here so a second draw in the same process
+        // still reports sampling pass 1 and keeps its previews.
+        sd_reset_preview_passes();
 
         sd->rng->manual_seed(request.seed);
         sd->sampler_rng->manual_seed(request.seed);
