@@ -299,6 +299,9 @@ imagegen_ctx * imagegen_init(const imagegen_params * params) {
         sp.backend = params->backend;
     }
     sp.enable_mmap                  = params->enable_mmap;
+    // Releasing the encoder frees its weights before the diffusion stage, at the
+    // cost of re-faulting them on the next encode. Worth setting only where the
+    // whole stack would not otherwise fit; callers on this device leave it off.
     sp.release_conditioner_after_encode = params->release_te_after_encode;
 
     // The weights are the first third of a run on this device, and the SDK
@@ -384,6 +387,9 @@ bool imagegen_generate(imagegen_ctx * ctx,
     }
     if (params->vae_tiling) {
         gp.vae_tiling_params.enabled = true;
+        // Tile geometry is left at the sdcpp defaults: a larger tile costs more
+        // per forward pass than the reduced tile count saves, and a smaller
+        // overlap does not change the tile count at the sizes used here.
     }
 
     // This API version has no per-step callback; the callback is only used to

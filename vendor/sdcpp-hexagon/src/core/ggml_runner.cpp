@@ -494,6 +494,10 @@ void GGMLRunner::runner_end() {
             if (parameter != nullptr)
                 tensors.push_back(parameter);
         }
+        // Free the compute-backend copy of every parameter. Keeping them
+        // resident across runs saves a re-upload, but on a device whose memory is
+        // already pinned by the image stack the host pages behind them get
+        // swapped out and the next draw pays more in page faults than it saved.
         manager->evict_compute_backend_params(tensors);
         manager->remove_runtime_owner(reinterpret_cast<uintptr_t>(this));
     }
