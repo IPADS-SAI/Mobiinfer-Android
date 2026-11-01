@@ -1232,28 +1232,41 @@ class MainActivity : AppCompatActivity() {
     private fun shouldUnloadChatModelFor(imageModel: ModelInfo): Boolean {
         if (!isModelReady) return false
         val footprint = imageStackBytes(imageModel)
-        val budgetMb = LlamaEngine.getMemoryBudgetMb(applicationContext)
-        val fits = MemoryBudget.fitsAlongsideLanguageModel(applicationContext, footprint, budgetMb)
+        val fits = MemoryBudget.fitsAlongsideLanguageModel(applicationContext, footprint)
         // Logged both ways on purpose: "it unloaded my model" and "it did not
         // fit" are the two questions every memory report starts with.
         Log.i(
             TAG,
             "image stack ${footprint / (1024 * 1024)} MB vs free " +
                 "${MemoryBudget.availableBytes(applicationContext) / (1024 * 1024)} MB " +
-                "(chat budget ${budgetMb} MB) -> " + if (fits) "fits, keep chat model" else "unload chat model"
+                "-> " + if (fits) "fits, keep chat model" else "unload chat model"
+        )
+        CriticalLog.log(
+            "image",
+            "stack decision: footprint=$footprint free=${MemoryBudget.availableBytes(applicationContext)} " +
+                "size=${LlamaEngine.getImageGenWidth(applicationContext)}x" +
+                "${LlamaEngine.getImageGenHeight(applicationContext)} -> ${if (fits) "KEEP" else "UNLOAD"}"
         )
         return !fits
     }
 
     /**
-     * DiT + text encoder + VAE as they sit on disk: an upper bound for what
-     * sdcpp maps into RAM. Falls back to the model's declared total when the
-     * files are not all present yet.
+     * What the draw needs resident, for the keep-or-unload decision.
+     *
+     * This is the on-disk size of the model files. It is deliberately
+     * conservative: the weights are mmapped and touched lazily, so the resident
+     * set during a draw is smaller than the files. There is no reliable way to
+     * read the real peak from inside the app - the ~6 GB the image stack pins
+     * lives in DMA-BUF, and Debug.getNativeHeapAllocatedSize() reports only the
+     * allocator arena, so it excludes both that and the mmapped weights.
+     * Over-estimating costs a chat-model reload; under-estimating runs the draw
+     * while the device is out of headroom, which is worse.
      */
     private fun imageStackBytes(imageModel: ModelInfo): Long {
         val onDisk = modelFileSize(imageModel, imageModel.ggufFileName) +
             imageModel.extraFiles.sumOf { LlamaEngine.extraFilePath(applicationContext, it).length() }
-        return if (onDisk > 0) onDisk else imageModel.installedBytes
+        val total = if (onDisk > 0) onDisk else imageModel.installedBytes
+        return total.coerceAtLeast(1L)
     }
 
     private fun modelFileSize(model: ModelInfo, fileName: String): Long =

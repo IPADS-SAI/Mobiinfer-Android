@@ -96,14 +96,20 @@ object MemoryBudget {
      */
     fun fitsAlongsideLanguageModel(
         context: Context,
-        imageFootprintBytes: Long,
-        languageBudgetMb: Int
+        imageFootprintBytes: Long
     ): Boolean {
-        // Keep a slice for the UI, the bitmap of the result and the allocator.
-        val reserve = 1536L * 1024 * 1024
+        // Keep a slice for the UI, the result bitmap and the allocator. The
+        // footprint passed in is the model files themselves; everything the draw
+        // allocates on top of them comes out of this reserve.
+        val reserve = 512L * 1024 * 1024
         val need = imageFootprintBytes + reserve
         val free = availableBytes(context)
-        val languageModelHold = if (languageBudgetMb > 0) languageBudgetMb.toLong() * 1024 * 1024 else 0L
-        return free - languageModelHold >= need
+        // `free` already excludes whatever the language model holds right now,
+        // so subtracting its configured budget as well charged it twice - and
+        // that budget defaults to 8000 MB to leave room for a 35B checkpoint,
+        // while a resident qwen3-vl-4b measures 781 MB. On a device with room for
+        // both, that arithmetic came out negative and the chat model was evicted
+        // and reloaded on every single draw.
+        return free >= need
     }
 }

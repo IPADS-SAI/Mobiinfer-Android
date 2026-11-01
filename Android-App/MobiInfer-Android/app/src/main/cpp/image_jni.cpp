@@ -154,6 +154,19 @@ static std::string jstringToStdString(JNIEnv * env, jstring jStr) {
     return result;
 }
 
+// MemAvailable in bytes, 0 when it cannot be read.
+static long long memAvailableBytes() {
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (f == nullptr) return 0;
+    char line[256];
+    long long kb = 0;
+    while (fgets(line, sizeof(line), f) != nullptr) {
+        if (sscanf(line, "MemAvailable: %lld kB", &kb) == 1) break;
+    }
+    fclose(f);
+    return kb > 0 ? kb * 1024LL : 0;
+}
+
 extern "C" {
 
 // setenv for the Hexagon runtime (must run before the HTP backend reads env).
@@ -250,7 +263,34 @@ Java_com_mobiinfer_demo_ImageEngine_nativeGenerate(
     gp.steps           = steps;
     gp.cfg_scale       = cfg;  // <0 -> model default
     gp.seed            = seed;  // <0 -> imagegen picks and reports one
-    gp.vae_tiling      = true;  // bound peak memory on mobile
+    // Decode the whole image in one forward pass instead of tiling it.
+    //
+    // Tiling bounds peak memory, but it pays a fixed setup cost per tile and
+    // that cost does not fall when the tiles are made larger: un-tiling cut the
+    // decode by roughly a third at 448x576 and a sixth at 768x768, with no seam
+    // artifacts. The trade is memory - the working set grows with the pixel
+    // count - so tiling comes back when the device does not have the headroom.
+    //
+    // IMAGEGEN_VAE_TILING forces one or the other when it is set.
+    {
+        const char * on = getenv("IMAGEGEN_VAE_TILING");
+        if (on != nullptr) {
+            gp.vae_tiling = on[0] == '1';
+        } else {
+            // The untiled decode was measured at 1024x1024 peaking around 6.4 GB
+            // with 11.4 GB available; require a comparable margin for the size
+            // actually requested and fall back to tiling when it is not there.
+            // Tiling is the safe direction - slower, not broken.
+            const double pixels   = static_cast<double>(width) * height;
+            const double need     = 6.4e9 * (pixels / (1024.0 * 1024.0));
+            const double required = need * 1.8;
+            const long long avail = memAvailableBytes();
+            gp.vae_tiling = avail > 0 && static_cast<double>(avail) < required;
+            LOG_I("vae tiling: %s (need ~%.1f MB, available %lld MB)",
+                  gp.vae_tiling ? "on (low memory)" : "off",
+                  required / 1048576.0, avail / 1048576LL);
+        }
+    }
     gp.on_preview           = preview_trampoline;
     gp.on_preview_user_data = nullptr;
     gp.on_step              = step_trampoline;
