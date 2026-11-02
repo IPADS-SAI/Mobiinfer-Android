@@ -23,8 +23,8 @@ android {
         // to the WebP icons in mipmap-{m,h,xh,xxh,xxxh}dpi/.
         minSdk = 24
         targetSdk = 36
-        versionCode = 4
-        versionName = "0.3.1"
+        versionCode = 5
+        versionName = "0.4"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -80,6 +80,12 @@ android {
                 keyAlias = providers.gradleProperty("MINICPMV_KEY_ALIAS").orNull
                 keyPassword = providers.gradleProperty("MINICPMV_KEY_PASSWORD").orNull
             }
+            // minSdk is 24, so v2 alone would be enough for every device this
+            // ships to - but the release that came before this one was signed
+            // with v2+v3, and an update path should not quietly narrow what a
+            // package offers. State both rather than inheriting a default.
+            enableV2Signing = true
+            enableV3Signing = true
         }
     }
 
