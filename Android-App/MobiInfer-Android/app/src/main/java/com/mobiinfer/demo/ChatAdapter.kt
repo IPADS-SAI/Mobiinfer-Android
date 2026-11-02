@@ -1,6 +1,10 @@
 package com.mobiinfer.demo
 
+import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.drawable.BitmapDrawable
+import android.os.SystemClock
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -22,6 +26,26 @@ class ChatAdapter(
         private const val TYPE_USER = 1
         private const val TYPE_AI = 2
         private const val TYPE_DOWNLOAD = 3
+        private const val TYPE_IMAGE_RESULT = 4
+        // Minimum gap between forced rebinds of an unbound image row. Matches
+        // the Activity's preview throttle: frames do not arrive faster anyway.
+        private const val REBIND_INTERVAL_MS = 500L
+        // Decoded results are cached by path: ListAdapter rebinds every time the
+        // list is submitted, and re-decoding a 1-2 MB PNG on the main thread on
+        // each pass would stutter while the next image streams in.
+        private val bitmapCache = androidx.collection.LruCache<String, Bitmap>(6)
+
+        /**
+         * The name of the selected checkpoint for a bound row, or null.
+         *
+         * A View's context is not usable before it is attached
+         * (applicationContext is still null), and binding does run that early
+         * for the first submitList(); resolving the model there threw.
+         */
+        private fun modelNameOrNull(view: View): String? {
+            val context = (view.context as? Context)?.applicationContext ?: return null
+            return LlamaEngine.getSelectedModel(context).displayName
+        }
     }
 
     private var onSuggestionClick: ((String) -> Unit)? = null
@@ -31,11 +55,23 @@ class ChatAdapter(
     private var onDownloadCancel: (() -> Unit)? = null
     private var onDownloadPause: (() -> Unit)? = null
     private var onDownloadResume: (() -> Unit)? = null
+    private var onImageClick: ((String) -> Unit)? = null
+    private var onImageLongClick: ((String) -> Unit)? = null
+    private var onImageErrorClick: ((String) -> Unit)? = null
+    private var onImageReseed: ((Long) -> Unit)? = null
 
     private var activeAiHolder: AiMessageViewHolder? = null
     private var activeAiId: Long = -1L
     private var activeDownloadHolder: DownloadPromptViewHolder? = null
     private var activeDownloadId: Long = -1L
+    // Row currently showing an in-flight image; progress and preview frames
+    // are pushed straight into it instead of re-submitting the list.
+    private var activeImageHolder: ImageResultViewHolder? = null
+    private var activeImageId: Long = -1L
+    // Last time a rebind was forced for a row that was not bound, per id.
+    // Without this the "row not bound yet" fallback would submit a new list on
+    // every preview frame and reintroduce the flicker it exists to avoid.
+    private val lastRebindAt = HashMap<Long, Long>()
 
     fun setOnSuggestionClick(listener: (String) -> Unit) {
         onSuggestionClick = listener
@@ -63,6 +99,26 @@ class ChatAdapter(
 
     fun setOnDownloadResume(listener: () -> Unit) {
         onDownloadResume = listener
+    }
+
+    /** Full-screen preview of a generated picture. */
+    fun setOnImageClick(listener: (String) -> Unit) {
+        onImageClick = listener
+    }
+
+    /** Save a generated picture to the gallery. */
+    fun setOnImageLongClick(listener: (String) -> Unit) {
+        onImageLongClick = listener
+    }
+
+    /** Copy a generation error somewhere the user can paste it. */
+    fun setOnImageErrorClick(listener: (String) -> Unit) {
+        onImageErrorClick = listener
+    }
+
+    /** Draw the same prompt again under a fresh seed, as a new row. */
+    fun setOnImageReseed(listener: (Long) -> Unit) {
+        onImageReseed = listener
     }
 
     fun setActiveAiMessage(id: Long) {
@@ -95,10 +151,138 @@ class ChatAdapter(
         }
     }
 
+    /**
+     * In-place progress update for the image bubble. Re-submitting the list
+     * would rebind every row and restart the bar animation on each step.
+     */
+    /**
+     * Latest state of every image row that is still drawing, by message id.
+     *
+     * The submitted list is only replaced when messages appear or disappear;
+     * progress and preview frames change several times per second, and pushing
+     * each of them through submitList() rebinds the row (restarting the
+     * Material progress animation and re-setting the thumbnail), which is what
+     * made the bar flicker continuously. onBindViewHolder() reads this map
+     * instead, so a rebind - scrolling, a neighbouring message arriving - shows
+     * the newest state rather than the progress 0 the list was submitted with.
+     */
+    private val liveImageItems = HashMap<Long, ChatMessage.ImageResult>()
+
+    /** Records the newest state of a drawing row; repaints only its label. */
+    fun updateImageItem(item: ChatMessage.ImageResult, allMessages: List<ChatMessage>? = null) {
+        // Two paths write this row - the progress label and the preview frames -
+        // and each carries whatever copy of the message its caller had. Keeping
+        // the larger progress (and the newer frame) stops the older write from
+        // undoing the newer one when a rebind reads the map back.
+        val known = liveImageItems[item.id]
+        val merged = if (known != null && known.isGenerating && item.isGenerating) {
+            item.copy(
+                progress = maxOf(item.progress, known.progress).coerceIn(0f, 1f),
+                previewBitmap = item.previewBitmap ?: known.previewBitmap
+            )
+        } else {
+            item
+        }
+        liveImageItems[item.id] = merged
+        val holder = activeImageHolder
+        // A finished row is not "live" even when its holder is still the active
+        // one: failImageResult()/finishImageResult() do not notify the adapter,
+        // so a failed draw left activeImageId pointing at the dead row and every
+        // later write took the bound branch - repainting a row that no longer
+        // needs it and never scheduling the rebind that shows the error. (An
+        // earlier attempt compared `merged.id` here instead of `item.id`, which
+        // was a no-op: merged is item or item.copy, so the ids are always equal.)
+        val isBound = merged.isGenerating && merged.id == activeImageId && holder != null
+        if (!isBound) {
+            // The row is not the one currently bound: either another image is
+            // drawing, or this row is not on screen yet. The frames must not be
+            // dropped here - that is what made the preview appear only
+            // sometimes, depending on whether the row happened to be bound when
+            // the first frames arrived.
+            //
+            // notifyItemChanged() alone is not enough: it resolves the position
+            // through currentList, and the image row is inserted ahead of the
+            // assistant bubble, so while that insert is still pending the index
+            // is -1 and the rebind is skipped.
+            //
+            // Re-submitting currentList().toMutableList() is NOT enough either -
+            // that was a real defect. The list is a new object but its
+            // ImageResult is still the stale copy the adapter holds, so the diff
+            // sees nothing changed, onBindViewHolder is never called, and the
+            // new progress sat in liveImageItems with nobody to read it. The
+            // merged item has to be planted into the list being submitted.
+            // Throttled, because a rebind re-creates the row and a submit per
+            // frame is exactly the flicker this avoids.
+            if (item.isGenerating) {
+                val now = SystemClock.elapsedRealtime()
+                val last = lastRebindAt[item.id] ?: 0L
+                if (now - last >= REBIND_INTERVAL_MS) {
+                    // Plant the merged image into the CALLER's list, not into
+                    // currentList: currentList carries copies of every other row
+                    // taken at the time of the last submit, so re-submitting it
+                    // makes later diffs compare a stale row against an equally
+                    // stale row and skip the rebind - which is how the assistant
+                    // bubble kept its spinner after the draw.
+                    val list = (allMessages ?: currentList).toMutableList()
+                    val at = list.indexOfFirst { it.id == item.id }
+                    if (at >= 0) {
+                        lastRebindAt[item.id] = now
+                        list[at] = merged
+                        submitList(list)
+                    }
+                }
+            } else {
+                liveImageItems.remove(item.id)
+            }
+            return
+        }
+        holder.updateProgress(merged.id, merged.progress, merged.stage)
+        merged.previewBitmap?.let { holder.showPreview(it) }
+    }
+
+    /** Drops the live state of a row that finished or was removed. */
+    fun forgetImageItem(id: Long) {
+        liveImageItems.remove(id)
+    }
+    /**
+     * Swaps in a live preview frame. Returns false when the row is no longer
+     * bound, so the caller can recycle the bitmap.
+     */
+    fun showImagePreview(id: Long, bitmap: Bitmap): Boolean {
+        val holder = activeImageHolder
+        if (id != activeImageId || holder == null) return false
+        return holder.showPreview(bitmap)
+    }
+
     fun updateStreamingText(id: Long, text: String) {
         if (id == activeAiId) {
             activeAiHolder?.updateText(text)
         }
+    }
+
+    /**
+     * Shows the "reply is coming" spinner on the bubble that [updateStreamingText]
+     * will feed. Falls back to a rebind when the row is not bound yet (the
+     * picture was just inserted/removed around it), because [updateStreamingText]
+     * silently drops updates while there is no holder and the bubble would stay
+     * frozen until the stream ends.
+     */
+    fun showPendingReply(id: Long, waiting: Boolean) {
+        if (id != activeAiId) return
+        val holder = activeAiHolder
+        if (holder == null) {
+            notifyItemChanged(indexOf(id))
+            return
+        }
+        holder.showPending(waiting)
+    }
+
+    private fun indexOf(id: Long): Int {
+        val items = currentList
+        for (i in items.indices) {
+            if (items[i].id == id) return i
+        }
+        return -1
     }
 
     fun setGeneratingDone(id: Long) {
@@ -113,6 +297,7 @@ class ChatAdapter(
             is ChatMessage.UserMessage -> TYPE_USER
             is ChatMessage.AiMessage -> TYPE_AI
             is ChatMessage.ModelDownloadPrompt -> TYPE_DOWNLOAD
+            is ChatMessage.ImageResult -> TYPE_IMAGE_RESULT
         }
     }
 
@@ -138,6 +323,11 @@ class ChatAdapter(
                     .inflate(R.layout.item_download_prompt, parent, false)
                 DownloadPromptViewHolder(view)
             }
+            TYPE_IMAGE_RESULT -> {
+                val view = LayoutInflater.from(parent.context)
+                    .inflate(R.layout.item_image_result, parent, false)
+                ImageResultViewHolder(view)
+            }
             else -> throw IllegalArgumentException("Unknown view type: $viewType")
         }
     }
@@ -151,6 +341,13 @@ class ChatAdapter(
                 aiHolder.bind(item)
                 if (item.id == activeAiId) {
                     activeAiHolder = aiHolder
+                } else if (aiHolder == activeAiHolder) {
+                    // The row was rebound with a newer copy of the streaming
+                    // bubble (the code below the image tool replaces the whole
+                    // message, so its id no longer matched). Dropping it left
+                    // updateStreamingText() with nothing to update and the
+                    // reply stayed invisible until the stream finished.
+                    activeAiId = item.id
                 }
             }
             is ChatMessage.ModelDownloadPrompt -> {
@@ -158,6 +355,28 @@ class ChatAdapter(
                 promptHolder.bind(item)
                 if (item.id == activeDownloadId) {
                     activeDownloadHolder = promptHolder
+                }
+            }
+            is ChatMessage.ImageResult -> {
+                val imageHolder = holder as ImageResultViewHolder
+                // A rebind must show the newest progress/preview of a drawing
+                // row, not the snapshot the list was submitted with.
+                val live = if (item.isGenerating) liveImageItems[item.id] else null
+                imageHolder.bind(live ?: item)
+                // Identity check, not id: a finishing row can be bound into the
+                // very holder that was tracking it, and leaving that holder as
+                // the active target made the next draw's progress land on a row
+                // that was no longer generating.
+                if (imageHolder == activeImageHolder && !item.isGenerating) {
+                    activeImageHolder = null
+                    activeImageId = -1L
+                }
+                if (item.isGenerating) {
+                    activeImageHolder = imageHolder
+                    activeImageId = item.id
+                } else {
+                    liveImageItems.remove(item.id)
+                    lastRebindAt.remove(item.id)
                 }
             }
         }
@@ -170,6 +389,10 @@ class ChatAdapter(
         if (holder is DownloadPromptViewHolder && holder == activeDownloadHolder) {
             activeDownloadHolder = null
         }
+        if (holder is ImageResultViewHolder && holder == activeImageHolder) {
+            activeImageHolder = null
+            activeImageId = -1L
+        }
     }
 
     inner class WelcomeViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
@@ -178,8 +401,22 @@ class ChatAdapter(
         private val btnSuggestion1: MaterialButton = itemView.findViewById(R.id.btn_suggestion_1)
         private val btnSuggestion2: MaterialButton = itemView.findViewById(R.id.btn_suggestion_2)
 
+        private val ivWelcomeIcon: ImageView = itemView.findViewById(R.id.iv_welcome_icon)
+
         fun bind(item: ChatMessage.WelcomeCard) {
             val ctx = itemView.context
+            ivWelcomeIcon.visibility = if (item.isImageMode) View.VISIBLE else View.GONE
+            if (item.isImageMode) {
+                tvWelcomeTitle.setText(R.string.welcome_title_image)
+                tvWelcomeDesc.setText(R.string.welcome_desc_image)
+                btnSuggestion1.setText(R.string.suggestion_image_1)
+                btnSuggestion2.setText(R.string.suggestion_image_2)
+                btnSuggestion1.setIconResource(R.drawable.ic_image)
+                btnSuggestion2.setIconResource(R.drawable.ic_image)
+                btnSuggestion1.setOnClickListener { onSuggestionClick?.invoke(btnSuggestion1.text.toString()) }
+                btnSuggestion2.setOnClickListener { onSuggestionClick?.invoke(btnSuggestion2.text.toString()) }
+                return
+            }
             if (item.isTextOnly) {
                 tvWelcomeTitle.setText(R.string.welcome_title_text)
                 tvWelcomeDesc.setText(R.string.welcome_desc_text)
@@ -258,6 +495,162 @@ class ChatAdapter(
         }
     }
 
+    inner class ImageResultViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
+        private val tvModel: TextView = itemView.findViewById(R.id.tv_image_model)
+        private val layoutProgress: View = itemView.findViewById(R.id.layout_image_progress)
+        private val tvProgress: TextView = itemView.findViewById(R.id.tv_image_progress)
+        private val ivResult: ImageView = itemView.findViewById(R.id.iv_image_result)
+        private val tvError: TextView = itemView.findViewById(R.id.tv_image_error)
+        private val tvParams: TextView = itemView.findViewById(R.id.tv_image_params)
+        private val tvHint: TextView = itemView.findViewById(R.id.tv_image_hint)
+        private val tvReseed: TextView = itemView.findViewById(R.id.tv_image_reseed)
+        private val progressBar: LinearProgressIndicator = itemView.findViewById(R.id.progress_image_gen)
+        // The model that drew this picture is recorded on the message itself
+        // (the selection may have changed since), but ImageResult carries no
+        // model name; the label is therefore only shown while generating.
+        private var boundPath: String? = null
+        // Id of the draw this row is showing, and the furthest the bar has got.
+        // bind() receives whatever copy of the item the list holds, and the
+        // progress label and the preview frames are written by two different
+        // paths, so that copy is not always the newest one. Without a floor the
+        // bar stepped back to the older value on every rebind - the flicker.
+        private var progressItemId: Long = -1L
+        private var maxProgress: Float = 0f
+
+        fun bind(item: ChatMessage.ImageResult) {
+            val ctx = itemView.context
+            // A recycled view may still hold the previous draw's high-water mark;
+            // the floor only makes sense within one message.
+            if (item.id != progressItemId) {
+                progressItemId = item.id
+                maxProgress = 0f
+            }
+            // The card names the checkpoint that draws the picture, not the
+            // selection: during a tool turn the selection is the language model.
+            tvModel.text = item.imageModelName
+                ?: modelNameOrNull(itemView)?.takeIf { it.isNotEmpty() }
+
+            val params = mutableListOf<String>()
+            item.paramsText?.let { params += it }
+            item.elapsedMs?.let {
+                params += ctx.getString(R.string.image_result_elapsed, formatDuration(it))
+            }
+            if (params.isNotEmpty() && !item.isGenerating && item.error == null) {
+                tvParams.text = params.joinToString(" · ")
+                tvParams.visibility = View.VISIBLE
+            } else {
+                tvParams.visibility = View.GONE
+            }
+
+            when {
+                item.isGenerating -> {
+                    layoutProgress.visibility = View.VISIBLE
+                    tvError.visibility = View.GONE
+                    tvHint.visibility = View.GONE
+                    tvReseed.visibility = View.GONE
+                    updateProgress(item.id, item.progress, item.stage)
+                    val preview = item.previewBitmap
+                    if (preview != null) {
+                        // Only replace what the view shows when it is a newer
+                        // frame. bind() can run after showPreview() painted a
+                        // fresh one straight into the ImageView, and rebinding
+                        // the slightly older frame made the thumbnail step
+                        // backwards (a visible stutter on every rebind).
+                        if (ivResult.drawable?.let { it as? BitmapDrawable }?.bitmap !== preview) {
+                            ivResult.setImageBitmap(preview)
+                        }
+                        ivResult.visibility = View.VISIBLE
+                    } else {
+                        ivResult.setImageDrawable(null)
+                        ivResult.visibility = View.GONE
+                    }
+                }
+                item.error != null -> {
+                    layoutProgress.visibility = View.GONE
+                    ivResult.visibility = View.GONE
+                    tvHint.visibility = View.GONE
+                    tvReseed.visibility = View.GONE
+                    tvError.visibility = View.VISIBLE
+                    // Show the engine's own words: "image generation failed"
+                    // alone gives the user (and us) nothing to act on. Tap
+                    // copies it for a bug report.
+                    tvError.text = ctx.getString(R.string.image_error, item.error) +
+                        "\n" + ctx.getString(R.string.image_copy_error)
+                    tvError.setOnClickListener { onImageErrorClick?.invoke(item.error) }
+                }
+                else -> {
+                    layoutProgress.visibility = View.GONE
+                    tvError.visibility = View.GONE
+                    val path = item.pngPath
+                    if (path == null) {
+                        ivResult.visibility = View.GONE
+                        return
+                    }
+                    ivResult.visibility = View.VISIBLE
+                    if (boundPath != path) {
+                        boundPath = path
+                        val bitmap = bitmapCache[path] ?: runCatching {
+                            ImageOutput.decodeForDisplay(path)
+                        }.getOrNull()?.also { bitmapCache.put(path, it) }
+                        ivResult.setImageBitmap(bitmap)
+                        ivResult.visibility = if (bitmap != null) View.VISIBLE else View.GONE
+                    }
+                    val available = ivResult.drawable != null
+                    tvHint.visibility = if (available) View.VISIBLE else View.GONE
+                    // Only a finished picture can be redrawn, and only for a
+                    // draw the user asked for: a tool call belongs to the model
+                    // turn that asked for it.
+                    tvReseed.visibility =
+                        if (available && !item.requestedByModel && onImageReseed != null) View.VISIBLE else View.GONE
+                    tvReseed.setOnClickListener { onImageReseed?.invoke(item.id) }
+                    // Tap opens the picture full screen, long-press offers to
+                    // save it; both are also reachable from the viewer.
+                    ivResult.setOnClickListener { if (available) onImageClick?.invoke(path) }
+                    ivResult.setOnLongClickListener {
+                        if (available) onImageLongClick?.invoke(path)
+                        available
+                    }
+                    tvHint.setOnClickListener { if (available) onImageClick?.invoke(path) }
+                }
+            }
+        }
+
+        fun updateProgress(itemId: Long, fraction: Float, stage: String?) {
+            layoutProgress.visibility = View.VISIBLE
+            // This path repaints the row without a bind(), so the high-water mark
+            // has to be reset here too: a recycled holder still carrying the
+            // previous draw's ceiling made maxOf() pin the bar at that old value
+            // for the whole draw, while the label underneath kept counting up.
+            if (itemId != progressItemId) {
+                progressItemId = itemId
+                maxProgress = 0f
+            }
+            if (fraction < 0f) {
+                progressBar.isIndeterminate = true
+            } else {
+                progressBar.isIndeterminate = false
+                // The bar never goes backwards within one draw: a stale copy of
+                // the item (another write path got there first) must not pull it
+                // back down to an earlier percentage.
+                val shown = maxOf(fraction, maxProgress).coerceIn(0f, 1f)
+                maxProgress = shown
+                // No animation: a 500 ms cross-fade per step reads as jitter
+                // while the bar is being restarted every step.
+                progressBar.setProgressCompat((shown * 100f).toInt().coerceIn(0, 100), false)
+            }
+            stage?.let { tvProgress.text = it }
+        }
+
+        /** Shows a step preview in place of the (not yet existing) result. */
+        fun showPreview(bitmap: Bitmap): Boolean {
+            ivResult.setImageBitmap(bitmap)
+            ivResult.visibility = View.VISIBLE
+            return true
+        }
+        private fun formatDuration(milliseconds: Long): String =
+            String.format(java.util.Locale.getDefault(), "%.1fs", milliseconds / 1000.0)
+    }
+
     inner class UserMessageViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
         private val tvText: TextView = itemView.findViewById(R.id.tv_user_text)
         private val flImageContainer: View = itemView.findViewById(R.id.fl_user_image_container)
@@ -289,6 +682,7 @@ class ChatAdapter(
     inner class AiMessageViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
         private val tvAiModel: TextView = itemView.findViewById(R.id.tv_ai_model)
         private val tvText: TextView = itemView.findViewById(R.id.tv_ai_text)
+        private val tvStatus: TextView = itemView.findViewById(R.id.tv_ai_status)
         private val tvMetrics: TextView = itemView.findViewById(R.id.tv_ai_metrics)
         private val btnStop: MaterialButton = itemView.findViewById(R.id.btn_stop_generating)
         private val layoutThinking: View = itemView.findViewById(R.id.layout_thinking)
@@ -304,7 +698,19 @@ class ChatAdapter(
         private var streamingMinWidth = 0
 
         fun bind(item: ChatMessage.AiMessage) {
-            tvAiModel.text = LlamaEngine.getSelectedModel(itemView.context).displayName
+            // A tool turn leaves the assistant bubble empty while the image is
+            // being drawn: showing it would stack a second model header with no
+            // content above the picture.
+            val hideWholeBubble = item.waitingForImage && item.text.isBlank()
+            itemView.visibility = if (hideWholeBubble) View.GONE else View.VISIBLE
+            if (hideWholeBubble) return
+            tvAiModel.text = modelNameOrNull(itemView).orEmpty()
+            if (!item.status.isNullOrBlank()) {
+                tvStatus.text = item.status
+                tvStatus.visibility = View.VISIBLE
+            } else {
+                tvStatus.visibility = View.GONE
+            }
             if (!item.isGenerating) {
                 streamingMinWidth = 0
                 (tvText.parent as? ViewGroup)?.minimumWidth = 0
@@ -313,8 +719,11 @@ class ChatAdapter(
             // loading (placeholder bubble) and prefill/thinking. Keep the copy
             // distinct so they are not confused.
             tvPrefillStatus.text = itemView.context.getString(
-                if (item.isLoadingPlaceholder) R.string.model_loading_in_progress
-                else R.string.thinking_in_progress
+                when {
+                    item.waitingForImage -> R.string.tool_generating_image_short
+                    item.isLoadingPlaceholder -> R.string.model_loading_in_progress
+                    else -> R.string.thinking_in_progress
+                }
             )
             renderWithThinking(item.text, item.isGenerating)
             val metrics = item.metrics
@@ -341,6 +750,26 @@ class ChatAdapter(
             }
         }
 
+        /**
+         * Grows the bubble to say a reply is coming before the first token.
+         *
+         * The tool flow leaves the assistant bubble empty and collapsed while
+         * the picture is drawn, and an empty bubble has nothing to render the
+         * spinner into: the picture appeared and then nothing happened until
+         * the first token, which on a reloaded model is many seconds later. It
+         * shows the text line (blank) and the spinner below the model name,
+         * and only once the model is clearly answering ([waiting] false).
+         */
+        fun showPending(waiting: Boolean) {
+            itemView.visibility = View.VISIBLE
+            tvText.text = ""
+            tvText.visibility = View.VISIBLE
+            prefillStatus.visibility = View.VISIBLE
+            tvPrefillStatus.text = itemView.context.getString(
+                if (waiting) R.string.tool_generating_image_short else R.string.thinking_in_progress
+            )
+        }
+
         private fun formatDuration(milliseconds: Long): String =
             String.format(java.util.Locale.getDefault(), "%.1fs", milliseconds / 1000.0)
 
@@ -359,7 +788,10 @@ class ChatAdapter(
         }
 
         private fun renderWithThinking(raw: String, isGenerating: Boolean) {
-            prefillStatus.visibility = if (isGenerating && raw.isEmpty()) View.VISIBLE else View.GONE
+            // The prefill spinner only makes sense for a plain token stream; a
+            // status line (e.g. image tool progress) replaces it.
+            prefillStatus.visibility =
+                if (isGenerating && raw.isEmpty() && tvStatus.visibility != View.VISIBLE) View.VISIBLE else View.GONE
             val parsed = parseThinkingBlock(raw, isGenerating)
 
             if (parsed.thinkingText != null) {
@@ -442,10 +874,32 @@ class ChatAdapter(
                             oldItem.isPrefilling == newItem.isPrefilling &&
                             oldItem.isVideo == newItem.isVideo
                 oldItem is ChatMessage.AiMessage && newItem is ChatMessage.AiMessage ->
+                    // waitingForImage and status are part of the bubble: a
+                    // submitList() that only changed them was treated as
+                    // "same content" and never rebound, so the spinner the
+                    // model's turn needs never appeared after the picture.
                     oldItem.isGenerating == newItem.isGenerating &&
+                            oldItem.waitingForImage == newItem.waitingForImage &&
+                            oldItem.status == newItem.status &&
                             (oldItem.isGenerating || (oldItem.text == newItem.text && oldItem.metrics == newItem.metrics))
                 oldItem is ChatMessage.WelcomeCard && newItem is ChatMessage.WelcomeCard ->
-                    oldItem.isTextOnly == newItem.isTextOnly
+                    oldItem.isTextOnly == newItem.isTextOnly &&
+                            oldItem.isImageMode == newItem.isImageMode
+                oldItem is ChatMessage.ImageResult && newItem is ChatMessage.ImageResult ->
+                    oldItem.isGenerating == newItem.isGenerating &&
+                            oldItem.progress == newItem.progress &&
+                            oldItem.stage == newItem.stage &&
+                            // Presence, not identity: every step brings a new
+                            // Bitmap, and comparing identities rebound the row
+                            // on every frame. The new frame is painted directly
+                            // into the bound view by showPreview(), so a rebind
+                            // is only needed when a preview first appears or
+                            // disappears (which decides GONE vs VISIBLE).
+                            (oldItem.previewBitmap != null) == (newItem.previewBitmap != null) &&
+                            oldItem.pngPath == newItem.pngPath &&
+                            oldItem.error == newItem.error &&
+                            oldItem.paramsText == newItem.paramsText &&
+                            oldItem.elapsedMs == newItem.elapsedMs
                 oldItem is ChatMessage.ModelDownloadPrompt && newItem is ChatMessage.ModelDownloadPrompt ->
                     oldItem.modelName == newItem.modelName &&
                             oldItem.downloading == newItem.downloading &&

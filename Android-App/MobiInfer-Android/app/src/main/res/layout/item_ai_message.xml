@@ -121,6 +121,19 @@
                     android:alpha="0.15" />
             </LinearLayout>
 
+            <!-- Display-only progress line (e.g. "generating image"). Never
+                 part of the text sent back to the model. -->
+            <TextView
+                android:id="@+id/tv_ai_status"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="6dp"
+                android:textColor="?attr/colorOnSurfaceVariant"
+                android:textSize="13sp"
+                android:alpha="0.8"
+                android:accessibilityLiveRegion="polite"
+                android:visibility="gone" />
+
             <TextView
                 android:id="@+id/tv_ai_text"
                 android:layout_width="match_parent"

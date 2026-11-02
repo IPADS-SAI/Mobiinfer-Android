@@ -5,6 +5,8 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.util.Log
+import com.mobiinfer.demo.imagegen.ImagePromptMarker
+import com.mobiinfer.demo.imagegen.ImageTool
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -60,7 +62,21 @@ object ConversationStore {
         var currentId: String?
     )
 
+    // Parsed index, replaced on every write. list() and currentId() run on the
+    // main thread and used to re-read and re-parse the whole file each time; a
+    // rebuild over hundreds of directories made that visibly slow, and it could
+    // happen on every call while the index was unreadable.
+    @Volatile
+    private var cachedIndex: Index? = null
+
     private fun loadIndex(context: Context): Index {
+        cachedIndex?.let { return it }
+        val parsed = parseIndex(context)
+        cachedIndex = parsed
+        return parsed
+    }
+
+    private fun parseIndex(context: Context): Index {
         val file = File(root(context), INDEX_FILE)
         val conversations = mutableListOf<ConversationMeta>()
         var currentId: String? = null
@@ -81,13 +97,105 @@ object ConversationStore {
                     )
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "Failed to read conversation index, starting fresh", e)
+                // Do NOT treat an unreadable index as "no conversations". The
+                // list is rewritten on the next save, so starting fresh here
+                // permanently deletes every entry - which is exactly how the
+                // drawer collapsed from 210 rows to 2 while all the data was
+                // still on disk. Rebuild from the directories instead.
+                Log.w(TAG, "Failed to read conversation index, rebuilding from disk", e)
+                return rebuildIndex(context)
             }
         }
         return Index(conversations, currentId)
     }
 
+    /**
+     * Rebuilds the conversation list from the directories on disk.
+     *
+     * Every conversation is a directory with a messages.json, so the index is
+     * only a cache of titles and timestamps. Used when it cannot be parsed, and
+     * when the app finds entries on disk that the index does not know about -
+     * a lost index must never lose the conversations themselves.
+     */
+    private fun rebuildIndex(context: Context): Index {
+        val conversations = mutableListOf<ConversationMeta>()
+        // listFiles() can throw (root missing, EACCES). Rebuilding is the
+        // fallback for an unreadable INDEX, so it must not itself be the thing
+        // that escapes: a throw here propagates into save()/setCurrentId() and
+        // the turn that had already been written to messages.json never reaches
+        // the index.
+        val dirs = runCatching {
+            root(context).listFiles()?.filter { it.isDirectory }.orEmpty()
+        }.getOrDefault(emptyList())
+        for (dir in dirs) {
+            val messages = File(dir, MESSAGES_FILE)
+            // isDirectory/exists/lastModified all touch the filesystem and can
+            // throw; a single unreadable directory must not abort the rebuild
+            // for every other conversation.
+            if (runCatching { messages.exists() && messages.isFile }.getOrDefault(false).not()) continue
+            var title = DEFAULT_TITLE
+            var createdAt = runCatching { dir.lastModified() }.getOrDefault(0L)
+            var updatedAt = createdAt
+            runCatching {
+                val arr = JSONArray(messages.readText())
+                // The title is what the user said, not what the model answered.
+                var firstText: String? = null
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val text = o.optString("text", "").takeIf { it.isNotBlank() } ?: continue
+                    if (firstText == null) firstText = text
+                    if (o.optString("type") == "user") { firstText = text; break }
+                }
+                firstText?.let { title = it.lineSequence().first().take(TITLE_MAX).trim() }
+                updatedAt = messages.lastModified()
+            }
+            conversations.add(
+                ConversationMeta(
+                    id = dir.name,
+                    title = title,
+                    createdAt = createdAt,
+                    updatedAt = updatedAt
+                )
+            )
+        }
+        conversations.sortByDescending { it.updatedAt }
+        Log.i(TAG, "Rebuilt conversation index from disk: ${conversations.size} conversation(s)")
+        runCatching {
+            CriticalLog.log("chat", "index rebuilt from disk: ${conversations.size} conversation(s)")
+        }
+        return Index(conversations, conversations.firstOrNull()?.id)
+    }
+
     private fun saveIndex(context: Context, index: Index) {
+        // Adoption pass: a conversation directory the list does not know about
+        // is kept rather than dropped. The index only caches titles and times,
+        // so a stale one must never delete conversations that still exist.
+        val known = index.conversations.mapTo(HashSet()) { it.id }
+        // Scanned on every save, not once per process. The earlier "once"
+        // version was wrong in both directions: a healthy parse never set the
+        // flag, so the FIRST save of each process still listed the whole
+        // directory (the cost it meant to save), and after that no save ever
+        // looked again - so a conversation whose entry was lost, and which the
+        // user then saved, stayed invisible for the rest of the run.
+        // save() runs on Dispatchers.IO, and the streaming path throttles to one
+        // save per second, so this is one readdir plus a stat per conversation
+        // directory per second - 251 on the test device. That is milliseconds
+        // against the messages.json write that always precedes it, and the
+        // exists() probe only runs for names the index does not know.
+        val maybeLost = runCatching { root(context).listFiles() }.getOrNull()
+            ?.filter { it.isDirectory && it.name !in known && File(it, MESSAGES_FILE).exists() }
+            ?: emptyList()
+        if (maybeLost.isNotEmpty()) {
+            val adopted = rebuildIndex(context).conversations.filter { it.id !in known }
+            index.conversations.addAll(adopted)
+            index.conversations.sortByDescending { it.updatedAt }
+            Log.i(TAG, "Adopted ${adopted.size} conversation(s) present on disk but missing from the index")
+            // Guarded: this runs inside saveIndex(), before the index is
+            // written, so a throwing logger would abort the save itself.
+            runCatching {
+                CriticalLog.log("chat", "index adopted ${adopted.size} orphaned conversation(s)")
+            }
+        }
         val arr = JSONArray()
         for (meta in index.conversations) {
             arr.put(
@@ -103,7 +211,24 @@ object ConversationStore {
             put("current", index.currentId ?: JSONObject.NULL)
             put("conversations", arr)
         }
-        File(root(context), INDEX_FILE).writeText(json.toString())
+        // Write to a sibling and rename: a process death or a kill in the
+        // middle of a plain writeText() left a truncated index, and the next
+        // launch then read it as "no conversations".
+        val target = File(root(context), INDEX_FILE)
+        val temp = File(root(context), "$INDEX_FILE.tmp")
+        temp.writeText(json.toString())
+        if (!temp.renameTo(target)) {
+            // renameTo does not replace an existing file on every filesystem.
+            target.delete()
+            if (!temp.renameTo(target)) {
+                Log.w(TAG, "Could not replace $INDEX_FILE atomically, writing in place")
+                target.writeText(json.toString())
+                temp.delete()
+            }
+        }
+        // Adopted orphans were appended to this very object, so publishing it
+        // keeps the cache identical to what just hit the disk.
+        cachedIndex = index
     }
 
     // ------------------------------------------------------------------- api
@@ -180,10 +305,41 @@ object ConversationStore {
     @Synchronized
     fun delete(context: Context, id: String) {
         val index = loadIndex(context)
+        // Remove the directory FIRST. The index is only a cache and saveIndex()
+        // adopts any directory it does not know about, so saving before the
+        // delete meant a failed deleteRecursively() (partial removal, EACCES)
+        // was immediately re-adopted and the conversation the user just deleted
+        // reappeared in the drawer.
+        val dir = dirFor(context, id)
+        if (dir.exists() && !dir.deleteRecursively()) {
+            // Still on disk: keep the entry, so the list matches what a restart
+            // would show. This has to be decided BEFORE touching `index`:
+            // loadIndex() hands back the cached object itself, so removing the
+            // entry and then logging "kept" left the live cache without it and
+            // the next saveIndex() persisted the loss.
+            Log.w(TAG, "Could not delete conversation $id; keeping its index entry")
+            runCatching {
+                CriticalLog.log("chat", "delete failed for $id; entry kept")
+            }
+            return
+        }
+        // The directory is gone, so the operation has already happened; the
+        // index must now follow it. If the write fails, roll the cache back:
+        // otherwise the cache says "deleted" while the disk index still lists
+        // the conversation, and the next launch shows a row that loads empty.
+        val previous = index.conversations.toList()
+        val previousCurrent = index.currentId
         index.conversations.removeAll { it.id == id }
         if (index.currentId == id) index.currentId = index.conversations.firstOrNull()?.id
-        saveIndex(context, index)
-        dirFor(context, id).deleteRecursively()
+        runCatching { saveIndex(context, index) }.onFailure { e ->
+            index.conversations.clear()
+            index.conversations.addAll(previous)
+            index.currentId = previousCurrent
+            Log.e(TAG, "Deleted $id but could not persist the index", e)
+            runCatching {
+                CriticalLog.log("chat", "delete of $id: index write failed, cache rolled back")
+            }
+        }
     }
 
     @Synchronized
@@ -205,7 +361,8 @@ object ConversationStore {
                                 imageBitmap = uri?.let { decodeBitmap(context, it) },
                                 imageInfo = o.optString("imageInfo", null),
                                 isVideo = o.optBoolean("isVideo", false),
-                                imageUri = uri
+                                imageUri = uri,
+                                isImagePrompt = o.optBoolean("isImagePrompt", false)
                             )
                         )
                     }
@@ -225,6 +382,22 @@ object ConversationStore {
                                 metrics = metrics
                             )
                         )
+                    }
+                    "image" -> {
+                        val pngPath = o.optString("pngPath", "").takeIf { it.isNotBlank() }
+                        // Drop results whose file was cleaned up so the cell
+                        // never shows a permanently blank frame.
+                        if (pngPath == null || File(pngPath).exists()) {
+                            out.add(
+                                ChatMessage.ImageResult(
+                                    id = o.getLong("id"),
+                                    prompt = o.optString("prompt", ""),
+                                    pngPath = pngPath,
+                                    paramsText = o.optString("params", "").takeIf { it.isNotBlank() },
+                                    elapsedMs = if (o.has("elapsedMs")) o.getLong("elapsedMs") else null
+                                )
+                            )
+                        }
                     }
                 }
             }
@@ -248,6 +421,7 @@ object ConversationStore {
                         m.imageInfo?.let { put("imageInfo", it) }
                         put("isVideo", m.isVideo)
                         m.imageUri?.let { put("imageUri", it) }
+                        if (m.isImagePrompt) put("isImagePrompt", true)
                     }
                 )
                 is ChatMessage.AiMessage -> {
@@ -271,6 +445,22 @@ object ConversationStore {
                         )
                     }
                 }
+                is ChatMessage.ImageResult -> {
+                    // Only persist finished results; an in-flight generation has
+                    // no file yet and would come back as a blank frame.
+                    if (!m.isGenerating && m.pngPath != null) {
+                        arr.put(
+                            JSONObject().apply {
+                                put("type", "image")
+                                put("id", m.id)
+                                put("prompt", m.prompt)
+                                put("pngPath", m.pngPath)
+                                m.paramsText?.let { put("params", it) }
+                                m.elapsedMs?.let { put("elapsedMs", it) }
+                            }
+                        )
+                    }
+                }
                 else -> Unit
             }
         }
@@ -279,7 +469,9 @@ object ConversationStore {
         // entries must never appear in the history list.
         val hasContent = messages.any { m ->
             (m is ChatMessage.UserMessage && (m.text.isNotBlank() || m.imageUri != null)) ||
-            (m is ChatMessage.AiMessage && !m.isLoadingPlaceholder && m.text.isNotBlank())
+            (m is ChatMessage.AiMessage && !m.isLoadingPlaceholder && m.text.isNotBlank()) ||
+            (m is ChatMessage.ImageResult && !m.isGenerating && m.pngPath != null) ||
+            (m is ChatMessage.UserMessage && m.isImagePrompt)
         }
         if (!hasContent) return
 
@@ -316,9 +508,34 @@ object ConversationStore {
         return if (clean.length <= TITLE_MAX) clean else clean.substring(0, TITLE_MAX) + "…"
     }
 
+    /** Every generated PNG referenced by any saved conversation. */
+    fun allImagePaths(context: Context): Set<String> {
+        val paths = mutableSetOf<String>()
+        for (meta in list(context)) {
+            messagesFile(context, meta.id).takeIf { it.exists() }?.let { file ->
+                runCatching {
+                    val arr = JSONArray(file.readText())
+                    for (i in 0 until arr.length()) {
+                        val o = arr.getJSONObject(i)
+                        if (o.optString("type") == "image") {
+                            o.optString("pngPath", "").takeIf { it.isNotBlank() }?.let { paths.add(it) }
+                        }
+                    }
+                }.onFailure { Log.w(TAG, "Failed to scan images of ${meta.id}", it) }
+            }
+        }
+        return paths
+    }
+
     /** Persisted turns, in order, for context replay on conversation switch. */
     fun toHistoryTurns(messages: List<ChatMessage>): List<ChatHistoryTurn> {
         val turns = mutableListOf<ChatHistoryTurn>()
+        // Prompt of the picture that was just drawn, so the assistant turn that
+        // follows it can mention what it produced.
+        var previousImagePrompt: String? = null
+        // Set when the picture turn above was just emitted, so the assistant
+        // sentence that follows merges into it instead of starting a new turn.
+        var pendingDrawnPrompt: String? = null
         for (m in messages) {
             when (m) {
                 is ChatMessage.UserMessage -> {
@@ -332,10 +549,74 @@ object ConversationStore {
                             imageUris = m.imageUri?.let { listOf(it) } ?: emptyList()
                         )
                     )
+                    // Text-to-image turns: the picture was not drawn by the
+                    // LLM, so tell it what happened instead of leaving a
+                    // question that looks answered only by the next turn. The
+                    // image path rides in the marker so the replay can use the
+                    // file name (and therefore find the PNG again).
+                    if (m.isImagePrompt) {
+                        // Home-screen image mode: the picture was not drawn by
+                        // the model, so replay it as a completed generate_image
+                        // call rather than as a raw prompt. The \uE000 sentinel
+                        // means nothing to the native side - it would reach the
+                        // model as a stray control character glued to the text.
+                        previousImagePrompt = text
+                        turns.add(
+                            ChatHistoryTurn(
+                                role = "assistant",
+                                text = ImagePromptMarker.toolRecord(text)
+                            )
+                        )
+                    }
                 }
                 is ChatMessage.AiMessage -> {
                     if (m.text.isNotBlank() && !m.isLoadingPlaceholder) {
-                        turns.add(ChatHistoryTurn(role = "assistant", text = m.text))
+                        val drawnPrompt = pendingDrawnPrompt
+                        if (drawnPrompt != null) {
+                            // Fold the sentence into the picture turn that was
+                            // just emitted, keeping one assistant turn.
+                            // The record is wrapped in \u0001 markers, so append
+                            // after the closing one without an extra space: the
+                            // native parser must see exactly the JSON object
+                            // between the markers, and anything glued to it -
+                            // even whitespace - changes what it has to accept.
+                            val last = turns.lastOrNull()
+                            if (last != null && last.role == "assistant") {
+                                turns[turns.size - 1] = last.copy(
+                                    text = last.text + m.text
+                                )
+                            } else {
+                                turns.add(ChatHistoryTurn(role = "assistant", text = m.text))
+                            }
+                            pendingDrawnPrompt = null
+                        } else {
+                            turns.add(ChatHistoryTurn(role = "assistant", text = m.text))
+                        }
+                        previousImagePrompt = null
+                    }
+                }
+                // Image results never enter the LLM context: they belong to the
+                // text-to-image engine, which is a separate native stack. While
+                // in image mode the chat model is not even loaded.
+                is ChatMessage.ImageResult -> {
+                    // A finished picture is the assistant's answer to the turn
+                    // above it. Omitting it made the model replay its own
+                    // request with no reply and conclude it cannot draw;
+                    // narrating it in extra prose made it treat the topic as
+                    // closed. Recording it as the plain answer to that request
+                    // is what keeps later prompts calling the tool.
+                    if (!m.isGenerating && m.pngPath != null && previousImagePrompt == null) {
+                        // The native side turns this record into a real
+                        // generate_image call + result. Without it the model
+                        // replays "user asked for a picture" with a plain
+                        // sentence as the answer and stops calling the tool.
+                        turns.add(
+                            ChatHistoryTurn(
+                                role = "assistant",
+                                text = ImagePromptMarker.toolRecord(m.prompt)
+                            )
+                        )
+                        pendingDrawnPrompt = m.prompt
                     }
                 }
                 else -> Unit

@@ -1,0 +1,102 @@
+# Contributing
+
+This document collects general contribution conventions for this repository.
+
+## Before You Start
+
+Before opening a PR, please search existing PRs to avoid duplicating ongoing work.
+
+For large-scale refactors or changes with broad impact, please open an issue first to discuss the approach before submitting a PR.
+
+If you want to update a third-party dependency, please open an issue first instead of submitting a direct PR. See [Dependency Updates](#dependency-updates) for details.
+
+## Pull Requests
+
+When contributing from a fork, use a fork under your personal GitHub account and enable **Allow edits from maintainers**. This lets maintainers make follow-up fixes directly on the PR branch.
+
+PRs from organization-owned forks are automatically closed when opened or reopened because GitHub does not support this maintainer-edit option for those forks. Submit the changes from a personal fork instead. See [GitHub's documentation](https://docs.github.com/en/pull-requests/how-tos/work-with-forks/allowing-changes-to-a-pull-request-branch-created-from-a-fork).
+
+Keep each PR focused on one clear change. Large or overly complex PRs are harder to review and may not be merged.
+
+Do not include test code or test scripts in commits or PRs. Keep them local and report verification results in the PR description.
+
+Follow Conventional Commit-style subjects seen in history: `feat:`, `fix:`, `refactor:`, `ci:`, `docs:`, `chore:`. Keep subjects imperative and scoped.
+
+PRs should include:
+
+- What changed and why (short problem/solution summary).
+- Verification evidence when applicable (commands and key outputs).
+- Linked issue/PR context when applicable.
+- Screenshots or sample outputs for UI/visual behavior changes.
+
+## README UI Listings
+
+The [UIs list in the README](README.md#uis) only includes open-source projects that use `stable-diffusion.cpp` as a backend. Do not submit PRs to add closed-source UIs.
+
+## Server Recipes
+
+Before adding or changing a built-in server recipe, read and follow the
+[built-in recipe policy](examples/server/recipes/README.md). The policy governs
+native editing, community editing LoRAs, distinct task checkpoints, external
+adapters, native components and layer-count variants. Do not add recipes solely
+for style or acceleration LoRAs, separately stored native components, or added
+or removed model layers. Explain the task, component compatibility or capability
+difference that justifies a new recipe, and verify its required components,
+feature declarations and embedded API representation.
+
+## Code Style
+
+Format code according to the repository style before submitting changes.
+
+Formatting follows `.clang-format` (Chromium base, 4-space indent, no tabs). Run `scripts/format-code.sh` or `scripts/format-code.ps1` before opening a PR. Keep C++ standard at C++17-compatible patterns used in this repo.
+
+Naming conventions:
+
+- Use `PascalCase` for class/struct/type names.
+- In `PascalCase` names, preserve common abbreviations in uppercase, for example `SD`, `API`, `HTTP`, `JSON`, `RGB`, `VAE`, `TAE`, `LoRA`, and `WebP`.
+- Use `snake_case` for functions, methods, variables, and file names unless an existing API requires a different style.
+- Use a trailing underscore for private data member names, for example `hidden_size_` or `tokenizer_`.
+- Use `.hpp` for model headers under `src/model/`, including new model headers. Do not rename these headers to `.h`. Use `.h` for other C and C++ header files.
+- Use macro-based header include guards instead of `#pragma once`.
+- Format header include guards as `__SD_{PATH}__`, where `{PATH}` is the header path in uppercase snake case without the file extension. For example, `src/sample.h` should use `__SD_SAMPLE_H__`.
+- Do not introduce anonymous namespaces in new or modified code; prefer `static` file-local functions/variables or an explicit named namespace when scoping is needed.
+- In `class`/`struct` definitions, place data members before member functions unless an existing type already clearly follows a different pattern.
+
+Some older code in the project may not fully follow the current conventions. Please do not submit PRs that only rewrite existing code to match style rules.
+
+When adding or modifying model implementations, follow the model config and weight detection conventions in [docs/model_config.md](docs/model_config.md).
+
+## Tokenizer Data
+
+New model integrations must use an external `tokenizer.json` by default. Do not
+embed new vocabularies or merge tables solely for less widely used models;
+these tables increase the binary size for every user.
+
+The embedded-data allowlist is CLIP, T5/UMT5, Qwen 2/3, Mistral, and Gemma 3/4.
+Models may reuse an existing embedded tokenizer when its vocabulary and behavior
+match their text encoder. Gemma 2 and GPT-OSS require external JSON files.
+
+Adding to this allowlist requires maintainer approval, supported by the model's
+usage, reuse across models, and measured binary-size cost. Document the matching
+JSON and CLI option for models that require an external tokenizer, and fail
+initialization clearly when it is missing.
+
+## AI-Assisted Contributions
+
+AI tools may be used to assist development, but contributors are responsible for the quality and correctness of the submitted code.
+
+If any part of a contribution was generated with AI assistance, the contributor must perform a thorough human review before submitting the PR and understand every changed line.
+
+Do not list AI tools as co-authors. The human contributor is the sole responsible author of the submitted code.
+
+Please do not submit AI-generated code that you do not understand, and do not include meaningless experiments, temporary test code, or unrelated generated output in a PR.
+
+## Dependency Updates
+
+Do not submit PRs that update `ggml`. `ggml` updates are performed only after local validation by the maintainer.
+
+Other third-party dependencies are not updated unless necessary. If you want to update a dependency, please open an issue first instead of submitting a direct PR.
+
+## Security & Configuration
+
+Do not commit model weights, secrets, or local absolute paths. Keep large binaries out of git unless intentionally tracked release assets.

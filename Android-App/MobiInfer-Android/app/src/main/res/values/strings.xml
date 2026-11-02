@@ -112,6 +112,7 @@
     <string name="toast_load_success">%1$s 加载成功!</string>
     <string name="toast_load_failed">加载失败: %1$s</string>
     <string name="toast_downloading">正在下载中...</string>
+    <string name="download_busy_other_model">正在下载 %1$s，请先暂停再下载其他模型</string>
     <string name="toast_already_downloaded">模型文件已存在，无需重复下载</string>
     <string name="toast_already_loading">模型正在加载中...</string>
     <string name="toast_model_not_found">模型文件不存在，请先下载</string>
@@ -249,4 +250,106 @@
     <string name="debug_logging_enabled">调试日志已开启</string>
     <string name="debug_logging_disabled">调试日志已关闭</string>
     <string name="debug_logs_unavailable">当前版本不包含调试日志查看器</string>
+
+    <!-- Text-to-image (stable-diffusion.cpp) -->
+    <string name="image_result_desc">生成结果</string>
+    <string name="image_generating">正在生成图片…</string>
+    <string name="image_generate_failed">图片生成失败</string>
+    <string name="image_error">错误: %1$s</string>
+    <string name="model_desc_moss_fp16">MOSS-Image 文生图，FP16 4 步蒸馏（画质最佳，约 16GB）</string>
+    <string name="model_desc_moss_q4">MOSS-Image 文生图，Q4 8 步（更小更快，约 9GB）</string>
+
+    <!-- Text-to-image UI -->
+    <string name="image_prompt_hint">描述你想要的画面，例如：一只晒太阳的橘猫，写实风格</string>
+    <string name="image_model_hint">当前为文生图模型，输入描述后直接生成图片；生成参数在「模型配置 → 文生图」中调整。</string>
+    <string name="t2i_mode_hint">文生图模式</string>
+    <string name="welcome_title_image">开始创作图片</string>
+    <string name="welcome_desc_image">输入一句描述，模型会在本机直接生成图片；尺寸、步数等参数可在模型配置中调整。</string>
+    <string name="suggestion_image_1">一只在月球上漫步的橘猫，写实风格</string>
+    <string name="suggestion_image_2">江南水乡的清晨，水墨画风格</string>
+    <string name="image_result_params">%1$d × %2$d · %3$d 步 · CFG %4$s · 种子 %5$d</string>
+    <string name="image_result_elapsed">耗时 %1$s</string>
+
+    <!-- Model manager: mode switch and text-to-image settings -->
+    <string name="config_page_title">模型配置</string>
+    <string name="config_tab_llm">大模型</string>
+    <string name="config_tab_image">文生图</string>
+    <string name="config_section_downloadable">可下载模型</string>
+    <string name="config_section_settings">配置</string>
+    <string name="config_section_parameters">生成参数</string>
+    <string name="image_param_size">尺寸</string>
+    <string name="image_param_size_value">%1$d × %2$d</string>
+    <string name="image_param_steps">步数</string>
+    <string name="image_param_cfg">CFG（提示词引导强度）</string>
+    <string name="image_param_negative">反向提示词</string>
+    <string name="image_param_negative_hint">留空则使用模型默认值</string>
+    <string name="image_param_reset">恢复默认值</string>
+    <string name="image_param_saved">已保存</string>
+    <string name="image_model_none">尚未选择文生图模型</string>
+
+    <!-- Image viewer and gallery export -->
+    <string name="image_result_hint">点击查看大图</string>
+    <string name="image_reseed_action">换一个种子再生成一遍</string>
+    <string name="image_reseed_running">正在用新的种子重新生成…</string>
+    <string name="image_loading">载入中…</string>
+    <string name="image_missing">图片文件已不存在</string>
+    <string name="image_save">保存到相册</string>
+    <string name="image_share">分享</string>
+    <string name="image_share_title">分享图片</string>
+    <string name="image_save_title">保存图片</string>
+    <string name="image_save_message">图片将保存到系统相册的 MobiInfer 目录。</string>
+    <string name="image_save_confirm">保存</string>
+    <string name="image_save_done_title">已保存</string>
+    <string name="image_save_done">图片已保存到相册。</string>
+    <string name="image_save_failed">保存失败</string>
+    <string name="image_save_permission_needed">需要存储权限才能保存到相册</string>
+    <string name="image_open_gallery">打开</string>
+
+    <!-- generate_image tool -->
+    <string name="tool_generating_image">正在生成图片：%1$s</string>
+    <string name="tool_image_done">图片已生成</string>
+    <string name="tool_download_image_model">正在下载文生图模型（%1$s），完成后会自动生成…</string>
+    <string name="tool_image_failed">图片生成失败：%1$s</string>
+    <string name="tool_unloading_model">内存不足，正在卸载语言模型以加载文生图模型…</string>
+    <string name="tool_image_done_no_reply">图片已生成，但继续对话需要重新加载语言模型。</string>
+    <string name="config_image_tool_title">允许聊天模型生成图片</string>
+    <string name="config_image_tool_description">在系统提示中加入 generate_image 工具：聊天时模型可以直接调用文生图；若模型未下载会自动下载（默认 Q4）。</string>
+    <string name="image_param_seed_random"></string>
+    <string name="image_param_seed_fixed">固定种子，可复现同一张图</string>
+    <string name="image_param_seed_use_last">用上一张的种子（%1$d）</string>
+    <string name="image_result_seed">种子 %1$d</string>
+    <string name="config_reload_for_prompt">已切换生成图片工具，语言模型将在下次对话时重新加载。</string>
+    <string name="tool_download_image_model_short">正在下载文生图模型 %1$s</string>
+    <string name="image_model_download_failed">文生图模型下载没有完成</string>
+    <string name="image_model_paused_hint">文生图模型下载已暂停，点「继续」后再试</string>
+    <string name="image_load_failed">文生图模型加载失败</string>
+    <string name="image_copy_error">复制错误信息</string>
+    <string name="image_error_copied">已复制</string>
+    <string name="image_stage_loading">准备模型…</string>
+    <string name="image_stage_encoding">理解提示词中…</string>
+    <string name="image_stage_step">第 %1$d / %2$d 步</string>
+    <string name="image_stage_decoding">正在解码图片…</string>
+    <string name="image_stage_sampling">正在生成画面…</string>
+    <string name="image_stage_loading_progress">加载模型 %1$d / %2$d</string>
+    <string name="image_eta_seconds">剩余约 %1$d 秒</string>
+    <string name="image_eta_minutes">剩余约 %1$d 分钟</string>
+    <string name="image_stage_with_eta">%1$s · %2$s</string>
+    <string name="image_progress_label">%1$d%% · %2$s · %3$s</string>
+    <string name="image_stage_loading_title">加载权重</string>
+    <string name="image_stage_encoding_title">理解提示词</string>
+    <string name="image_stage_sampling_title">生成画面</string>
+    <string name="image_stage_decoding_title">解码图片</string>
+    <string name="tool_reloading_model">正在重新加载模型…</string>
+    <string name="image_progress_label_short">%1$d%% · %2$s</string>
+    <string name="image_param_steps_hint">去噪迭代次数，按所选模型的训练步数来：8 步 Turbo 用 8，4 步蒸馏用 4。偏离太多画面会变差。</string>
+    <string name="image_param_cfg_hint">CFG 越大越贴提示词，但画面容易过饱和、发糊。MOSS 蒸馏权重默认 1.0；调到 3.0 附近更贴提示词，但易过饱和。</string>
+    <string name="image_param_seed_hint">相同种子 + 相同提示词 = 同一张图，方便微调对比</string>
+    <string name="image_param_seed">随机种子</string>
+    <string name="image_param_seed_random_action">换个种子</string>
+    <string name="image_param_width">宽（像素）</string>
+    <string name="image_param_height">高（像素）</string>
+    <string name="tool_restoring_context">正在恢复对话上下文…</string>
+    <string name="image_param_seed_box">0–9999，留空则每张随机</string>
+    <string name="tool_generating_image_short">正在生成图片…</string>
+    <string name="tool_loading_image_model">正在加载文生图模型…</string>
 </resources>

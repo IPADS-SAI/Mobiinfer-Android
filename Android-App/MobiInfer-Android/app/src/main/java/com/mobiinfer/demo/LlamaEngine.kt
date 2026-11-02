@@ -18,14 +18,19 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.RandomAccessFile
 import java.net.HttpURLConnection
 import java.net.URL
+import java.nio.channels.FileLock
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
@@ -168,6 +173,290 @@ class LlamaEngine private constructor(
         private const val KEY_MODEL_SWITCHED = "model_switched"
         private const val KEY_ENABLE_THINKING = "enable_thinking"
 
+        // Text-to-image generation defaults. Kept in prefs (not per-model) so a
+        // MOSS fp16 <-> q4 switch keeps the user's size/step choices; the step
+        // preference is tracked per checkpoint build (see getImageGenSteps)
+        // because the 8-step turbo DiT and the 4-step distill DiT differ.
+        private const val KEY_IMAGE_WIDTH = "image_gen_width"
+        private const val KEY_IMAGE_HEIGHT = "image_gen_height"
+        private const val KEY_IMAGE_STEPS = "image_gen_steps"
+        private const val KEY_IMAGE_ENCODE_MS = "image_timing_encode_ms"
+        private const val KEY_IMAGE_PER_STEP_MS = "image_timing_per_step_ms"
+        private const val KEY_IMAGE_DECODE_MS = "image_timing_decode_ms"
+        private const val KEY_IMAGE_TIMING_STEPS = "image_timing_steps"
+        private const val KEY_IMAGE_TIMING_WIDTH = "image_timing_width"
+        private const val KEY_IMAGE_TIMING_HEIGHT = "image_timing_height"
+        private const val KEY_IMAGE_TIMING_CFG = "image_timing_cfg"
+        private const val KEY_IMAGE_TIMING_PROMPT_CHARS = "image_timing_prompt_chars"
+        private const val KEY_IMAGE_TIMING_MODEL = "image_timing_model"
+        private const val KEY_IMAGE_CFG = "image_gen_cfg"
+        private const val KEY_IMAGE_NEGATIVE = "image_gen_negative_prompt"
+        private const val KEY_IMAGE_SEED = "image_gen_seed"
+        private const val KEY_IMAGE_LAST_SEED = "image_gen_last_seed"
+        private const val KEY_IMAGE_CHAT_TOOL = "image_gen_chat_tool"
+        // Per (model id, file name) ownership of a shared accessory file.
+        private const val KEY_SHARED_EXTRA = "image_extra_owner"
+        const val MIN_IMAGE_GEN_SIDE = 256
+        const val MAX_IMAGE_GEN_SIDE = 1024
+        const val IMAGE_GEN_SIDE_STEP = 64
+        // Below 4 denoising steps the MOSS flow path cannot form an image, so
+        // the slider and every stored value are clamped to this floor.
+        const val MIN_IMAGE_GEN_STEPS = 4
+        const val MAX_IMAGE_GEN_STEPS = 50
+        const val DEFAULT_IMAGE_GEN_SIDE = 256
+        // Fallbacks only: a checkpoint with its own training step count / CFG
+        // carries them in ModelInfo.defaultSteps / defaultCfg.
+        const val DEFAULT_IMAGE_GEN_STEPS = 8
+        const val DEFAULT_IMAGE_GEN_CFG = 1.0f
+        // -1 means "pick a fresh random seed for every image". Any other value
+        // is reused verbatim so the same prompt can be reproduced.
+        const val RANDOM_IMAGE_SEED = -1L
+
+        /**
+         * Seeds are shown and typed as four digits: long enough to feel like a
+         * code one can share, short enough to read out loud. The picker stays
+         * inside 0..9999 so every seed fits the field.
+         */
+        const val IMAGE_SEED_MAX = 9999L
+
+        fun randomImageSeed(): Long = java.util.Random().nextInt(10_000).toLong()
+
+        // Shared accessory file names an in-process download is currently
+        // writing. Deletion checks this so it never unlinks a file mid-transfer.
+        // Kept static (not per engine instance) because the model manager and
+        // the home screen use different instances, and the one deleting a model
+        // is usually not the one downloading it.
+        private val liveSharedDownloads = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+
+        fun getImageGenWidth(context: Context): Int =
+            prefs(context).getInt(KEY_IMAGE_WIDTH, DEFAULT_IMAGE_GEN_SIDE)
+                .coerceIn(MIN_IMAGE_GEN_SIDE, MAX_IMAGE_GEN_SIDE)
+
+        fun setImageGenWidth(context: Context, width: Int) {
+            val clamped = width.coerceIn(MIN_IMAGE_GEN_SIDE, MAX_IMAGE_GEN_SIDE)
+            prefs(context).edit().putInt(KEY_IMAGE_WIDTH, clamped).apply()
+        }
+
+        fun getImageGenHeight(context: Context): Int =
+            prefs(context).getInt(KEY_IMAGE_HEIGHT, DEFAULT_IMAGE_GEN_SIDE)
+                .coerceIn(MIN_IMAGE_GEN_SIDE, MAX_IMAGE_GEN_SIDE)
+
+        fun setImageGenHeight(context: Context, height: Int) {
+            val clamped = height.coerceIn(MIN_IMAGE_GEN_SIDE, MAX_IMAGE_GEN_SIDE)
+            prefs(context).edit().putInt(KEY_IMAGE_HEIGHT, clamped).apply()
+        }
+
+        fun getImageGenSteps(context: Context): Int =
+            getImageGenSteps(context, getSelectedModel(context))
+
+        /**
+         * Step count for [model]'s checkpoint. A checkpoint with its own
+         * [ModelInfo.defaultSteps] (turbo DiT 8, distill DiT 4) reports its
+         * training step count until the user overrides it; a checkpoint without
+         * one keeps the legacy app-wide preference unchanged.
+         */
+        fun getImageGenSteps(context: Context, model: ModelInfo): Int {
+            val prefs = prefs(context)
+            val modelDefault = model.defaultSteps
+            val stored = if (modelDefault != null) {
+                if (prefs.getBoolean(stepsOverriddenKeyFor(model.id), false)) {
+                    prefs.getInt(stepsKeyFor(model.id), modelDefault)
+                } else {
+                    modelDefault
+                }
+            } else {
+                prefs.getInt(KEY_IMAGE_STEPS, DEFAULT_IMAGE_GEN_STEPS)
+            }
+            return stored.coerceIn(MIN_IMAGE_GEN_STEPS, MAX_IMAGE_GEN_STEPS)
+        }
+
+        fun setImageGenSteps(context: Context, steps: Int) {
+            setImageGenSteps(context, getSelectedModel(context), steps)
+        }
+
+        /**
+         * Records [steps] as an explicit choice. Unlike [getImageGenSteps] it
+         * keeps the user's number verbatim, because the UI writes the value it
+         * just displayed back on refresh.
+         */
+        fun setImageGenSteps(context: Context, model: ModelInfo, steps: Int) {
+            val clamped = steps.coerceIn(MIN_IMAGE_GEN_STEPS, MAX_IMAGE_GEN_STEPS)
+            val prefs = prefs(context)
+            val modelDefault = model.defaultSteps
+            if (modelDefault == null) {
+                prefs.edit().putInt(KEY_IMAGE_STEPS, clamped).apply()
+                return
+            }
+            prefs.edit()
+                .putInt(stepsKeyFor(model.id), clamped)
+                .putBoolean(stepsOverriddenKeyFor(model.id), true)
+                .apply()
+        }
+
+        /** Drops the user's overrides so the checkpoint's own defaults apply. */
+        fun resetImageGenSteps(context: Context) {
+            val model = getSelectedModel(context)
+            val editor = prefs(context).edit()
+            if (model.defaultSteps == null) {
+                editor.remove(KEY_IMAGE_STEPS)
+            } else {
+                editor.remove(stepsKeyFor(model.id))
+                editor.remove(stepsOverriddenKeyFor(model.id))
+            }
+            if (model.defaultCfg == null) {
+                editor.remove(KEY_IMAGE_CFG)
+            } else {
+                editor.remove(cfgKeyFor(model.id))
+                editor.remove(cfgOverriddenKeyFor(model.id))
+            }
+            editor.apply()
+        }
+
+        private fun stepsKeyFor(modelId: String): String = "$KEY_IMAGE_STEPS.$modelId"
+
+        private fun stepsOverriddenKeyFor(modelId: String): String =
+            "$KEY_IMAGE_STEPS.$modelId.custom"
+
+        private fun cfgKeyFor(modelId: String): String = "$KEY_IMAGE_CFG.$modelId"
+
+        private fun cfgOverriddenKeyFor(modelId: String): String =
+            "$KEY_IMAGE_CFG.$modelId.custom"
+
+        /**
+         * CFG scale for the selected checkpoint. Like the step count, a model
+         * with its own [ModelInfo.defaultCfg] (guided checkpoints 3.0, distilled
+         * ones 1.0) uses that until the user moves the slider.
+         */
+        fun getImageGenCfg(context: Context): Float =
+            getImageGenCfg(context, getSelectedModel(context))
+
+        fun getImageGenCfg(context: Context, model: ModelInfo): Float {
+            val prefs = prefs(context)
+            val modelDefault = model.defaultCfg
+            val stored = if (modelDefault != null) {
+                if (prefs.getBoolean(cfgOverriddenKeyFor(model.id), false)) {
+                    prefs.getFloat(cfgKeyFor(model.id), modelDefault)
+                } else {
+                    modelDefault
+                }
+            } else {
+                prefs.getFloat(KEY_IMAGE_CFG, DEFAULT_IMAGE_GEN_CFG)
+            }
+            return stored.coerceIn(1f, 15f)
+        }
+
+        fun setImageGenCfg(context: Context, cfg: Float) {
+            setImageGenCfg(context, getSelectedModel(context), cfg)
+        }
+
+        fun setImageGenCfg(context: Context, model: ModelInfo, cfg: Float) {
+            // Keep one decimal place so the UI never shows 3.0000001.
+            val stepped = (cfg.coerceIn(1f, 15f) * 10).roundToInt() / 10f
+            val prefs = prefs(context)
+            if (model.defaultCfg == null) {
+                prefs.edit().putFloat(KEY_IMAGE_CFG, stepped).apply()
+                return
+            }
+            prefs.edit()
+                .putFloat(cfgKeyFor(model.id), stepped)
+                .putBoolean(cfgOverriddenKeyFor(model.id), true)
+                .apply()
+        }
+
+        /** Seed of the most recently drawn picture (for "reuse this seed"). */
+        fun getLastImageSeed(context: Context): Long =
+            prefs(context).getLong(KEY_IMAGE_LAST_SEED, RANDOM_IMAGE_SEED)
+
+        fun setLastImageSeed(context: Context, seed: Long) {
+            prefs(context).edit().putLong(KEY_IMAGE_LAST_SEED, seed).apply()
+        }
+
+        /**
+         * Milliseconds the last draw spent in each phase, used to predict the
+         * remaining time of the next one. Zero means "never measured", and the
+         * caller falls back to its own defaults.
+         */
+        data class ImageTiming(
+            val encodeMs: Long,
+            val perStepMs: Long,
+            val decodeMs: Long,
+            // Settings the measurement was taken under. Without them the numbers
+            // can only be reused for the exact same draw: one step at 512x512
+            // costs about four times what it costs at 256x256, and CFG > 1 runs
+            // the denoiser twice per step.
+            val steps: Int = 0,
+            val width: Int = 0,
+            val height: Int = 0,
+            val cfg: Float = 0f,
+            val promptChars: Int = 0,
+            // Which checkpoint produced the measurement. fp16 and q4 builds of
+            // the same model differ by several times in both load and per-step
+            // cost, so a number measured on one is worthless for the other.
+            val modelId: String = ""
+        )
+
+        fun getImageTiming(context: Context): ImageTiming {
+            val p = prefs(context)
+            return ImageTiming(
+                encodeMs = p.getLong(KEY_IMAGE_ENCODE_MS, 0L),
+                perStepMs = p.getLong(KEY_IMAGE_PER_STEP_MS, 0L),
+                decodeMs = p.getLong(KEY_IMAGE_DECODE_MS, 0L),
+                steps = p.getInt(KEY_IMAGE_TIMING_STEPS, 0),
+                width = p.getInt(KEY_IMAGE_TIMING_WIDTH, 0),
+                height = p.getInt(KEY_IMAGE_TIMING_HEIGHT, 0),
+                cfg = p.getFloat(KEY_IMAGE_TIMING_CFG, 0f),
+                promptChars = p.getInt(KEY_IMAGE_TIMING_PROMPT_CHARS, 0),
+                modelId = p.getString(KEY_IMAGE_TIMING_MODEL, "").orEmpty()
+            )
+        }
+
+        fun setImageTiming(context: Context, timing: ImageTiming) {
+            if (timing.encodeMs <= 0 || timing.perStepMs <= 0 || timing.decodeMs <= 0) return
+            prefs(context).edit()
+                .putLong(KEY_IMAGE_ENCODE_MS, timing.encodeMs)
+                .putLong(KEY_IMAGE_PER_STEP_MS, timing.perStepMs)
+                .putLong(KEY_IMAGE_DECODE_MS, timing.decodeMs)
+                .putInt(KEY_IMAGE_TIMING_STEPS, timing.steps)
+                .putInt(KEY_IMAGE_TIMING_WIDTH, timing.width)
+                .putInt(KEY_IMAGE_TIMING_HEIGHT, timing.height)
+                .putFloat(KEY_IMAGE_TIMING_CFG, timing.cfg)
+                .putInt(KEY_IMAGE_TIMING_PROMPT_CHARS, timing.promptChars)
+                .putString(KEY_IMAGE_TIMING_MODEL, timing.modelId)
+                .apply()
+        }
+
+        fun getImageGenSeed(context: Context): Long =
+            prefs(context).getLong(KEY_IMAGE_SEED, RANDOM_IMAGE_SEED)
+
+        /** Clamps to sdcpp's 32-bit seed range; negative keeps it random. */
+        fun setImageGenSeed(context: Context, seed: Long) {
+            val stored = if (seed < 0) RANDOM_IMAGE_SEED else seed and 0xffffffffL
+            prefs(context).edit().putLong(KEY_IMAGE_SEED, stored).apply()
+        }
+
+        /**
+         * Whether chat models are told about the generate_image tool. Off
+         * means the model never hears about image generation; the chat-side
+         * text-to-image switch (for image checkpoints) is unaffected.
+         */
+        fun isImageToolEnabled(context: Context): Boolean =
+            prefs(context).getBoolean(KEY_IMAGE_CHAT_TOOL, true)
+
+        fun setImageToolEnabled(context: Context, enabled: Boolean) {
+            prefs(context).edit().putBoolean(KEY_IMAGE_CHAT_TOOL, enabled).apply()
+        }
+
+        fun getImageNegativePrompt(context: Context): String =
+            prefs(context).getString(KEY_IMAGE_NEGATIVE, "") ?: ""
+
+        fun setImageNegativePrompt(context: Context, prompt: String) {
+            prefs(context).edit().putString(KEY_IMAGE_NEGATIVE, prompt.trim()).apply()
+        }
+
+        /** Directory holding generated PNGs (outside cacheDir so history survives). */
+        fun imageOutputDir(context: Context): File =
+            File(context.filesDir, "generated_images").apply { mkdirs() }
+
         // MiniCPM-V's hard upper bound on slice count.  Values higher than 9
         // get clamped by clip.cpp::get_best_grid anyway; we cap on the UI
         // side to keep the slider semantics honest.
@@ -200,23 +489,36 @@ class LlamaEngine private constructor(
         }
 
         fun setSelectedModel(context: Context, modelId: String) {
-            prefs(context).edit().putString(KEY_SELECTED_MODEL, modelId).apply()
+            // A manual choice must survive the next default-model rollover.
+            prefs(context).edit()
+                .putString(KEY_SELECTED_MODEL, modelId)
+                .putString(KEY_DEFAULT_MODEL_APPLIED, modelId)
+                .apply()
         }
 
         /**
          * Rolls the stored model selection forward to [ModelInfo.DEFAULT_MODEL]
-         * once per change of the shipped default. Fresh installs and users who
-         * already run the current default are no-ops; only a stale selection
-         * left by an older build (e.g. Qwen before the default moved to
-         * MiniCPM) is overridden, and a later manual choice is preserved.
+         * once, on the first launch of a build that ships it.
+         *
+         * Only a selection that was never made explicitly is overridden: a
+         * fresh install, or a choice rolled forward by an earlier rollover.
+         * A model the user picked by hand (in the toolbar or in the
+         * configuration page) is always preserved - otherwise every rebuild
+         * with a new default would silently switch the user, e.g. away from
+         * the text-to-image checkpoint they are working with.
          */
         fun applyDefaultModelIfNeeded(context: Context) {
             val prefs = prefs(context)
             if (prefs.getString(KEY_DEFAULT_MODEL_APPLIED, null) == ModelInfo.DEFAULT_MODEL.id) return
-            prefs.edit()
-                .putString(KEY_SELECTED_MODEL, ModelInfo.DEFAULT_MODEL.id)
-                .putString(KEY_DEFAULT_MODEL_APPLIED, ModelInfo.DEFAULT_MODEL.id)
-                .apply()
+            val current = prefs.getString(KEY_SELECTED_MODEL, null)
+            val editor = prefs.edit().putString(KEY_DEFAULT_MODEL_APPLIED, ModelInfo.DEFAULT_MODEL.id)
+            // No stored selection at all: a fresh install, take the default.
+            // Anything else is either this rollover's own bookkeeping or a
+            // manual pick (setSelectedModel() records it), which is kept.
+            if (current == null) {
+                editor.putString(KEY_SELECTED_MODEL, ModelInfo.DEFAULT_MODEL.id)
+            }
+            editor.apply()
         }
 
         fun markModelSwitched(context: Context) {
@@ -268,10 +570,10 @@ class LlamaEngine private constructor(
         fun modelDirFor(context: Context, model: ModelInfo): String =
             File(modelDir(context), model.id).absolutePath
 
-        fun modelPath(context: Context): String {
-            val model = getSelectedModel(context)
-            return File(modelDirFor(context, model), model.ggufFileName).absolutePath
-        }
+        fun modelPath(context: Context): String = modelPath(context, getSelectedModel(context))
+
+        fun modelPath(context: Context, model: ModelInfo): String =
+            File(modelDirFor(context, model), model.ggufFileName).absolutePath
 
         fun mmprojPath(context: Context): String? {
             val model = getSelectedModel(context)
@@ -285,6 +587,197 @@ class LlamaEngine private constructor(
             return File(modelDirFor(context, model), acoustic).absolutePath
         }
 
+        // MOSS-Image accessory file paths (derived from extraFiles order:
+        // [text encoder, VAE, tokenizer]). Return null if the model has no
+        // matching extra files configured.
+        fun imageTextEncoderPath(context: Context): String? =
+            imageTextEncoderPath(context, getSelectedModel(context))
+
+        fun imageVaePath(context: Context): String? =
+            imageVaePath(context, getSelectedModel(context))
+
+        fun imageTokenizerPath(context: Context): String? =
+            imageTokenizerPath(context, getSelectedModel(context))
+
+        fun imageTextEncoderPath(context: Context, model: ModelInfo): String? =
+            imageExtraPath(context, model, 0)
+
+        fun imageVaePath(context: Context, model: ModelInfo): String? =
+            imageExtraPath(context, model, 1)
+
+        fun imageTokenizerPath(context: Context, model: ModelInfo): String? =
+            imageExtraPath(context, model, 2)
+
+        private fun imageExtraPath(context: Context, model: ModelInfo, index: Int): String? {
+            val name = model.extraFiles.getOrNull(index) ?: return null
+            return extraFilePath(context, name).absolutePath
+        }
+
+        // Shared accessory files (MOSS-Image text encoder / VAE / tokenizer).
+        // They are identical for every checkpoint of the same family and are
+        // by far the largest part of the q4 download, so they live once in
+        // `<models>/shared/` instead of once per model directory.
+        //
+        // The shared blob alone does not make a model complete: a q4 download
+        // populates the files while the fp16 DiT is still missing, so
+        // ownership is tracked per (model id, file name) in prefs. Files left
+        // in a per-model directory by an older build are adopted on first use
+        // (see adoptLegacyExtraFile), so existing installs do not pay twice.
+        private fun sharedExtraDir(context: Context): File =
+            File(modelDir(context), "shared").apply { mkdirs() }
+
+        /** On-disk location of a shared accessory file, regardless of the model. */
+        fun extraFilePath(context: Context, name: String): File =
+            File(sharedExtraDir(context), name)
+
+        /** True when [name] is present on disk and not still being written. */
+        fun hasExtraFile(context: Context, name: String): Boolean {
+            val f = extraFilePath(context, name)
+            return f.isFile && f.length() > 0L && !File(f.path + ".part").exists()
+        }
+
+        /** True when [model] has claimed [name] (downloaded it, or it was adopted). */
+        fun hasExtraFile(context: Context, model: ModelInfo, name: String): Boolean =
+            hasExtraFile(context, name) &&
+                prefs(context).getBoolean(extraOwnerKey(model.id, name), false)
+
+        private fun extraOwnerKey(modelId: String, name: String): String =
+            "$KEY_SHARED_EXTRA.$modelId.$name"
+
+        private fun claimExtraFile(context: Context, model: ModelInfo, name: String) {
+            prefs(context).edit().putBoolean(extraOwnerKey(model.id, name), true).apply()
+        }
+
+        /**
+         * Summed size of [model]'s accessory files that are already installed
+         * (by this model or by another one), i.e. bytes it will not fetch again.
+         */
+        fun sharedExtraBytes(context: Context, model: ModelInfo): Long =
+            model.extraFiles.sumOf { name ->
+                val f = extraFilePath(context, name)
+                if (hasExtraFile(context, name)) f.length() else 0L
+            }
+
+        /** Bytes [model] still has to fetch; drives the download progress bar. */
+        fun downloadBytes(context: Context, model: ModelInfo): Long =
+            model.downloadBytes(sharedExtraBytes(context, model))
+
+        /**
+         * Bytes [model] has to fetch for files it owns itself (checkpoint,
+         * mmproj, bundle payloads) — the [downloadBytes] total without the
+         * accessory files, whether or not those are already installed.
+         *
+         * This is the denominator for row progress and pairs with
+         * [ownDownloadedBytes], so both sides of the ratio exclude the shared
+         * text encoder / VAE / tokenizer. Computing it as
+         * `downloadBytes - sharedExtraBytes` at the call site would read the
+         * preference twice and break if a download finished in between.
+         */
+        fun ownNeededBytes(context: Context, model: ModelInfo): Long =
+            model.downloadBytes(0L)
+
+        /**
+         * Bytes already on disk that count towards [downloadBytes] without
+         * being fetched again: shared accessory files plus any payload file
+         * that is fully present. Seeded into the progress bar so it does not
+         * start at 0% when most of the footprint is reused.
+         */
+        private fun installedReusedBytes(context: Context, model: ModelInfo, sharedExtra: Long): Long {
+            if (model.bundleManifestFile != null) return 0L
+            val dir = File(modelDirFor(context, model))
+            fun present(name: String, expected: Long?): Long {
+                val f = File(dir, name)
+                if (!f.isFile || f.length() == 0L) return 0L
+                if (expected != null && f.length() != expected) return 0L
+                return f.length()
+            }
+            return sharedExtra +
+                present(model.ggufFileName, model.ggufBytes) +
+                (model.mmprojFileName?.let { present(it, model.mmprojBytes) } ?: 0L) +
+                (model.acousticFileName?.let { present(it, model.acousticBytes) } ?: 0L)
+        }
+
+        /**
+         * Deletes [model]'s shared accessory files that no other model still
+         * claims. Called after a model is deleted so the shared copy is not
+         * orphaned, while a second checkpoint keeps it alive.
+         * Returns true when something was actually removed.
+         */
+        fun releaseExtraFiles(context: Context, model: ModelInfo): Boolean {
+            if (model.extraFiles.isEmpty()) return false
+            var removed = false
+            for (name in model.extraFiles) {
+                // A download of this file is still running (possibly for
+                // another model): unlinking it now would strand that writer on
+                // a deleted inode. Leave it; the owning model re-releases it
+                // the next time it is deleted.
+                if (liveSharedDownloads.contains(name)) {
+                    Log.i(TAG, "Keeping shared $name: a download is still writing it")
+                    continue
+                }
+                dropExtraOwnership(context, model, name)
+                if (extraOwners(context, name).isNotEmpty()) continue
+                val file = extraFilePath(context, name)
+                File(file.path + ".part").let { if (it.exists()) removed = it.delete() || removed }
+                if (!file.exists()) continue
+                if (file.delete()) {
+                    removed = true
+                    Log.i(TAG, "Released shared $name (last owner ${model.id} deleted)")
+                } else {
+                    Log.w(TAG, "Could not delete shared $name; keeping its ownership record")
+                    claimExtraFile(context, model, name)
+                    removed = true
+                }
+            }
+            return removed
+        }
+
+        /** Model ids that currently claim [name]. */
+        private fun extraOwners(context: Context, name: String): List<String> {
+            val prefs = prefs(context)
+            return ModelInfo.AVAILABLE_MODELS
+                .filter { it.extraFiles.contains(name) && prefs.getBoolean(extraOwnerKey(it.id, name), false) }
+                .map { it.id }
+        }
+
+        private fun dropExtraOwnership(context: Context, model: ModelInfo, name: String) {
+            prefs(context).edit().remove(extraOwnerKey(model.id, name)).apply()
+        }
+
+        /**
+         * Moves a same-sized copy of [name] from a per-model directory into the
+         * shared location. Runs under the cross-process download lock, so the
+         * rename cannot race another process adopting the same file.
+         */
+        private fun adoptLegacyExtraFile(context: Context, model: ModelInfo, name: String): Boolean {
+            val shared = extraFilePath(context, name)
+            if (hasExtraFile(context, name)) {
+                claimExtraFile(context, model, name)
+                return true
+            }
+            val expected = model.extraFileBytes[name]
+            val legacy = File(modelDirFor(context, model), name)
+            if (!legacy.isFile || legacy.length() == 0L) return false
+            if (expected != null && legacy.length() != expected) return false
+            return try {
+                val moved = legacy.renameTo(shared)
+                if (moved) {
+                    Log.i(TAG, "Adopted $name from ${model.id}/ into shared/")
+                } else {
+                    // Different filesystem or a stale handle: copy, then drop.
+                    legacy.copyTo(shared, overwrite = true)
+                    legacy.delete()
+                    Log.i(TAG, "Copied $name from ${model.id}/ into shared/")
+                }
+                val ok = hasExtraFile(context, name)
+                if (ok) claimExtraFile(context, model, name)
+                ok
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not adopt $name from ${model.id}/: ${e.message}")
+                false
+            }
+        }
+
         fun modelsExist(context: Context): Boolean =
             modelsExist(context, getSelectedModel(context))
 
@@ -293,6 +786,9 @@ class LlamaEngine private constructor(
             val dir = File(modelDirFor(context, model))
             if (missingExpertFile(context, model) != null) return false
             if (!File(dir, model.ggufFileName).exists()) return false
+            if (model.extraFiles.isNotEmpty()) {
+                return model.extraFiles.all { hasExtraFile(context, model, it) }
+            }
             if (model.isTextOnly) return true
             if (model.isTts) {
                 val acoustic = model.acousticFileName ?: return true
@@ -302,12 +798,33 @@ class LlamaEngine private constructor(
             return File(dir, mmproj).exists()
         }
 
-        /** Bytes currently on disk for [model] (including partial `.tmp` files). */
-        fun downloadedBytes(context: Context, model: ModelInfo): Long {
+        /**
+         * Bytes this model owns on its own, i.e. everything under its
+         * directory (downloads, partial `.tmp` files, bundle payloads) without
+         * the shared accessory files. This is the numerator for row progress:
+         * shared files are excluded from [downloadBytes] as well, so both sides
+         * of the ratio talk about the same bytes.
+         */
+        fun ownDownloadedBytes(context: Context, model: ModelInfo): Long {
             val dir = File(modelDirFor(context, model))
             if (!dir.exists()) return 0L
             var total = 0L
             dir.walkTopDown().forEach { if (it.isFile) total += it.length() }
+            return total
+        }
+
+        /** Bytes currently on disk for [model] (including partial `.tmp` files). */
+        fun downloadedBytes(context: Context, model: ModelInfo): Long {
+            val dir = File(modelDirFor(context, model))
+            var total = 0L
+            if (dir.exists()) dir.walkTopDown().forEach { if (it.isFile) total += it.length() }
+            // Shared bytes only count once this model has claimed them, so a
+            // sibling model's installed files do not make a partial download
+            // look complete.
+            for (name in model.extraFiles) {
+                if (!hasExtraFile(context, model, name)) continue
+                total += extraFilePath(context, name).length()
+            }
             return total
         }
 
@@ -513,6 +1030,18 @@ class LlamaEngine private constructor(
             private var lastSampleBytes = 0L
             private var smoothedBytesPerSec = 0.0
 
+            /**
+             * Seeds the bar with bytes that are already on disk for this model.
+             * It does not touch the speed sampler, so reused bytes never look
+             * like a burst of throughput.
+             */
+            fun preset(doneBytes: Long) {
+                if (doneBytes <= 0L) return
+                completedBytes += doneBytes
+                lastSampleTime = 0L
+                overall(0L)
+            }
+
             /** Emit an informational message at the current overall offset. */
             fun message(text: String) = emit(DownloadProgress(text, completedBytes, grandTotal))
 
@@ -596,6 +1125,67 @@ class LlamaEngine private constructor(
             val contentLength: Long,
         )
 
+        // Models the user paused/cancelled. A background download loop that
+        // outlived its service (see flagDownloadStop) must never restart by
+        // itself; only an explicit user "resume/start" of *that* model clears
+        // its entry via resumeRequested(modelId).
+        //
+        // It is a set, not a single id: pausing model A and immediately
+        // starting model B must not erase A's marker, otherwise A's loop keeps
+        // running and the pause looks ignored.
+        private val stopRequestedModels = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+
+        /** Clears the pause marker of [modelId]; call on an explicit user start. */
+        fun resumeRequested(modelId: String) {
+            stopRequestedModels.remove(modelId)
+        }
+
+        /**
+         * Records that [modelId] was paused/cancelled by the user. The
+         * download loop notices the marker between files (and during the body
+         * copy) and stops instead of resuming on its own.
+         */
+        fun flagDownloadStop(modelId: String) {
+            stopRequestedModels.add(modelId)
+        }
+
+        private fun stopRequested(modelId: String): Boolean = stopRequestedModels.contains(modelId)
+
+        private class DownloadStoppedException(val modelId: String) :
+            CancellationException("Download of $modelId stopped by the user")
+
+        private class DownloadInterruptedException(val fileName: String) :
+            java.io.InterruptedIOException("Download of $fileName interrupted by the user")
+
+        // The download job of the session this process is running, with the
+        // model it belongs to. The body-copy helpers run on blocking sockets
+        // and have no CoroutineScope of their own, so they poll this job after
+        // every 64 KB chunk: pausing must stop the transfer within one chunk
+        // rather than after the whole file.
+        @Volatile
+        private var downloadJobModelId: String? = null
+
+        @Volatile
+        private var downloadJob: kotlinx.coroutines.Job? = null
+
+        private fun checkCancelled() {
+            val job = downloadJob
+            if (job != null && !job.isActive) throw CancellationException("Download cancelled")
+        }
+
+        /**
+         * Drops the tracked job once its loop has unwound, but only if it
+         * still belongs to [modelId]. A paused session can outlive its
+         * successor by a few hundred milliseconds; clearing unconditionally
+         * would erase the job a newer session just registered and make that
+         * session un-pausable.
+         */
+        fun clearDownloadJob(modelId: String) {
+            if (downloadJobModelId != modelId) return
+            downloadJob = null
+            downloadJobModelId = null
+        }
+
         suspend fun downloadModels(
             context: Context,
             onProgress: (DownloadProgress) -> Unit
@@ -616,9 +1206,63 @@ class LlamaEngine private constructor(
             model: ModelInfo,
             onProgress: (DownloadProgress) -> Unit
         ) = withContext(Dispatchers.IO) {
+            try {
+                downloadModelsInner(context, model, onProgress)
+            } catch (e: DownloadInterruptedException) {
+                // The session was cancelled (paused / model deleted). Swallow
+                // it so the loop unwinds as a plain "paused" instead of an
+                // error; the `.tmp` files are kept so a resume continues from
+                // where it stopped.
+                Log.i(TAG, "Download intercepted ${e.message}; leaving .tmp for resume")
+                throw CancellationException("Download of ${e.fileName} interrupted")
+            }
+        }
+
+        private suspend fun downloadModelsInner(
+            context: Context,
+            model: ModelInfo,
+            onProgress: (DownloadProgress) -> Unit
+        ) = withContext(Dispatchers.IO) {
             val dir = File(modelDirFor(context, model))
             if (!dir.exists()) dir.mkdirs()
-            val sink = ProgressSink(context, model.totalBytes, onProgress)
+            val sharedExtra = sharedExtraBytes(context, model)
+            // The denominator has to cover the bytes the bar is seeded with.
+            // downloadBytes(sharedExtra) already removes the shared encoder/VAE/
+            // tokenizer because they are not fetched again, but preset() puts
+            // those very bytes back on the numerator - so for a second
+            // checkpoint that reuses them the ratio started above 100% and the
+            // bar sat at full while the model was still downloading. Count the
+            // reused bytes on both sides.
+            val reused = installedReusedBytes(context, model, sharedExtra)
+            val sink = ProgressSink(context, model.downloadBytes(sharedExtra) + reused, onProgress)
+            // Reused accessory files are inside the installed footprint but not
+            // inside the bytes we are about to fetch, so the bar must start at
+            // what is already accounted for instead of at 0.
+            sink.preset(reused)
+            val job = coroutineContext[kotlinx.coroutines.Job]
+            downloadJobModelId = model.id
+            downloadJob = job
+            // The body-copy loops have no scope of their own and poll this job.
+            checkCancelled()
+
+            // Cross-process guard: two app processes (e.g. after the service is
+            // restarted while a background download is still running) must never
+            // write the same per-model directory concurrently - they would each
+            // delete the other's `.tmp` and corrupt/reset the download. An OS
+            // file lock on `<dir>/.download.lock` makes that exclusive.
+            //
+            // Within this process an abandoned-but-not-yet-unwound session
+            // (paused mid socket read) holds the in-process session lock, so a
+            // resume waits for it to drain instead of failing on the FileLock.
+            val sessionLock = dirSessionLock(dir)
+            sessionLock.lockInterruptibly()
+            try {
+            val lock = acquireDownloadLock(dir)
+            if (lock == null) {
+                Log.w(TAG, "Download already in progress for ${model.id} in another process; refusing to start")
+                throw IllegalStateException("该模型正在另一个进程中下载，请稍后再试")
+            }
+            try {
 
             // Bundle models (e.g. the 4.7 Hexagon package) are more than a
             // single gguf/mmproj pair: a ModelScope-hosted checksum manifest
@@ -644,6 +1288,8 @@ class LlamaEngine private constructor(
                 val sources: List<FileSource>,
                 val md5: String?,
                 val bytes: Long?,
+                /** Save into `<models>/shared/` instead of the per-model directory. */
+                val shared: Boolean = false,
             )
 
             val ggufSources = mutableListOf<FileSource>()
@@ -701,15 +1347,151 @@ class LlamaEngine private constructor(
             if (!model.isTextOnly && !model.isTts && model.mmprojFileName != null) {
                 files.add(FileSpec(model.mmprojFileName, mmprojSources, model.mmprojMd5, model.mmprojBytes))
             }
+            // Extra accessory files (e.g. MOSS-Image TE / VAE / tokenizer),
+            // fetched from the ModelScope repo only. They are identical across
+            // checkpoints of the same family, so they go to `<models>/shared/`
+            // and are fetched once: a file already installed by any model is
+            // skipped here, and one left in this model's own directory by an
+            // older build is adopted instead of downloaded again.
+            //
+            // Deferred to the end of [files]: the DiT is what the user is
+            // actually waiting for, so it goes first instead of sitting behind
+            // a 6 GB text encoder.
+            if (model.extraFiles.isNotEmpty()) {
+                val msBase = model.msRepo?.takeIf { it.isNotBlank() }
+                    ?.let { "https://www.modelscope.cn/models/$it/resolve/${model.msBranch}" }
+                    ?: throw RuntimeException("Model ${model.id} has extraFiles but no ModelScope repo")
+                for (name in model.extraFiles) {
+                    if (hasExtraFile(context, name)) {
+                        claimExtraFile(context, model, name)
+                        // Already on disk: it is part of grandTotal minus
+                        // sharedExtraBytes, so it adds nothing to the bar; only
+                        // say so, or the user wonders where the 6 GB went.
+                        sink.message(context.getString(R.string.download_file_ready, name))
+                        Log.i(TAG, "$name already installed in shared/, skipping download")
+                        continue
+                    }
+                    if (adoptLegacyExtraFile(context, model, name)) {
+                        sink.message(context.getString(R.string.download_file_ready, name))
+                        continue
+                    }
+                    files.add(
+                        FileSpec(
+                            name,
+                            listOf(FileSource("ModelScope", URL("$msBase/$name"))),
+                            null,
+                            model.extraFileBytes[name],
+                            shared = true,
+                        )
+                    )
+                }
+            }
+
+            // Files that have to come over the wire, DiT first.
+            files.sortByDescending { it.shared }
 
             val racedLabel = files.first().sources.joinToString("+") { it.label }
             sink.message(context.getString(R.string.download_race_start, racedLabel))
 
             for (file in files) {
-                downloadFileMultiSource(context, dir, file.name, file.sources, file.md5, sink, expectedBytes = file.bytes)
+                // Between files is the cheapest place to honour a pause: the
+                // current file is finished, the rest is left untouched.
+                if (stopRequested(model.id)) throw DownloadStoppedException(model.id)
+                if (!file.shared) {
+                    downloadFileMultiSource(
+                        context, dir, file.name, file.sources, file.md5, sink, expectedBytes = file.bytes,
+                    )
+                    continue
+                }
+                liveSharedDownloads.add(file.name)
+                try {
+                    downloadFileMultiSource(
+                        context, sharedExtraDir(context), file.name, file.sources, file.md5, sink,
+                        expectedBytes = file.bytes,
+                    )
+                    claimExtraFile(context, model, file.name)
+                } finally {
+                    liveSharedDownloads.remove(file.name)
+                }
             }
 
             sink.message(context.getString(R.string.download_all_complete))
+            } finally {
+                releaseDownloadLock(lock)
+            }
+            } finally {
+                // The directory lock file survives a FileLock release, so hand
+                // the in-process monitor back once no session wants it.
+                sessionLock.unlock()
+                if (!sessionLock.hasQueuedThreads() && !sessionLock.isLocked) {
+                    dirSessionLocks.remove(dir.absolutePath, sessionLock)
+                }
+            }
+        }
+
+        // Cross-process download lock, keyed on the per-model directory.
+        // A held lock keeps its RandomAccessFile open; we store it by path so
+        // release can both drop the FileLock and close the RAF (closing alone
+        // would release the OS lock, but we close explicitly for tidiness).
+        private val downloadLocks = ConcurrentHashMap<String, RandomAccessFile>()
+
+        // Per-directory lock held for the lifetime of one download session.
+        //
+        // java.nio FileLock is per *process*: a second FileLock on the same
+        // file from this process fails (OverlappingFileLockException) instead
+        // of blocking, and it was caught and reported as "another process is
+        // downloading". That is wrong for a session the user just paused: the
+        // old loop may still be sitting in a socket read for a moment while a
+        // resume starts, and the resume must wait for it rather than fail.
+        // This monitor serialises sessions of this process; the file lock
+        // still guards against a genuinely different process.
+        private val dirSessionLocks = ConcurrentHashMap<String, java.util.concurrent.locks.ReentrantLock>()
+
+        private fun dirSessionLock(dir: File): java.util.concurrent.locks.ReentrantLock =
+            dirSessionLocks.getOrPut(dir.absolutePath) { java.util.concurrent.locks.ReentrantLock() }
+
+        private fun acquireDownloadLock(dir: File): FileLock? {
+            val key = dir.absolutePath
+            val raf = try {
+                RandomAccessFile(File(dir, ".download.lock"), "rw")
+            } catch (e: Exception) {
+                Log.w(TAG, "acquireDownloadLock: cannot open lock file: ${e.message}")
+                return null
+            }
+            return try {
+                val l = raf.channel.tryLock()
+                if (l == null) {
+                    raf.close()
+                    null
+                } else {
+                    downloadLocks[key] = raf
+                    l
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "acquireDownloadLock: tryLock failed: ${e.message}")
+                try { raf.close() } catch (_: Exception) {}
+                null
+            }
+        }
+
+        private fun releaseDownloadLock(lock: FileLock) {
+            try { if (lock.isValid) lock.release() } catch (_: Exception) {}
+            // Close and forget every RAF whose channel no longer holds a lock.
+            val it = downloadLocks.entries.iterator()
+            while (it.hasNext()) {
+                val (_, raf) = it.next()
+                try {
+                    val held = raf.channel.tryLock()
+                    if (held != null) {
+                        held.release()
+                        raf.close()
+                        it.remove()
+                    }
+                } catch (_: Exception) {
+                    try { raf.close() } catch (_: Exception) {}
+                    it.remove()
+                }
+            }
         }
 
         /**
@@ -891,8 +1673,7 @@ class LlamaEngine private constructor(
         ) {
             val source = winner.source
             val conn = winner.conn
-            try {
-                if (winner.responseCode == 416) {
+            try {                if (winner.responseCode == 416) {
                     Log.i(TAG, "$fileName: server reports complete (HTTP 416 via race)")
                 } else {
                     val acceptedResume = winner.responseCode == HttpURLConnection.HTTP_PARTIAL // 206
@@ -911,6 +1692,7 @@ class LlamaEngine private constructor(
                             var totalRead = effectiveStart
                             var lastProgressTime = 0L
                             while (true) {
+                                checkCancelled()
                                 val read = input.read(buffer)
                                 if (read == -1) break
                                 output.write(buffer, 0, read)
@@ -945,6 +1727,11 @@ class LlamaEngine private constructor(
                 sink.fileFinished(targetFile.length())
                 sink.message(context.getString(R.string.download_file_complete, fileName, (targetFile.length() / (1024 * 1024)).toInt()))
                 Log.i(TAG, "$fileName saved to ${targetFile.absolutePath} (winner=$source)")
+            } catch (e: CancellationException) {
+                // Paused while copying: .tmp keeps the bytes, but the session is
+                // over - surface an interrupt so the loop stops instead of
+                // claiming the file is complete.
+                throw DownloadInterruptedException(fileName)
             } finally {
                 try { conn.disconnect() } catch (_: Throwable) {}
             }
@@ -1000,6 +1787,7 @@ class LlamaEngine private constructor(
             }
 
             val resumeFrom = if (tmpFile.exists()) tmpFile.length() else 0L
+            Log.i(TAG, "$fileName: start, tmpExists=${tmpFile.exists()} resumeFrom=$resumeFrom targetExists=${targetFile.exists()}")
             if (resumeFrom > 0) {
                 val mb = resumeFrom / (1024 * 1024)
                 sink.message(context.getString(R.string.download_resuming_src, source, fileName, mb.toInt()))
@@ -1065,6 +1853,7 @@ class LlamaEngine private constructor(
                             var lastProgressTime = 0L
 
                             while (true) {
+                                checkCancelled()
                                 val read = input.read(buffer)
                                 if (read == -1) break
                                 output.write(buffer, 0, read)
@@ -1096,11 +1885,25 @@ class LlamaEngine private constructor(
                     }
                 }
 
-                // Promote .tmp -> final.
+                // Promote .tmp -> final. Be defensive: another process, an OS
+                // cleanup, or a 200-restart may have removed the .tmp between
+                // the write and here. Never let a missing .tmp throw
+                // NoSuchFileException - fall back to an already-complete target
+                // if one exists, else fail with a clear message.
                 if (targetFile.exists()) targetFile.delete()
-                if (!tmpFile.renameTo(targetFile)) {
-                    tmpFile.copyTo(targetFile, overwrite = true)
-                    tmpFile.delete()
+                if (tmpFile.exists()) {
+                    if (!tmpFile.renameTo(targetFile)) {
+                        tmpFile.copyTo(targetFile, overwrite = true)
+                        tmpFile.delete()
+                    }
+                } else if (!targetFile.exists()) {
+                    // Neither .tmp nor final is present. If the server told us
+                    // this was already complete (416) we cannot recover here;
+                    // otherwise it's a genuine failure.
+                    Log.e(TAG, "$fileName: .tmp vanished before finalize (and no final file)")
+                    throw java.io.IOException("$fileName: temporary file disappeared before it could be finalized; will retry from scratch")
+                } else {
+                    Log.w(TAG, "$fileName: .tmp missing but final file already present; using it")
                 }
 
                 verifyOrThrow(context, targetFile, source, expectedMd5, expectedSha256, sink, tmpFile)
@@ -1108,6 +1911,11 @@ class LlamaEngine private constructor(
                 sink.fileFinished(targetFile.length())
                 sink.message(context.getString(R.string.download_file_complete, fileName, (targetFile.length() / (1024 * 1024)).toInt()))
                 Log.i(TAG, "$fileName saved to ${targetFile.absolutePath}")
+            } catch (e: CancellationException) {
+                // Paused mid-file: keep the `.tmp` for a Range resume, but end
+                // this session so the loop cannot promote a truncated file or
+                // move on to the next one.
+                throw DownloadInterruptedException(fileName)
             } finally {
                 conn.disconnect()
                 // Note: we deliberately do NOT delete tmpFile in catch-all -
@@ -1332,6 +2140,16 @@ class LlamaEngine private constructor(
     private val _state = MutableStateFlow<LlamaState>(LlamaState.Uninitialized)
     val state: StateFlow<LlamaState> = _state.asStateFlow()
 
+    /**
+     * True when the model is loaded, readable without a round trip through the
+     * StateFlow. loadModel() sets ModelReady on the llama dispatcher while its
+     * caller is still on that dispatcher, so anything that checked
+     * `state.value` right after loading raced the main-thread collector and
+     * failed - it is why replaying the history after a reload silently did
+     * nothing and the model lost the conversation (and the tool instructions).
+     */
+    val isReady: Boolean get() = _state.value is LlamaState.ModelReady
+
     @Volatile
     private var _cancelGeneration = false
 
@@ -1360,6 +2178,20 @@ class LlamaEngine private constructor(
     private external fun getMinicpmvVersionNative(): Int
     private external fun prepare(): Int
     private external fun systemInfo(): String
+    // The active chat template (Jinja or built-in), or null when the model
+    // ships none. Used to expose the generate_image tool in a shape the
+    // model's own template understands (tools schema vs. system text).
+    private external fun chatTemplateNative(): String?
+    // OpenAI-compatible tool schema array for the next system prompt; pass
+    // "[]" (or null) to clear. Only tool-aware templates render it.
+    private external fun setToolSchemasNative(toolSchemasJson: String?)
+    // Appends a finished text-to-image turn (assistant tool call + tool
+    // result) to the template history used by tool-aware prompts.
+    private external fun recordImageToolTurnNative(prompt: String, fileName: String)
+    // Process the system prompt without dropping an existing short-term
+    // state. Unlike the single-shot variant used at load time, this can be
+    // called mid-conversation so a new system prompt never wipes history.
+    private external fun processSystemPromptKeepStateNative(systemPrompt: String): Int
     private external fun processSystemPrompt(systemPrompt: String): Int
     private external fun processUserPrompt(userPrompt: String, predictLength: Int): Int
     private external fun generateNextToken(): String?
@@ -1533,6 +2365,48 @@ class LlamaEngine private constructor(
         Log.i(TAG, "enable_thinking=$enable")
     }
 
+    /**
+     * Declares the tools the model may call. Has to run right before the
+     * system prompt is processed: the prompt it applies to is the only one
+     * that sees them.
+     */
+    suspend fun setToolSchemas(schemasJson: String?) = withContext(llamaDispatcher) {
+        runCatching { setToolSchemasNative(schemasJson) }
+            .onFailure { Log.w(TAG, "setToolSchemas failed", it) }
+    }
+
+    /** Records a generated picture as a generate_image tool turn. */
+    suspend fun recordImageToolTurn(prompt: String, fileName: String) = withContext(llamaDispatcher) {
+        runCatching { recordImageToolTurnNative(prompt, fileName) }
+            .onFailure { Log.w(TAG, "recordImageToolTurn failed", it) }
+    }
+
+    /** The model's chat template source, or null when it has none. */
+    suspend fun chatTemplate(): String? = withContext(llamaDispatcher) {
+        runCatching { chatTemplateNative() }.getOrNull()?.takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * Applies a system prompt mid-conversation without resetting the context.
+     * The KV prefix is recomputed from the system prompt on the next request;
+     * the restored history is replayed afterwards by the caller.
+     */
+    suspend fun reapplySystemPrompt(prompt: String) = withContext(llamaDispatcher) {
+        require(prompt.isNotBlank()) { "Cannot process empty system prompt!" }
+        val state = _state.value
+        if (state is LlamaState.ModelReady) {
+            _state.value = LlamaState.ProcessingSystemPrompt
+        }
+        try {
+            processSystemPromptKeepStateNative(prompt).let { result ->
+                if (result != 0) throw RuntimeException("Failed to apply system prompt: $result")
+            }
+        } finally {
+            if (state is LlamaState.ModelReady) _state.value = LlamaState.ModelReady
+        }
+        Log.i(TAG, "System prompt re-applied mid-conversation")
+    }
+
     suspend fun setSystemPrompt(prompt: String) =
         withContext(llamaDispatcher) {
             require(prompt.isNotBlank()) { "Cannot process empty system prompt!" }
@@ -1683,7 +2557,7 @@ class LlamaEngine private constructor(
 
     suspend fun clearContext() =
         withContext(llamaDispatcher) {
-            check(_state.value is LlamaState.ModelReady) {
+            check(isReady) {
                 "Cannot clear context in ${_state.value.javaClass.simpleName}"
             }
             try {
@@ -1708,7 +2582,7 @@ class LlamaEngine private constructor(
      * the graceful degradation we agreed on for reference-only storage).
      */
     suspend fun restoreConversation(turns: List<ChatHistoryTurn>) = withContext(llamaDispatcher) {
-        check(_state.value is LlamaState.ModelReady) {
+        check(isReady) {
             "Cannot restore conversation in ${_state.value.javaClass.simpleName}"
         }
         val roles = ArrayList<String>(turns.size)
@@ -1802,10 +2676,28 @@ class LlamaEngine private constructor(
         _cancelGeneration = true
     }
 
-    suspend fun unloadModel() = withContext(llamaDispatcher) {
+    /** True while a model is resident in memory (loading/generating excluded). */
+    val isModelLoaded: Boolean
+        get() = _state.value is LlamaState.ModelReady
+
+    /**
+     * Frees the model. Runs on a dispatcher that is NOT tied to the caller's
+     * job on purpose: it is routinely called from inside a generation coroutine
+     * that is being cancelled (generate_image frees the chat model before the
+     * image stack loads), and withContext(llamaDispatcher) would abort with
+     * that job's CancellationException before the unload even starts.
+     */
+    suspend fun unloadModel() {
+        // withContext(NonCancellable) keeps the unload running when the caller
+        // happens to be a coroutine that is being cancelled; the explicit
+        // dispatcher keeps it serialised with every other native call.
+        withContext(NonCancellable + llamaDispatcher) { unloadModelInner() }
+    }
+
+    private suspend fun unloadModelInner() {
         if (_nativeCallTimedOut) {
             Log.w(TAG, "Skipping unload after native timeout; restart the app")
-            return@withContext
+            return
         }
         if (_state.value is LlamaState.ModelReady || _state.value is LlamaState.Error) {
             Log.i(TAG, "Unloading model...")

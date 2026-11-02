@@ -1,0 +1,238 @@
+# Build from scratch
+
+## Get the Code
+
+```
+git clone --recursive https://github.com/leejet/stable-diffusion.cpp
+cd stable-diffusion.cpp
+```
+
+- If you have already cloned the repository, you can use the following command to update the repository to the latest code.
+
+```
+cd stable-diffusion.cpp
+git pull origin master
+git submodule init
+git submodule update
+```
+
+## Selecting a GGML source tree
+
+By default, sd.cpp builds the patched GGML submodule in `ggml/`. To build with
+an upstream GGML checkout instead, enable `SD_USE_UPSTREAM_GGML` and set
+`SD_GGML_SOURCE_DIR`:
+
+```shell
+cmake -S . -B build-upstream -DSD_USE_UPSTREAM_GGML=ON -DSD_GGML_SOURCE_DIR=../ggml-upstream
+cmake --build build-upstream --config Release
+```
+
+The selected source tree supplies both the library and its private headers.
+Backend options such as `-DSD_CUDA=ON` apply to the selected tree as usual.
+
+`SD_USE_UPSTREAM_GGML` defaults to `OFF`, which enables the patched GGML
+extensions. Set it to `ON` when using upstream GGML; it selects the compatibility
+mode and does not download or replace the GGML source tree. Upstream mode keeps
+the original FP8 safetensors handling: FP8 tensors are converted to F16 at load
+time (one byte per element in the file, two in RAM and VRAM). INT8
+tensorwise/convrot is disabled and its model files are rejected with an explicit
+error. FP8 GGUF files, FP8 weight type requests and tensor type rules are also
+rejected; no automatic conversion is performed.
+
+Upstream GGML may lack some operators and performance optimizations provided by
+the patched version. A warning is emitted during CMake configuration and when
+creating an inference context. Ordinary floating-point and shared GGML
+quantization types remain available, subject to backend operator support.
+
+`SD_USE_SYSTEM_GGML=ON` instead links an installed GGML CMake package, located
+with `ggml_DIR` or `CMAKE_PREFIX_PATH`. In that mode, `SD_GGML_SOURCE_DIR` must
+point to the matching source tree for private headers. The installed library
+must use the same ABI settings as sd.cpp, including `GGML_MAX_NAME`.
+Set `SD_USE_UPSTREAM_GGML=ON` as well if the installed package is upstream GGML.
+
+## WebP and WebM Support in Examples
+
+The example applications (`examples/cli` and `examples/server`) use `libwebp` to support WebP image I/O, and `examples/cli` can also use `libwebm` for `.webm` video output. Both are enabled by default. WebM output currently reuses `libwebp` to encode each frame as VP8 before muxing with `libwebm`.
+
+If you do not want WebP/WebM support, you can disable them at configure time:
+
+```shell
+mkdir build && cd build
+cmake .. -DSD_WEBP=OFF -DSD_WEBM=OFF
+cmake --build . --config Release
+```
+
+If the submodules are not available, you can also link against system packages instead:
+
+```shell
+mkdir build && cd build
+cmake .. -DSD_USE_SYSTEM_WEBP=ON -DSD_USE_SYSTEM_WEBM=ON
+cmake --build . --config Release
+```
+
+## Build (CPU only)
+
+If you don't have a GPU or CUDA installed, you can build a CPU-only version.
+
+```shell
+mkdir build && cd build
+cmake ..
+cmake --build . --config Release
+```
+
+## Build with OpenBLAS
+
+```shell
+mkdir build && cd build
+cmake .. -DGGML_OPENBLAS=ON
+cmake --build . --config Release
+```
+
+## Build with CUDA
+
+Native SageAttention is included when using CUDA with patched GGML
+(`SD_USE_UPSTREAM_GGML=OFF`).
+See [SageAttention](sage_attention.md) for GPU requirements and `--sage-attn` usage.
+
+This provides GPU acceleration using NVIDIA GPU. Make sure to have the CUDA toolkit installed. You can download it from your Linux distro's package manager (e.g. `apt install nvidia-cuda-toolkit`) or from here: [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads). Recommended to have at least 4 GB of VRAM.
+
+```shell
+mkdir build && cd build
+cmake .. -DSD_CUDA=ON
+cmake --build . --config Release
+```
+
+## Build with HipBLAS
+
+This provides GPU acceleration using AMD GPU. Make sure to have the ROCm toolkit installed.
+To build for another GPU architecture than installed in your system, set `$GFX_NAME` manually to the desired architecture (replace first command). This is also necessary if your GPU is not officially supported by ROCm, for example you have to set `$GFX_NAME` manually to `gfx1030` for consumer RDNA2 cards.
+
+Windows User Refer to [docs/hipBLAS_on_Windows.md](docs%2FhipBLAS_on_Windows.md) for a comprehensive guide.
+
+```shell
+mkdir build && cd build
+if command -v rocminfo; then export GFX_NAME=$(rocminfo | awk '/ *Name: +gfx[1-9]/ {print $2; exit}'); else echo "rocminfo missing!"; fi
+if [ -z "${GFX_NAME}" ]; then echo "Error: Couldn't detect GPU!"; else echo "Building for GPU: ${GFX_NAME}"; fi
+cmake .. -G "Ninja" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DSD_HIPBLAS=ON -DCMAKE_BUILD_TYPE=Release -DGPU_TARGETS=$GFX_NAME -DAMDGPU_TARGETS=$GFX_NAME -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+cmake --build . --config Release
+```
+
+## Build with MUSA
+
+This provides GPU acceleration using Moore Threads GPUs. The configuration below follows upstream validation with MUSA SDK 5.2.0 and MTT S5000 (PH1, `mp_31`). Install that toolkit before building. Older SDKs such as 4.2 may lack the CUB headers required by the current backend.
+
+```shell
+mkdir build && cd build
+cmake .. -DCMAKE_C_COMPILER=/usr/local/musa/bin/clang -DCMAKE_CXX_COMPILER=/usr/local/musa/bin/clang++ -DSD_MUSA=ON -DMUSA_ARCHITECTURES=31 -DCMAKE_BUILD_TYPE=Release
+cmake --build . --config Release
+```
+
+The MUSA Docker image uses the same SDK 5.2.0 development image as upstream for both build and runtime stages, and targets `mp_31` only. It includes the development tools and PyTorch from that base image, so it is larger than a minimal runtime image. Other GPU architectures require separate validation.
+
+## Build with Metal
+
+Using Metal makes the computation run on the GPU. Currently, there are some issues with Metal when performing operations on very large matrices, making it highly inefficient at the moment. Performance improvements are expected in the near future.
+
+```shell
+mkdir build && cd build
+cmake .. -DSD_METAL=ON
+cmake --build . --config Release
+```
+
+## Build with Vulkan
+
+Install Vulkan SDK from https://www.lunarg.com/vulkan-sdk/.
+On Ubuntu, install the Vulkan development packages and SPIR-V headers:
+
+```shell
+sudo apt-get install build-essential libvulkan-dev glslc spirv-headers
+```
+
+```shell
+mkdir build && cd build
+cmake .. -DSD_VULKAN=ON
+cmake --build . --config Release
+```
+
+## Build with OpenCL (for Adreno GPU)
+
+Currently, it supports only Adreno GPUs and is primarily optimized for Q4_0 type
+
+To build for Windows ARM please refers to [Windows 11 Arm64](https://github.com/ggml-org/llama.cpp/blob/master/docs/backend/OPENCL.md#windows-11-arm64)
+
+Building for Android:
+
+  Android NDK:
+       Download and install the Android NDK from the [official Android developer site](https://developer.android.com/ndk/downloads).
+
+Setup OpenCL Dependencies for NDK:
+
+You need to provide OpenCL headers and the ICD loader library to your NDK sysroot.
+
+*   OpenCL Headers:
+    ```bash
+    # In a temporary working directory
+    git clone https://github.com/KhronosGroup/OpenCL-Headers
+    cd OpenCL-Headers
+    # Replace <YOUR_NDK_PATH> with your actual NDK installation path
+    # e.g., cp -r CL /path/to/android-ndk-r26c/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include
+    sudo cp -r CL <YOUR_NDK_PATH>/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include
+    cd ..
+    ```
+
+*   OpenCL ICD Loader:
+    ```shell
+    # In the same temporary working directory
+    git clone https://github.com/KhronosGroup/OpenCL-ICD-Loader
+    cd OpenCL-ICD-Loader
+    mkdir build_ndk && cd build_ndk
+
+    # Replace <YOUR_NDK_PATH> in the CMAKE_TOOLCHAIN_FILE and OPENCL_ICD_LOADER_HEADERS_DIR
+    cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_TOOLCHAIN_FILE=<YOUR_NDK_PATH>/build/cmake/android.toolchain.cmake \
+      -DOPENCL_ICD_LOADER_HEADERS_DIR=<YOUR_NDK_PATH>/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include \
+      -DANDROID_ABI=arm64-v8a \
+      -DANDROID_PLATFORM=24 \
+      -DANDROID_STL=c++_shared
+
+    ninja
+    # Replace <YOUR_NDK_PATH>
+    # e.g., cp libOpenCL.so /path/to/android-ndk-r26c/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android
+    sudo cp libOpenCL.so <YOUR_NDK_PATH>/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android
+    cd ../..
+    ```
+
+Build `stable-diffusion.cpp` for Android with OpenCL:
+
+```shell
+mkdir build-android && cd build-android
+
+# Replace <YOUR_NDK_PATH> with your actual NDK installation path
+# e.g., -DCMAKE_TOOLCHAIN_FILE=/path/to/android-ndk-r26c/build/cmake/android.toolchain.cmake
+cmake .. -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE=<YOUR_NDK_PATH>/build/cmake/android.toolchain.cmake \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_PLATFORM=android-28 \
+  -DGGML_OPENMP=OFF \
+  -DSD_OPENCL=ON
+
+ninja
+```
+*(Note: Don't forget to include `LD_LIBRARY_PATH=/vendor/lib64` in your command line before running the binary)*
+
+## Build with SYCL
+
+Using SYCL makes the computation run on the Intel GPU. Please make sure you have installed the related driver and [Intel® oneAPI Base toolkit](https://www.intel.com/content/www/us/en/developer/tools/oneapi/base-toolkit.html) before start. More details and steps can refer to [llama.cpp SYCL backend](https://github.com/ggml-org/llama.cpp/blob/master/docs/backend/SYCL.md#linux).
+
+```shell
+# Export relevant ENV variables
+source /opt/intel/oneapi/setvars.sh
+
+# Option 1: Use FP32 (recommended for better performance in most cases)
+cmake .. -DSD_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx
+
+# Option 2: Use FP16
+cmake .. -DSD_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_SYCL_F16=ON
+
+cmake --build . --config Release
+```

@@ -1,0 +1,30 @@
+build*/
+cmake-build-*/
+/test/
+/tests/
+# ggml is vendored in-tree here; keep its upstream tests and examples tracked
+!ggml/tests/
+!ggml/examples/
+.vscode/
+.idea/
+.cache/
+*.swp
+*.bat
+!/start-server.bat
+/start-server.local.sh
+/start-server.local.bat
+/start-server.local.ps1
+*.bin
+*.exe
+*.gguf
+output*.png
+models*
+*.log
+preview.png
+.claude/
+CLAUDE.local.md
+.agents/
+.codex/
+
+# local agent dev docs (not committed)
+devdocs/

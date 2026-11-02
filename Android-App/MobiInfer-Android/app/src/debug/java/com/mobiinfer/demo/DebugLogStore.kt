@@ -45,8 +45,12 @@ object DebugLogStore {
     private var collectorThread: Thread? = null
 
     @JvmStatic
+    @Volatile
+    private var appContext: Context? = null
+
     fun install(context: Context) {
         val app = context.applicationContext
+        appContext = app
         if (installed) return
         installed = true
 
@@ -415,6 +419,22 @@ object DebugLogStore {
             collectorProcess = null
             collectorThread = null
         }
+    }
+
+    /**
+     * Writes a diagnostic block (already formatted) to the store. Called
+     * reflectively from [DebugLogBridge], which exists in release builds too;
+     * the context is kept as an application-wide reference installed by
+     * [install].
+     */
+    @JvmStatic
+    fun dump(tag: String, text: String) {
+        val context = appContext ?: return
+        append(context, buildString {
+            appendLine()
+            appendLine("---- [$tag] ${timestamp()} ----")
+            append(text)
+        })
     }
 
     private fun append(context: Context, text: String) {

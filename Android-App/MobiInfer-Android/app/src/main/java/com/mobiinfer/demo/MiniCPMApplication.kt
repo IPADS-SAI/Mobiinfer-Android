@@ -7,5 +7,8 @@ class MiniCPMApplication : Application() {
         super.onCreate()
         LocaleManager.applyOnAppStart(this)
         DebugLogBridge.install(this)
+        // Persistent pipeline trail: logcat is flooded by the DSP driver while
+        // an image model runs, and process deaths must not erase the evidence.
+        CriticalLog.install(this)
     }
 }
