@@ -203,7 +203,7 @@ class LlamaEngine private constructor(
         // the slider and every stored value are clamped to this floor.
         const val MIN_IMAGE_GEN_STEPS = 4
         const val MAX_IMAGE_GEN_STEPS = 50
-        const val DEFAULT_IMAGE_GEN_SIDE = 512
+        const val DEFAULT_IMAGE_GEN_SIDE = 256
         // Fallbacks only: a checkpoint with its own training step count / CFG
         // carries them in ModelInfo.defaultSteps / defaultCfg.
         const val DEFAULT_IMAGE_GEN_STEPS = 8
