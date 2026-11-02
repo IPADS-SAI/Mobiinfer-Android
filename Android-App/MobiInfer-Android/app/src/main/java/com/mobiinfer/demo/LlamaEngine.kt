@@ -1226,11 +1226,19 @@ class LlamaEngine private constructor(
             val dir = File(modelDirFor(context, model))
             if (!dir.exists()) dir.mkdirs()
             val sharedExtra = sharedExtraBytes(context, model)
-            val sink = ProgressSink(context, model.downloadBytes(sharedExtra), onProgress)
+            // The denominator has to cover the bytes the bar is seeded with.
+            // downloadBytes(sharedExtra) already removes the shared encoder/VAE/
+            // tokenizer because they are not fetched again, but preset() puts
+            // those very bytes back on the numerator - so for a second
+            // checkpoint that reuses them the ratio started above 100% and the
+            // bar sat at full while the model was still downloading. Count the
+            // reused bytes on both sides.
+            val reused = installedReusedBytes(context, model, sharedExtra)
+            val sink = ProgressSink(context, model.downloadBytes(sharedExtra) + reused, onProgress)
             // Reused accessory files are inside the installed footprint but not
             // inside the bytes we are about to fetch, so the bar must start at
             // what is already accounted for instead of at 0.
-            sink.preset(installedReusedBytes(context, model, sharedExtra))
+            sink.preset(reused)
             val job = coroutineContext[kotlinx.coroutines.Job]
             downloadJobModelId = model.id
             downloadJob = job
