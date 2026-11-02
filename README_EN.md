@@ -22,6 +22,7 @@
 
 ## News
 
+- [2026.11.02] 🎨 **On-device text-to-image with MOSS-Image**: 9B TE + fp16 5B DiT running on the Hexagon NPU.
 - [2026.10.22] 🔥 Day-0 support for InternScience's latest Sage-A1.5 35B-A3B, with 41 expert layers streamed from an HTP-tiled bundle.
 - [2026.10.19] 🛠️ Added support for Qwen3-30B-A3B / Qwen3.5-MoE-35B-A3B, with MoE experts using external slots and LES.
 - [2026.10.17] 🚀 Released MobiInfer-Android v0.1 with model management, one-tap downloads, and on-device NPU inference.
@@ -80,6 +81,7 @@ The repo provides the [Android APK](https://github.com/IPADS-SAI/Mobiinfer-Andro
 | **[Qwen3 series](https://www.modelscope.cn/models/Qwen/Qwen3-4B-GGUF)** | 0.6 / 1.7 / 4 B | 0.64 / 1.83 / 2.5 G | `qwen3`, text |
 | **[Qwen3-VL series](https://www.modelscope.cn/models/Qwen/Qwen3-VL-4B-Instruct-GGUF)** | 2 / 4 B | ~1.9 / 3.3 G | `qwen3vl`, vision + text |
 | DFlash / DSpark series | — | ~0.42–0.43 G | Speculative sampling (`dflash` / `dspark`) |
+| **[MOSS-Image FP16 / Q4](https://www.modelscope.cn/models/fengerhu1/moss-image-hexagon)** | 5B DiT + 9B TE | ~3.6–9.6 G | text-to-image, fp16 / Q4_K_M, shares the text encoder with chat |
 
 Architecture coverage includes `qwen3`/`qwen3moe`/`qwen3next`, `qwen3vl`/`qwen3vlmoe`, `qwen35moe`, `dflash`, `minicpm` families, and other common architectures within llama.cpp.
 
@@ -94,6 +96,17 @@ Architecture coverage includes `qwen3`/`qwen3moe`/`qwen3next`, `qwen3vl`/`qwen3v
 | MiniCPM-V 4.7 35B-A3B | Q3, LES + DSpark | 8 Elite | 41 | 22.02 | 17.98 |
 | MiniCPM-V 4.7 35B-A3B | Q3, LES + DSpark | 8 Elite | 512 | 94.28 | 13.65 |
 | Qwen3-VL-4B-Instruct | Q4_K_M | 8 Elite | 512 | 1013.74 | 18.13 |
+
+---
+
+## Text-to-image performance
+
+> 📱 Snapdragon 8 Elite (Hexagon HTP), MOSS-Image FP16. End-to-end, including prompt encoding and the VAE decode.
+
+| Resolution | Steps | End to end | Per step | Unit efficiency |
+|---|---|---:|---:|---:|
+| 256 × 256 | 4 | **10 s** | 2.5 s | 38.1 s/(Mpx·step) |
+| 768 × 1024 | 8 | **100.1 s** | 12.5 s | **15.9 s/(Mpx·step)** |
 
 ---
 

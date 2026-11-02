@@ -22,6 +22,7 @@
 
 ## 最新动态
 
+- [2026.11.02] 🎨 **支持 MOSS-Image 端侧文生图**：9B TE + fp16 5B DiT 在 Hexagon NPU 上运行。
 - [2026.10.29] 🛠️ 发布 **MobiInfer-Android v0.3.1-alpha**，改进 Hexagon 内存布局与加载超时处理，补充 v73 skel，并增强映射失败和调试日志诊断。
 - [2026.10.22] 🔥 **Day-0 适配** InternScience 最新 **Sage-A1.5 35B-A3B**在手机上的运行，支持 41 层专家从 HTP tiled 包流式加载。
 - [2026.10.19] 🛠️ 支持 Qwen3-30B-A3B / Qwen3.5-MoE-35B-A3B，MoE 专家可走外置槽位与 LES。
@@ -47,8 +48,10 @@ MobiInfer-Android 引入完整的 **Qualcomm Hexagon NPU 后端**，打通了**�
 | 骁龙8 Elite Gen5 | 小米17系列（含Pro/Pro Max/Ultra）、一加15、真我GT8 Pro、红米K90 Pro Max、iQOO 15、荣耀Magic8系列、三星Galaxy S26系列、红魔游戏手机、vivo X300系列 |
 
 <p align="center">
-  <img src="Android-App/assets/screenshoot/index.jpg" width="45%" alt="MobiInfer 首页" />
-  <img src="Android-App/assets/screenshoot/setting.jpg" width="45%" alt="MobiInfer 设置页" />
+  <a href="https://github.com/user-attachments/assets/04808bb8-9cc6-42f6-bc0f-78fcf0fc454e"><img src="https://github.com/user-attachments/assets/04808bb8-9cc6-42f6-bc0f-78fcf0fc454e" width="23%" alt="App 内文生图" /></a>
+  <a href="https://github.com/user-attachments/assets/da987639-8818-4434-8b31-c8fbf861dcaa"><img src="https://github.com/user-attachments/assets/da987639-8818-4434-8b31-c8fbf861dcaa" width="23%" alt="MOSS-Image 生成的海报" /></a>
+  <img src="Android-App/assets/screenshoot/index.jpg" width="23%" alt="MobiInfer 首页" />
+  <img src="Android-App/assets/screenshoot/setting.jpg" width="23%" alt="MobiInfer 设置页" />
 </p>
 
 ---
@@ -86,6 +89,7 @@ MobiInfer-Android 引入完整的 **Qualcomm Hexagon NPU 后端**，打通了**�
 | **[Qwen3系列](https://www.modelscope.cn/models/Qwen/Qwen3-4B-GGUF)** | 0.6 / 1.7 / 4 B | 0.64 / 1.83 / 2.5 G | `qwen3`，文本 |
 | **[Qwen3-VL系列](https://www.modelscope.cn/models/Qwen/Qwen3-VL-4B-Instruct-GGUF)** | 2 / 4 B | ~1.9 / 3.3 G | `qwen3vl`，视觉 + 文本|
 | DFlash / DSpark 系列 | — | ~0.42–0.43 G | 投机采样（`dflash` / `dspark`） |
+| **[MOSS-Image FP16 / Q4](https://www.modelscope.cn/models/fengerhu1/moss-image-hexagon)** | 5B DiT + 9B TE | ~3.6–9.6 G | 文生图，fp16 / Q4_K_M，与对话共用文本编码器 |
 
 
 模型架构覆盖 `qwen3`/`qwen3moe`/`qwen3next`、`qwen3vl`/`qwen3vlmoe`、`qwen35moe`、`dflash`、`minicpm` 系列，以及 llama.cpp 其余常见架构。
@@ -103,7 +107,16 @@ MobiInfer-Android 引入完整的 **Qualcomm Hexagon NPU 后端**，打通了**�
 | MiniCPM-V 4.7 35B-A3B| Q3 LES + DSpark| 8 Elite | 512 | 94.28 | 13.65 |
 | Qwen3-VL-4B-Instruct | Q4_K_M | 8 Elite | 512 | 1013.74 | 18.13 |
 
+---
 
+## 文生图性能
+
+> 📱 Snapdragon 8 Elite（Hexagon HTP），MOSS-Image FP16，端到端耗时含文本编码与 VAE 解码。
+
+| 分辨率 | 步数 | 端到端耗时 | 每步 | 单位效率 |
+|---|---|---:|---:|---:|
+| 256 × 256 | 4 | **10 s** | 2.5 s | 38.1 s/(Mpx·step) |
+| 768 × 1024 | 8 | **100.1 s** | 12.5 s | **15.9 s/(Mpx·step)** |
 
 ---
 
