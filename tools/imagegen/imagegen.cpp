@@ -299,6 +299,21 @@ imagegen_ctx * imagegen_init(const imagegen_params * params) {
         sp.backend = params->backend;
     }
     sp.enable_mmap                  = params->enable_mmap;
+    // Direct conv is on by default here. sdcpp's probe only accepts it on Vulkan,
+    // MUSA and CUDA/ROCm, so on HTP it would never be chosen on its own; the
+    // kernel is validated on this device, and the im2col path it replaces is the
+    // VAE decode's largest single cost.
+    // Precedence: the caller's value, then SD_CONV_DIRECT_MODE (the escape hatch
+    // for an already-installed build), then "on". Either override may pass "off"
+    // or "auto" to fall back to sdcpp's own decision.
+    static const char * const kDefaultConvDirectMode = "on";
+    if (params->conv_direct_mode != nullptr && params->conv_direct_mode[0] != '\0') {
+        sp.conv_direct_mode = params->conv_direct_mode;
+    } else if (const char * conv_direct_env = getenv("SD_CONV_DIRECT_MODE")) {
+        sp.conv_direct_mode = conv_direct_env[0] != '\0' ? conv_direct_env : kDefaultConvDirectMode;
+    } else {
+        sp.conv_direct_mode = kDefaultConvDirectMode;
+    }
     // Releasing the encoder frees its weights before the diffusion stage, at the
     // cost of re-faulting them on the next encode. Worth setting only where the
     // whole stack would not otherwise fit; callers on this device leave it off.

@@ -245,6 +245,9 @@ class ImageEngine private constructor(
                 System.loadLibrary("imagegen")
                 nativeSetenv("GGML_HEXAGON_HOSTBUF", "1")
                 nativeSetenv("GGML_HEXAGON_ARCH", hexagonArchForDevice())
+                nativeSetenv("GGML_HEXAGON_CONV2D", "1")
+                nativeSetenv("SD_TE_CUT_STRIDE", "24")
+                nativeSetenv("SD_HEXAGON_PARALLEL_LOAD", "1")
                 nativeSetenv("ADSP_LIBRARY_PATH",
                     "${context.applicationInfo.nativeLibraryDir};/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/system/vendor/lib/rfsa/adsp")
                 nativeSetProgressListener(bridge)

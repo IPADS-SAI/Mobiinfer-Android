@@ -42,6 +42,10 @@ struct imagegen_params {
     // the text encoder on CPU and runs DiT + VAE on the NPU.
     const char * backend;              // e.g. "diffusion=HTP0,te=cpu,vae=HTP0"
     bool enable_mmap;                  // mmap weights from disk instead of reading
+    // "on" / "off" / "auto", or per-module assignments such as "vae=on". NULL or
+    // empty keeps sdcpp's own probe, which currently declines the direct conv
+    // path on HTP. Setting "vae=on" is how a caller opts into it.
+    const char * conv_direct_mode;
     // Free the TE params+buffers after the prompt is encoded (saves memory,
     // re-loads TE on the next prompt). Useful on memory-tight devices.
     bool release_te_after_encode;
