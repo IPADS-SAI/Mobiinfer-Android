@@ -1077,6 +1077,8 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
     std::atomic<uint64_t> bytes_processed(0);
 
     int num_threads_to_use = n_threads_;
+    const char* parallel_load_env = getenv("SD_HEXAGON_PARALLEL_LOAD");
+    const bool parallel_load_enabled = parallel_load_env != nullptr && atoi(parallel_load_env) != 0;
 
     int64_t start_time = ggml_time_ms();
 
@@ -1143,6 +1145,45 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
         }
         last_n_threads = n_threads;
 
+        std::vector<ggml_tensor*> destinations(tensors_to_process.size(), nullptr);
+        bool parallel_htp_batch = parallel_load_enabled;
+        std::vector<std::pair<uintptr_t, uintptr_t>> write_ranges;
+        std::set<const void*> extras;
+        for (size_t index = 0; index < tensors_to_process.size(); ++index) {
+            if (!on_new_tensor_cb(*tensors_to_process[index], &destinations[index])) {
+                return false;
+            }
+            ggml_tensor* tensor = destinations[index];
+            if (tensor == nullptr) {
+                continue;
+            }
+            if (tensor->buffer == nullptr || tensor->data == nullptr || tensor->view_src != nullptr ||
+                !ggml_is_contiguous(tensor) || ggml_backend_buffer_is_host(tensor->buffer)) {
+                parallel_htp_batch = false;
+                continue;
+            }
+            auto buft = ggml_backend_buffer_get_type(tensor->buffer);
+            auto device = ggml_backend_buft_get_device(buft);
+            auto registry = device != nullptr ? ggml_backend_dev_backend_reg(device) : nullptr;
+            if (registry == nullptr || strcmp(ggml_backend_reg_name(registry), "HTP") != 0 ||
+                buft != ggml_backend_dev_buffer_type(device) || tensor->extra == nullptr ||
+                !extras.insert(tensor->extra).second) {
+                parallel_htp_batch = false;
+            }
+            const uintptr_t begin = reinterpret_cast<uintptr_t>(tensor->data);
+            const size_t bytes = ggml_backend_buffer_get_alloc_size(tensor->buffer, tensor);
+            if (bytes > UINTPTR_MAX - begin) {
+                parallel_htp_batch = false;
+            } else {
+                write_ranges.emplace_back(begin, begin + bytes);
+            }
+        }
+        std::sort(write_ranges.begin(), write_ranges.end());
+        for (size_t index = 1; index < write_ranges.size(); ++index) {
+            if (write_ranges[index - 1].second > write_ranges[index].first) {
+                parallel_htp_batch = false;
+            }
+        }
         std::atomic<size_t> tensor_idx(0);
         std::atomic<bool> failed(false);
         std::vector<std::thread> workers;
@@ -1180,15 +1221,9 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                     }
 
                     const TensorStorage& tensor_storage = *tensors_to_process[idx];
-                    ggml_tensor* dst_tensor             = nullptr;
+                    ggml_tensor* dst_tensor             = destinations[idx];
 
                     t0 = ggml_time_ms();
-
-                    if (!on_new_tensor_cb(tensor_storage, &dst_tensor)) {
-                        LOG_WARN("process tensor failed: '%s'", tensor_storage.name.c_str());
-                        failed = true;
-                        break;
-                    }
 
                     if (dst_tensor == nullptr) {
                         t1 = ggml_time_ms();
@@ -1270,6 +1305,13 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                         return true;
                     };
 
+                    const bool direct_mapped_source = parallel_load_enabled && mmapped != nullptr &&
+                        dst_tensor->buffer != nullptr && !ggml_backend_buffer_is_host(dst_tensor->buffer) &&
+                        tensor_storage.type == dst_tensor->type && !tensor_storage.is_f64 && !tensor_storage.is_i64 &&
+                        !tensor_storage.is_f8_e4m3 && !tensor_storage.is_f8_e5m2 &&
+                        nbytes_to_read == tensor_storage.nbytes() && nbytes_to_read == ggml_nbytes(dst_tensor) &&
+                        tensor_storage.offset <= mmapped->size() &&
+                        nbytes_to_read <= mmapped->size() - tensor_storage.offset;
                     char* read_buf    = nullptr;
                     char* target_buf  = nullptr;
                     char* convert_buf = nullptr;
@@ -1290,7 +1332,9 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                             convert_buf = (char*)dst_tensor->data;
                         }
                     } else {
-                        read_buffer.resize(std::max(tensor_storage.nbytes(), tensor_storage.nbytes_to_read()));
+                        if (!direct_mapped_source) {
+                            read_buffer.resize(std::max(tensor_storage.nbytes(), tensor_storage.nbytes_to_read()));
+                        }
                         read_buf   = (char*)read_buffer.data();
                         target_buf = read_buf;
 
@@ -1301,7 +1345,10 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                     }
 
                     t0 = ggml_time_ms();
-                    if (!read_data(read_buf, nbytes_to_read)) {
+                    if (direct_mapped_source) {
+                        read_buf = reinterpret_cast<char*>(const_cast<uint8_t*>(mmapped->data() + tensor_storage.offset));
+                        target_buf = read_buf;
+                    } else if (!read_data(read_buf, nbytes_to_read)) {
                         failed = true;
                         break;
                     }
@@ -1344,7 +1391,10 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                     if (dst_tensor->buffer != nullptr && !ggml_backend_buffer_is_host(dst_tensor->buffer)) {
                         t0 = ggml_time_ms();
 
-                        std::lock_guard<std::mutex> lock(backend_tensor_set_mutex);
+                        std::unique_lock<std::mutex> lock(backend_tensor_set_mutex, std::defer_lock);
+                        if (!parallel_htp_batch) {
+                            lock.lock();
+                        }
                         ggml_backend_tensor_set(dst_tensor, convert_buf, 0, ggml_nbytes(dst_tensor));
 
                         t1 = ggml_time_ms();
@@ -1359,7 +1409,7 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
             });
         }
 
-        while (true) {
+        while (log_progress) {
             size_t current_idx = tensor_idx.load();
             if (current_idx >= tensors_to_process.size() || failed) {
                 break;
@@ -1372,7 +1422,7 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                                       bytes_processed.load(),
                                       elapsed_seconds);
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(total_tensors_to_process <= 4 ? 10 : 200));
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
 
         for (auto& w : workers) {
