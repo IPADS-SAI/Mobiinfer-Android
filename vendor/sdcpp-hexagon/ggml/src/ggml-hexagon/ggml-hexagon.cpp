@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <regex>
 #include <queue>
+
 #include <deque>
 #include <algorithm>
 #include <cmath>
@@ -69,6 +70,7 @@
 #include "htp/softmax-ops.h"
 #include "htp/pool-ops.h"
 #include "htp/rope-ops.h"
+#include "htp/conv2dhmx-ops.h"
 #include "htp/rope-apply-ops.h"
 #include "htp/ssm-conv.h"
 #include "htp/gated-delta-net-ops.h"
@@ -171,6 +173,16 @@ static u32vec opt_pmu_evt { 0x3, 0x111, 0x100, 0x105, 0x240, 0x256, 0x7D, 0x8C }
 
 static int opt_opbatch  = 1280; // max number of ops in a batch
 static int opt_opqueue  = 8;   // max number of pending batches
+// Ceiling for the stack arrays used while collecting a batch's buffers. The
+// effective per-batch limit is opt_opbufs (or HTP_OP_MAX_BUFS when unset); this
+// only bounds the temporary. 64 keeps the two `int seen_bufs[...]` arrays at
+// 256 B each instead of 1 KB, and no configuration has ever needed more.
+#define GGML_HEXAGON_MAX_OP_BUFS 64
+static bool g_batch_stats = false;
+static std::atomic<uint64_t> g_fit_reject[4];  // bufs, tens, vmem, n_ops
+static std::atomic<size_t>   g_vmem_reject_would{0};
+static std::atomic<size_t>   g_vmem_reject_cap{0};
+static int opt_opbufs   = 0;   // max distinct shared buffers per batch (0 = HTP_OP_MAX_BUFS)
 static int opt_optrace  = 0;    // trace buffer size per thread (0 means default)
 static int opt_oppoll   = 0;    // polling for batch completions
 static int opt_opfusion = 1;    // enable/disable op fusion
@@ -604,7 +616,17 @@ struct ggml_hexagon_session {
 
     std::atomic<uint64_t> batch_req_seq{0};
     std::atomic<uint64_t> batch_rsp_seq{0};
+    // GGML_HEXAGON_BATCHSTATS counters. Per-session rather than function-local
+    // statics so that TE/DiT/VAE runners are counted separately and a second
+    // run in the same process does not inherit the first run's totals.
+    uint64_t bs_batches  = 0;
+    uint64_t bs_sum_ops  = 0;
+    uint64_t bs_sum_bufs = 0;
+    uint64_t bs_buf_hits = 0;
     std::atomic<uint32_t> last_error{HTP_STATUS_OK};
+    // fds of weight buffers used as direct-conv kernels: these must not use an
+    // extended (64-bit) mapping, which the DSP cannot dereference directly.
+    std::unordered_set<int> conv_kernel_fds;
 
     uint64_t                cached_uid = 0;
     std::vector<htp_opnode> cached_nodes;
@@ -735,9 +757,23 @@ struct ggml_hexagon_shared_buffer {
     size_t       size()   const { return mem ? mem->size : 0;  }
     int          fd()     const { return mem ? mem->fd   : -1; }
 
+    // FastRPC mapping is process-global and not thread safe; every map/unmap goes
+    // through this one lock.
+    static std::mutex & map_mutex() {
+        static std::mutex m;
+        return m;
+    }
+
     void mmap(bool extended = false) {
         if (!this->mem)   return;
         if (this->mapped) return;
+
+        // FastRPC mapping is process-global state and not thread safe: two threads
+        // mapping (or mapping while another unmaps) the same fd can make the call
+        // fail with 0x80000600 and leave the host waiting. Serialise it.
+        std::lock_guard<std::mutex> mmap_lock(map_mutex());
+        if (this->mapped) return;
+
 
         GGML_ASSERT(!this->pinned || !extended);
 
@@ -758,6 +794,9 @@ struct ggml_hexagon_shared_buffer {
     }
 
     void unmap() {
+        if (!this->mapped) return;
+
+        std::lock_guard<std::mutex> mmap_lock(map_mutex());
         if (!this->mapped) return;
 
         if (!this->pinned && mem) {
@@ -2255,7 +2294,10 @@ static void repack_q5_K_tiled(ggml_tensor * t, const void * data, size_t offset,
             const block_q5_K * src_slice = src_matrix + (i3 * ne2 + i2) * (ne1 * sb_per_row);
             uint8_t * matrix_dst = (uint8_t *) t->data + (i3 * ne2 + i2) * matrix_size;
 
-            memset(matrix_dst, 0, matrix_size);
+            if (ne1 % 32 != 0) {
+                memset(matrix_dst + (size_t) (ne1 / 32) * n_k_tiles * tile_size,
+                       0, (size_t) n_k_tiles * tile_size);
+            }
 
             for (int64_t r = 0; r < ne1; r++) {
                 const int ct  = (int) (r / 32);
@@ -2279,21 +2321,20 @@ static void repack_q5_K_tiled(ggml_tensor * t, const void * data, size_t offset,
 
                     const uint8_t * qs_sub = b->qs + (kt_local / 2) * 32;
                     const int shift = (kt_local & 1) ? 4 : 0;
-                    const uint8_t hbit = (uint8_t) (1 << kt_local);
 
                     for (int cp = 0; cp < 16; cp++) {
                         const uint8_t q0 = (qs_sub[2 * cp + 0] >> shift) & 0x0F;
                         const uint8_t q1 = (qs_sub[2 * cp + 1] >> shift) & 0x0F;
                         tile_dst[cp * 32 + row] = (uint8_t) ((q1 << 4) | q0);
 
-                        const int i    = cp / 4;
-                        const int lane = (cp % 4) * 32 + row;
-                        if (b->qh[2 * cp + 0] & hbit) {
-                            plane[lane] |= (uint8_t) (1 << (2 * i));
+                    }
+                    for (int j = 0; j < 4; ++j) {
+                        uint8_t bits = 0;
+                        for (int i = 0; i < 4; ++i) {
+                            bits |= (uint8_t) (((b->qh[8 * i + 2 * j] >> kt_local) & 1u) << (2 * i));
+                            bits |= (uint8_t) (((b->qh[8 * i + 2 * j + 1] >> kt_local) & 1u) << (2 * i + 1));
                         }
-                        if (b->qh[2 * cp + 1] & hbit) {
-                            plane[lane] |= (uint8_t) (1 << (2 * i + 1));
-                        }
+                        plane[j * 32 + row] = bits;
                     }
 
                     ggml_half * scale_dst = (ggml_half *) (tile_dst + 512);
@@ -2435,9 +2476,43 @@ static void repack_tensor_tiled(ggml_tensor * tensor, const void * data, size_t 
             repack_q4_1_tiled(tensor, data, 0, size);
             break;
 
-        case GGML_TYPE_Q4_K:
-            repack_q4_K_tiled(tensor, data, 0, size);
+        case GGML_TYPE_Q4_K: {
+            const char* parallel = getenv("SD_HEXAGON_PARALLEL_LOAD");
+            if (parallel != nullptr && atoi(parallel) != 0 && size >= 256ULL * 1024 * 1024 &&
+                tensor->ne[2] == 1 && tensor->ne[3] == 1 && tensor->ne[1] >= 128) {
+                constexpr int workers = 4;
+                const int64_t tiles = (tensor->ne[1] + 31) / 32;
+                const size_t src_row = ggml_row_size(tensor->type, tensor->ne[0]);
+                const size_t dst_row = ggml_hexagon_tiled_row_size(tensor->type, tensor->ne[0]);
+                std::vector<std::thread> threads;
+                try {
+                    threads.reserve(workers);
+                    for (int worker = 0; worker < workers; ++worker) {
+                        const int64_t begin = tiles * worker / workers * 32;
+                        const int64_t end = std::min<int64_t>(tiles * (worker + 1) / workers * 32, tensor->ne[1]);
+                        threads.emplace_back([=] {
+                            ggml_tensor part = *tensor;
+                            part.ne[1] = end - begin;
+                            part.data = static_cast<char*>(tensor->data) + begin * dst_row;
+                            repack_q4_K_tiled(&part, static_cast<const char*>(data) + begin * src_row,
+                                              0, (end - begin) * src_row);
+                        });
+                    }
+                } catch (...) {
+                    for (auto& thread : threads) {
+                        thread.join();
+                    }
+                    repack_q4_K_tiled(tensor, data, 0, size);
+                    break;
+                }
+                for (auto& thread : threads) {
+                    thread.join();
+                }
+            } else {
+                repack_q4_K_tiled(tensor, data, 0, size);
+            }
             break;
+        }
 
         case GGML_TYPE_Q8_0:
             repack_q8_0_tiled(tensor, data, 0, size);
@@ -3151,7 +3226,11 @@ struct ggml_hexagon_opbatch {
     ggml_hexagon_opbatch(ggml_hexagon_session *sess, size_t batch_size, size_t max_vmem) {
         this->sess = sess;
 
-        n_bufs_max = HTP_OP_MAX_BUFS;
+        // HTP_OP_MAX_BUFS caps how many distinct shared buffers one batch may
+        // touch. The DiT weights arrive in ~52 separate buffers, so a 16-buffer
+        // cap forces a flush every ~19 ops (11244 ops / 586 batches) and each
+        // flush is a host<->DSP round trip. Raise it with GGML_HEXAGON_OPBUFS.
+        n_bufs_max = (unsigned int) (opt_opbufs > 0 ? opt_opbufs : HTP_OP_MAX_BUFS);
         n_ops_max  = batch_size;
         n_tens_max = std::min<size_t>(n_ops_max + n_ops_max * HTP_OP_MAX_INPUTS, HTP_OP_MAX_TENSORS);
 
@@ -3182,7 +3261,7 @@ struct ggml_hexagon_opbatch {
         if (it != b_map.end()) { return it->second; }
 
         // Add new buffer to the batch
-        GGML_ASSERT(n_bufs < HTP_OP_MAX_BUFS);
+        GGML_ASSERT(n_bufs < n_bufs_max);
         int bi = n_bufs++;
 
         b_map.insert({sbuf->fd(), bi});
@@ -3294,14 +3373,17 @@ struct ggml_hexagon_opbatch {
     }
 
     bool fit_op(const htp_opnode & node) const {
-        if (n_ops >= n_ops_max) return false;
+        if (n_ops >= n_ops_max) {
+            if (g_batch_stats) g_fit_reject[3]++;
+            return false;
+        }
 
         // check how much extras we will need
         size_t extra_bufs = 0;
         size_t extra_vmem = 0;
         size_t extra_tens = 0;
 
-        int seen_bufs[HTP_OP_MAX_BUFS];
+        int seen_bufs[GGML_HEXAGON_MAX_OP_BUFS];
         int n_seen_bufs = 0;
 
         auto fit_tensor = [&](const ggml_tensor *t) {
@@ -3316,7 +3398,7 @@ struct ggml_hexagon_opbatch {
                     for (int i = 0; i < n_seen_bufs; i++) {
                         if (seen_bufs[i] == fd) return;
                     }
-                    if (n_seen_bufs < HTP_OP_MAX_BUFS) {
+                    if (n_seen_bufs < GGML_HEXAGON_MAX_OP_BUFS) {
                         seen_bufs[n_seen_bufs++] = fd;
                     }
                     if (!sbuf->extended) {
@@ -3334,10 +3416,30 @@ struct ggml_hexagon_opbatch {
             fit_tensor(output);
         }
 
-        if ((extra_bufs + n_bufs) > n_bufs_max) return false;
-        if ((extra_tens + n_tens) > n_tens_max) return false;
-        if ((extra_vmem + b_vmem) > b_vmem_max) return false;
-
+        if ((extra_bufs + n_bufs) > n_bufs_max) {
+            if (g_batch_stats) g_fit_reject[0]++;
+            return false;
+        }
+        if ((extra_tens + n_tens) > n_tens_max) {
+            if (g_batch_stats) g_fit_reject[1]++;
+            return false;
+        }
+        if ((extra_vmem + b_vmem) > b_vmem_max) {
+            if (g_batch_stats) {
+                g_fit_reject[2]++;
+                // Record the numbers so the report shows how far the batch was
+                // from the cap, not just that it tripped. Relaxed maximum keeps
+                // this race-free enough for a diagnostic.
+                const size_t would = extra_vmem + b_vmem;
+                size_t prev = g_vmem_reject_would.load(std::memory_order_relaxed);
+                while (would > prev &&
+                       !g_vmem_reject_would.compare_exchange_weak(prev, would, std::memory_order_relaxed)) {
+                }
+                g_vmem_reject_cap.store(b_vmem_max, std::memory_order_relaxed);
+            }
+            return false;
+        }
+        // n_ops_max is checked at the top of fit_op.
         return true;
     }
 
@@ -3414,7 +3516,7 @@ struct ggml_hexagon_opbatch {
     bool try_fuse_common(std::initializer_list<const ggml_tensor *> tensors) const {
         size_t extra_bufs = 0, extra_vmem = 0, extra_tens = 0;
 
-        int seen_bufs[HTP_OP_MAX_BUFS];
+        int seen_bufs[GGML_HEXAGON_MAX_OP_BUFS];
         int n_seen_bufs = 0;
 
         for (const auto * t : tensors) {
@@ -3434,7 +3536,7 @@ struct ggml_hexagon_opbatch {
                     }
                 }
                 if (!found) {
-                    if (n_seen_bufs < HTP_OP_MAX_BUFS) {
+                    if (n_seen_bufs < GGML_HEXAGON_MAX_OP_BUFS) {
                         seen_bufs[n_seen_bufs++] = fd;
                     }
                     if (!sbuf->extended) {
@@ -4133,7 +4235,7 @@ struct ggml_hexagon_opqueue {
     std::vector<uint64_t>       start_usec;     // per batch start time
 
     ggml_hexagon_opqueue(ggml_hexagon_session *sess, size_t batch_size, size_t depth) : depth(depth) {
-        size_t n_bufs    = HTP_OP_MAX_BUFS;
+        size_t n_bufs    = (size_t) (opt_opbufs > 0 ? opt_opbufs : HTP_OP_MAX_BUFS);
         size_t n_ops     = batch_size;
         size_t n_tensors = n_ops * HTP_OP_MAX_OUTPUTS + n_ops * HTP_OP_MAX_INPUTS;
 
@@ -4412,6 +4514,39 @@ void ggml_hexagon_session::start_batch() {
 
 void ggml_hexagon_session::flush_batch(size_t min_ops) {
     if (op_batch->n_ops < min_ops) { return; }
+
+    // Batch fill diagnostics: 11244 ops end up split into 586 batches (~19 ops
+    // each) even though opt_opbatch is 1280. If n_bufs is pinned at n_bufs_max
+    // here, the shared-buffer cap is what forces the flush; if it is small, the
+    // cap is innocent and the real trigger is somewhere else. Set
+    // GGML_HEXAGON_BATCHSTATS=1 to print.
+    if (g_batch_stats) {
+        bs_batches++;
+        bs_sum_ops  += op_batch->n_ops;
+        bs_sum_bufs += op_batch->n_bufs;
+        if (op_batch->n_bufs >= op_batch->n_bufs_max) bs_buf_hits++;
+        if ((bs_batches % 64) == 0) {
+            const uint64_t n_batches = bs_batches;
+            const uint64_t sum_ops   = bs_sum_ops;
+            const uint64_t sum_bufs  = bs_sum_bufs;
+            const uint64_t buf_hits  = bs_buf_hits;
+            GGML_LOG_INFO("[batchstats] %llu batches, last ops %u bufs %u, avg ops %.1f, "
+                          "avg bufs %.1f, buf-capped %llu | "
+                          "flushes: bufs %llu tens %llu vmem %llu n_ops %llu | "
+                          "first vmem reject: would %zu MiB vs cap %zu MiB\n",
+                (unsigned long long) n_batches,
+                op_batch->n_ops, op_batch->n_bufs,
+                (double) sum_ops / (double) n_batches,
+                (double) sum_bufs / (double) n_batches,
+                (unsigned long long) buf_hits,
+                (unsigned long long) g_fit_reject[0].load(),
+                (unsigned long long) g_fit_reject[1].load(),
+                (unsigned long long) g_fit_reject[2].load(),
+                (unsigned long long) g_fit_reject[3].load(),
+                g_vmem_reject_would.load() / (1024 * 1024),
+                g_vmem_reject_cap.load()   / (1024 * 1024));
+        }
+    }
 
     op_batch->sort_buffers();
 
@@ -4763,7 +4898,12 @@ ggml_hexagon_shared_buffer * ggml_hexagon_session::mmap_tensor(const ggml_tensor
 
     if (!sbuf->mapped) {
         const bool is_weight = ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
-        const bool extended  = opt_dma64 && is_weight;
+        // conv2d-hmx reads its kernel directly from DSP memory, so an extended
+        // mapping is unusable there; a buffer that holds a conv kernel therefore
+        // stays on the ordinary mapping for good.
+        const bool holds_conv_kernel =
+            is_weight && (this->conv_kernel_fds.count(sbuf->fd()) > 0);
+        const bool extended  = opt_dma64 && is_weight && !holds_conv_kernel;
         sbuf->mmap(extended);
     }
     return sbuf;
@@ -7881,6 +8021,161 @@ static bool ggml_hexagon_supported_rope_apply(const struct ggml_hexagon_session 
     return true;
 }
 
+// ggml_conv_2d(): build the patch matrix in VTCM and multiply it on HMX. The
+// generic path materialises the patch matrix to DDR (40.8 GB per VAE decode,
+// devdocs/06-perf-profile.md 100), which DMA cannot sustain.
+static int g_conv2d_dbg = 0;
+
+static bool ggml_hexagon_conv2d_params(const struct ggml_tensor * op,
+                                       struct htp_conv2dhmx_kernel_params * kp,
+                                       uint32_t n_threads) {
+    const struct ggml_tensor * a = op->src[0];  // kernel [KW, KH, IC, OC]
+    const struct ggml_tensor * b = op->src[1];  // input  [W, H, IC, N]
+
+    const int32_t s0 = ggml_get_op_params_i32(op, 0);
+    const int32_t s1 = ggml_get_op_params_i32(op, 1);
+    const int32_t p0 = ggml_get_op_params_i32(op, 2);
+    const int32_t p1 = ggml_get_op_params_i32(op, 3);
+    const int32_t d0 = ggml_get_op_params_i32(op, 4);
+    const int32_t d1 = ggml_get_op_params_i32(op, 5);
+
+    memset(kp, 0, sizeof(*kp));
+    kp->IC  = (uint32_t) b->ne[2];
+    kp->IH  = (uint32_t) b->ne[1];
+    kp->IW  = (uint32_t) b->ne[0];
+    kp->OC  = (uint32_t) op->ne[2];
+    kp->OH  = (uint32_t) op->ne[1];
+    kp->OW  = (uint32_t) op->ne[0];
+    // The kernel is already stored dilated-free; d0/d1 fold into the row count.
+    kp->KH  = (uint32_t) ((a->ne[1] - 1) * d1 + 1);
+    kp->KW  = (uint32_t) ((a->ne[0] - 1) * d0 + 1);
+    kp->stride = (uint32_t) s0;
+    kp->pad    = (uint32_t) p0;
+    (void) s1; (void) p1;
+
+    kp->total_rows   = (uint32_t) (op->ne[0] * op->ne[1] * op->ne[3]);
+    // K is padded up to a multiple of 64 so the tile packers' 128-byte row
+    // alignment holds for every shape. The extra taps are zero in both the
+    // weight and the activation tile, so they add nothing to the dot product.
+    kp->k_valid      = (uint32_t) (a->ne[0] * a->ne[1] * a->ne[2]);
+    kp->patch_stride = (kp->k_valid + 63u) / 64u * 64u;
+    kp->n_dot_tiles  = kp->patch_stride / 32;
+    kp->n_col_tiles  = (kp->OC + 31) / 32;
+    kp->n_threads    = n_threads;
+    kp->kernel_type  = a->type == GGML_TYPE_F16 ? HTP_TYPE_F16 : HTP_TYPE_F32;
+    // Diagnostic plumbing for the tile-layout experiments. Read on the host
+    // because the DSP's getenv() does not see this environment.
+    kp->dump_tiles   = getenv("GGML_HEXAGON_CONV2D_DUMP") ? (uint32_t) atoi(getenv("GGML_HEXAGON_CONV2D_DUMP")) : 0;
+    return true;
+}
+
+static bool ggml_hexagon_supported_conv2d(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+    const struct ggml_tensor * a = op->src[0];
+    const struct ggml_tensor * b = op->src[1];
+
+    // Two independent gates. This one is the backend's: the HMX direct-conv path
+    // replaces the well-tested im2col path for every VAE conv, so it stays opt-in
+    // here and is enabled with GGML_HEXAGON_CONV2D=1. Whether sdcpp actually asks
+    // for it is a separate decision (sd_ctx_params_t::conv_direct_mode), so a
+    // build that leaves this unset still takes the im2col path even when the
+    // caller requests direct conv.
+    if (!getenv("GGML_HEXAGON_CONV2D") || getenv("GGML_HEXAGON_NO_CONV2D")) {
+        return false;
+    }
+    if (!a || !b) {
+        return false;
+    }
+    if (b->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (a->type != GGML_TYPE_F32 && a->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (sess->n_hmx <= 0 || opt_mm_select < 2) {
+        return false;
+    }
+
+    // The kernel only handles the square, undilated, single-stride case that the
+    // VAE decoder actually uses.
+    const int32_t s0 = ggml_get_op_params_i32(op, 0);
+    const int32_t s1 = ggml_get_op_params_i32(op, 1);
+    const int32_t p0 = ggml_get_op_params_i32(op, 2);
+    const int32_t p1 = ggml_get_op_params_i32(op, 3);
+    const int32_t d0 = ggml_get_op_params_i32(op, 4);
+    const int32_t d1 = ggml_get_op_params_i32(op, 5);
+    if (s0 <= 0 || s0 != s1 || p0 < 0 || p0 != p1 || d0 != 1 || d1 != 1) {
+        return false;
+    }
+    if (!ggml_is_contiguous(a) || !ggml_is_contiguous(b) || !ggml_is_contiguous(op)) {
+        return false;
+    }
+
+    // Weight staging rows must remain 128-byte aligned. Small VAE input
+    // convolutions with K=4 or K=36 use the original im2col graph.
+    {
+        uint64_t K = 1;
+        uint64_t total_rows = 1;
+        for (int i = 0; i < 4; i++) {
+            if (a->ne[i] <= 0 || b->ne[i] <= 0 || op->ne[i] <= 0 ||
+                a->ne[i] > INT32_MAX || b->ne[i] > INT32_MAX || op->ne[i] > INT32_MAX) {
+                return false;
+            }
+            if (i < 3) {
+                if (K > UINT32_MAX / (uint64_t) a->ne[i]) {
+                    return false;
+                }
+                K *= a->ne[i];
+            }
+            if (i != 2) {
+                if (total_rows > (UINT32_MAX - 31u) / (uint64_t) op->ne[i]) {
+                    return false;
+                }
+                total_rows *= op->ne[i];
+            }
+        }
+        // Both alignment guards that used to live here are gone. They were
+        // measured to be unnecessary: the activation packer (cv_pack_act_tiles)
+        // builds tiles with HVX stores and needs no row alignment, and K is
+        // padded up to a multiple of 64 with zeros so the weight packer's
+        // 128-byte row requirement holds for every shape. Removing them took
+        // shapes such as IW=40 and conv_in's K=36 off the CPU fallback.
+        if (b->ne[0] <= 0) {
+            return false;
+        }
+        // total_rows and patch_stride are uint32 in the kernel params, so reject
+        // anything that would truncate instead of silently computing a short grid.
+        if (a->ne[2] != b->ne[2] || a->ne[3] != op->ne[2] || b->ne[3] != op->ne[3]) {
+            return false;
+        }
+    }
+
+    struct htp_conv2dhmx_kernel_params kp;
+    ggml_hexagon_conv2d_params(op, &kp, (uint32_t) sess->n_threads);
+
+    // Match the DSP minimum: shared weights, one activation/result tile,
+    // scales, staging, private pack scratch, and the end guard.
+    const size_t w_bytes     = (size_t) kp.n_dot_tiles * 1024 * sizeof(__fp16);
+    const size_t act_bytes   = (size_t) kp.n_dot_tiles * 1024 * sizeof(__fp16);
+    const size_t out_bytes   = (size_t) 1024 * sizeof(__fp16);
+    const size_t stage_bytes = ((size_t) kp.patch_stride * 32 * sizeof(__fp16) + 127) & ~(size_t) 127;
+    const size_t wall_bytes  = (size_t) kp.n_col_tiles * w_bytes;
+    const size_t fixed       = 256 + stage_bytes + (size_t) (std::max(1u, sess->n_threads) - 1) * 4096;
+    if (wall_bytes + act_bytes + out_bytes + fixed + 128 > sess->vtcm_size) {
+        return false;
+    }
+    if (getenv("GGML_HEXAGON_CONV2D_DEBUG") && g_conv2d_dbg < 8) {
+        g_conv2d_dbg++;
+        GGML_LOG_INFO("[conv2ddbg] ACCEPT a=%s[%lld:%lld:%lld:%lld] b=%s[%lld:%lld:%lld:%lld] -> [%lld:%lld:%lld:%lld] "
+                      "K=%u n_dot=%u n_col=%u rows=%u stride=%u pad=%u wall=%zu min_slab=%zu x %u <= %zu\n",
+            ggml_type_name(a->type), (long long)a->ne[0], (long long)a->ne[1], (long long)a->ne[2], (long long)a->ne[3],
+            ggml_type_name(b->type), (long long)b->ne[0], (long long)b->ne[1], (long long)b->ne[2], (long long)b->ne[3],
+            (long long)op->ne[0], (long long)op->ne[1], (long long)op->ne[2], (long long)op->ne[3],
+            kp.patch_stride, kp.n_dot_tiles, kp.n_col_tiles, kp.total_rows, kp.stride, kp.pad,
+            wall_bytes, act_bytes + out_bytes + fixed, sess->n_threads, sess->vtcm_size);
+    }
+    return true;
+}
+
 static int g_rope_dbg_printed = 0;
 
 static bool rope_reject(const struct ggml_tensor * op, const char * why) {
@@ -8652,6 +8947,7 @@ static htp_op_code op_remap_to_htp(const ggml_tensor * t) {
         case GGML_OP_SUM:             return HTP_OP_SUM;
         case GGML_OP_SUM_ROWS:        return HTP_OP_SUM_ROWS;
         case GGML_OP_POOL_2D:         return HTP_OP_POOL_2D;
+        case GGML_OP_CONV_2D:         return HTP_OP_CONV_2D;
         case GGML_OP_POOL_1D:         return HTP_OP_POOL_1D;
         case GGML_OP_ARGSORT:         return HTP_OP_ARGSORT;
         case GGML_OP_TOP_K:           return HTP_OP_TOP_K;
@@ -8915,6 +9211,10 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
                     node.opcode, src0, src1, node.dst(),
                     (struct htp_unary_kernel_params *)node.kernel_params
                 );
+            } else if (node.opcode == HTP_OP_CONV_2D) {
+                ggml_hexagon_conv2d_params(node.node,
+                    (struct htp_conv2dhmx_kernel_params *) node.kernel_params,
+                    (uint32_t) sess->n_threads);
             } else if (node.opcode == HTP_OP_ROPE_APPLY) {
                 ggml_hexagon_rope_apply_params(node.node,
                     (struct htp_rope_apply_kernel_params *) node.kernel_params,
@@ -9882,6 +10182,19 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
             supp = ggml_hexagon_supported_cumsum(sess, op);
             break;
 
+        case GGML_OP_CONV_2D:
+            supp = ggml_hexagon_supported_conv2d(sess, op);
+            if (supp) {
+                // Remember this kernel's buffer while the graph is being built, i.e.
+                // before enqueue maps anything: the mapping mode is decided once.
+                const ggml_tensor * ker = op->src[0];
+                if (ker && ker->buffer && ggml_backend_buffer_is_hexagon(ker->buffer) && ker->buffer->context) {
+                    auto kb = static_cast<ggml_hexagon_shared_buffer *>(ker->buffer->context);
+                    const_cast<ggml_hexagon_session *>(sess)->conv_kernel_fds.insert(kb->fd());
+                }
+            }
+            break;
+
         case GGML_OP_CONCAT:
             supp = ggml_hexagon_supported_concat(sess, op);
             break;
@@ -10326,6 +10639,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_verbose  = getenv("GGML_HEXAGON_VERBOSE");
     const char * str_opbatch  = getenv("GGML_HEXAGON_OPBATCH");
     const char * str_opqueue  = getenv("GGML_HEXAGON_OPQUEUE");
+    const char * str_opbufs   = getenv("GGML_HEXAGON_OPBUFS");
+    const char * str_bstats   = getenv("GGML_HEXAGON_BATCHSTATS");
     const char * str_oppoll   = getenv("GGML_HEXAGON_OPPOLL");
     const char * str_opfusion = getenv("GGML_HEXAGON_OPFUSION");
     const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
@@ -10383,6 +10698,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_verbose   = str_verbose  ? atoi(str_verbose)                      : 0;
     opt_opbatch   = str_opbatch  ? strtoul(str_opbatch, NULL, 0)          : opt_opbatch;
     opt_opqueue   = str_opqueue  ? strtoul(str_opqueue, NULL, 0)          : opt_opqueue;
+    opt_opbufs    = str_opbufs   ? strtoul(str_opbufs,  NULL, 0)          : opt_opbufs;
+    g_batch_stats = str_bstats   != nullptr;
     opt_optrace   = str_optrace  ? strtoul(str_optrace, NULL, 0)          : (opt_opbatch * 256);
     opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
     opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;

@@ -122,6 +122,7 @@ enum htp_op_code {
     HTP_OP_UPSCALE,
     HTP_OP_GROUP_NORM,
     HTP_OP_ROPE_APPLY,
+    HTP_OP_CONV_2D,
 
     HTP_OP_INVALID
 };

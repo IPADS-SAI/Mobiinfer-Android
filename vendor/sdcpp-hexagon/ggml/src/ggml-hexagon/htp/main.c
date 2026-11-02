@@ -35,6 +35,7 @@
 #include "hex-profile.h"
 #include "allreduce-ops.h"
 #include "rope-apply-ops.h"
+#include "conv2dhmx-ops.h"
 #include "htp-fence.h"
 
 #define HMX_QUEUE_CAPACITY     128
@@ -1023,6 +1024,8 @@ static int execute_op(struct htp_ops_context * octx) {
 
         case HTP_OP_ROPE_APPLY:
             return op_rope_apply(octx);
+        case HTP_OP_CONV_2D:
+            return op_conv_2d_hmx(octx);
 
         case HTP_OP_POOL_2D:
             return op_pool_2d(octx);

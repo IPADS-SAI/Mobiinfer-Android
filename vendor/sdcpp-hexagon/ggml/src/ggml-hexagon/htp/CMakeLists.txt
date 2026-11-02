@@ -50,6 +50,7 @@ add_library(${HTP_LIB} SHARED
     upscale-ops.c
     group-norm-ops.c
     rope-apply-ops.c
+    conv2dhmx-ops.c
 )
 
 target_compile_definitions(${HTP_LIB} PRIVATE
