@@ -230,7 +230,7 @@ class ChatAdapter(
             }
             return
         }
-        holder.updateProgress(merged.progress, merged.stage)
+        holder.updateProgress(merged.id, merged.progress, merged.stage)
         merged.previewBitmap?.let { holder.showPreview(it) }
     }
 
@@ -540,7 +540,7 @@ class ChatAdapter(
                     layoutProgress.visibility = View.VISIBLE
                     tvError.visibility = View.GONE
                     tvHint.visibility = View.GONE
-                    updateProgress(item.progress, item.stage)
+                    updateProgress(item.id, item.progress, item.stage)
                     val preview = item.previewBitmap
                     if (preview != null) {
                         // Only replace what the view shows when it is a newer
@@ -600,8 +600,16 @@ class ChatAdapter(
             }
         }
 
-        fun updateProgress(fraction: Float, stage: String?) {
+        fun updateProgress(itemId: Long, fraction: Float, stage: String?) {
             layoutProgress.visibility = View.VISIBLE
+            // This path repaints the row without a bind(), so the high-water mark
+            // has to be reset here too: a recycled holder still carrying the
+            // previous draw's ceiling made maxOf() pin the bar at that old value
+            // for the whole draw, while the label underneath kept counting up.
+            if (itemId != progressItemId) {
+                progressItemId = itemId
+                maxProgress = 0f
+            }
             if (fraction < 0f) {
                 progressBar.isIndeterminate = true
             } else {
