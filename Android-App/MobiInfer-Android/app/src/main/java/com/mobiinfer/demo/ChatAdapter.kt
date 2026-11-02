@@ -58,6 +58,7 @@ class ChatAdapter(
     private var onImageClick: ((String) -> Unit)? = null
     private var onImageLongClick: ((String) -> Unit)? = null
     private var onImageErrorClick: ((String) -> Unit)? = null
+    private var onImageReseed: ((Long) -> Unit)? = null
 
     private var activeAiHolder: AiMessageViewHolder? = null
     private var activeAiId: Long = -1L
@@ -113,6 +114,11 @@ class ChatAdapter(
     /** Copy a generation error somewhere the user can paste it. */
     fun setOnImageErrorClick(listener: (String) -> Unit) {
         onImageErrorClick = listener
+    }
+
+    /** Draw the same prompt again under a fresh seed, as a new row. */
+    fun setOnImageReseed(listener: (Long) -> Unit) {
+        onImageReseed = listener
     }
 
     fun setActiveAiMessage(id: Long) {
@@ -497,6 +503,7 @@ class ChatAdapter(
         private val tvError: TextView = itemView.findViewById(R.id.tv_image_error)
         private val tvParams: TextView = itemView.findViewById(R.id.tv_image_params)
         private val tvHint: TextView = itemView.findViewById(R.id.tv_image_hint)
+        private val tvReseed: TextView = itemView.findViewById(R.id.tv_image_reseed)
         private val progressBar: LinearProgressIndicator = itemView.findViewById(R.id.progress_image_gen)
         // The model that drew this picture is recorded on the message itself
         // (the selection may have changed since), but ImageResult carries no
@@ -540,6 +547,7 @@ class ChatAdapter(
                     layoutProgress.visibility = View.VISIBLE
                     tvError.visibility = View.GONE
                     tvHint.visibility = View.GONE
+                    tvReseed.visibility = View.GONE
                     updateProgress(item.id, item.progress, item.stage)
                     val preview = item.previewBitmap
                     if (preview != null) {
@@ -561,6 +569,7 @@ class ChatAdapter(
                     layoutProgress.visibility = View.GONE
                     ivResult.visibility = View.GONE
                     tvHint.visibility = View.GONE
+                    tvReseed.visibility = View.GONE
                     tvError.visibility = View.VISIBLE
                     // Show the engine's own words: "image generation failed"
                     // alone gives the user (and us) nothing to act on. Tap
@@ -588,6 +597,12 @@ class ChatAdapter(
                     }
                     val available = ivResult.drawable != null
                     tvHint.visibility = if (available) View.VISIBLE else View.GONE
+                    // Only a finished picture can be redrawn, and only for a
+                    // draw the user asked for: a tool call belongs to the model
+                    // turn that asked for it.
+                    tvReseed.visibility =
+                        if (available && !item.requestedByModel && onImageReseed != null) View.VISIBLE else View.GONE
+                    tvReseed.setOnClickListener { onImageReseed?.invoke(item.id) }
                     // Tap opens the picture full screen, long-press offers to
                     // save it; both are also reachable from the viewer.
                     ivResult.setOnClickListener { if (available) onImageClick?.invoke(path) }

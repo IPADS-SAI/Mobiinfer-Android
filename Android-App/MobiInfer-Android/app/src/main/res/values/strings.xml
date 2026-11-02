@@ -289,6 +289,8 @@
 
     <!-- Image viewer and gallery export -->
     <string name="image_result_hint">点击查看大图</string>
+    <string name="image_reseed_action">换一个种子再生成一遍</string>
+    <string name="image_reseed_running">正在用新的种子重新生成…</string>
     <string name="image_loading">载入中…</string>
     <string name="image_missing">图片文件已不存在</string>
     <string name="image_save">保存到相册</string>

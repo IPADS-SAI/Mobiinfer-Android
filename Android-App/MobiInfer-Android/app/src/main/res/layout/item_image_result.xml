@@ -90,6 +90,21 @@
                 android:textSize="11sp"
                 android:visibility="gone" />
 
+            <!-- Draws the same prompt again with a fresh seed, as its own row:
+                 the picture already on screen is kept. -->
+            <TextView
+                android:id="@+id/tv_image_reseed"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_gravity="end"
+                android:paddingVertical="8dp"
+                android:paddingHorizontal="6dp"
+                android:background="?attr/selectableItemBackground"
+                android:text="@string/image_reseed_action"
+                android:textColor="?attr/colorPrimary"
+                android:textSize="12sp"
+                android:visibility="gone" />
+
             <TextView
                 android:id="@+id/tv_image_error"
                 android:layout_width="match_parent"

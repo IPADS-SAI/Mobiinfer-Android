@@ -234,6 +234,7 @@ class MainActivity : AppCompatActivity() {
         }
         chatAdapter.setOnImageClick { path -> ImageViewer.show(this, path) }
         chatAdapter.setOnImageLongClick { path -> ImageViewer.saveToGallery(this, path) }
+        chatAdapter.setOnImageReseed { id -> reseedImageGeneration(id) }
         chatAdapter.setOnImageErrorClick { message ->
             val clipboard = getSystemService(ClipboardManager::class.java)
             clipboard?.setPrimaryClip(ClipData.newPlainText("MobiInfer image error", message))
@@ -1300,9 +1301,45 @@ class MainActivity : AppCompatActivity() {
     private fun nativeHeapMb(): Long = android.os.Debug.getNativeHeapAllocatedSize() / (1024 * 1024)
 
     /** Home-screen image mode entry point (the switch is on). */
-    private fun beginImageGeneration(prompt: String) {
+    /**
+     * Draws the same prompt again under a new seed, as an additional picture.
+     *
+     * Only the seed changes: the size, step count and CFG of the row that asked
+     * for it are reused, so the new picture is comparable to the one on screen.
+     * The original stays where it is - this appends rather than replaces - and
+     * no user message is added, because the prompt was already said once.
+     */
+    private fun reseedImageGeneration(itemId: Long) {
+        val previous = messages.firstOrNull { it.id == itemId } as? ChatMessage.ImageResult ?: return
         val ctx = applicationContext
         val model = LlamaEngine.getSelectedModel(ctx)
+        if (imageJob?.isActive == true) {
+            Toast.makeText(this, R.string.image_generating, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val fresh = currentImageRequest(previous.prompt, model)
+        beginImageGeneration(previous.prompt, fresh.copy(seed = newSeedDistinctFrom(previous.seedUsed)))
+    }
+
+    /**
+     * A seed different from the one that made [used].
+     *
+     * The configured seed is often pinned, so reusing it would redraw the very
+     * same picture; drawing from the clock gives a new one. The loop only guards
+     * the (unlikely) collision.
+     */
+    private fun newSeedDistinctFrom(used: Long?): Long {
+        var seed = System.nanoTime() and 0x7fffffffL
+        var guard = 0
+        while (seed == used && guard++ < 8) {
+            seed = System.nanoTime() and 0x7fffffffL
+        }
+        return seed
+    }
+
+    private fun beginImageGeneration(prompt: String, requestOverride: ImageRequest? = null) {
+        val ctx = applicationContext
+        val model = requestOverride?.model ?: LlamaEngine.getSelectedModel(ctx)
         if (!LlamaEngine.modelsExist(ctx, model)) {
             beginModelFlow(prompt)
             return
@@ -1331,20 +1368,24 @@ class MainActivity : AppCompatActivity() {
         cancelActiveGeneration()
 
         lockOrientationWhileGenerating(true)
-        val userMsgId = messageIdCounter++
-        messages.add(
-            ChatMessage.UserMessage(
-                id = userMsgId,
-                text = prompt,
-                isImagePrompt = true
+        // A redraw keeps the prompt already on screen: adding it a second time
+        // would read as if the user had asked twice.
+        if (requestOverride == null) {
+            val userMsgId = messageIdCounter++
+            messages.add(
+                ChatMessage.UserMessage(
+                    id = userMsgId,
+                    text = prompt,
+                    isImagePrompt = true
+                )
             )
-        )
+        }
         val resultId = addImageResultPlaceholder(prompt, requestedByModel = false)
         chatAdapter.submitList(messages.toList()) { scrollToBottom() }
         persistCurrentConversation()
         enableInput(false)
 
-        val request = currentImageRequest(prompt, model)
+        val request = requestOverride ?: currentImageRequest(prompt, model)
         lastImageStartAt = SystemClock.elapsedRealtime()
         val outFile = ImageOutput.newOutputFile(ctx)
         val token = ++imageGenerationToken
@@ -2125,6 +2166,7 @@ class MainActivity : AppCompatActivity() {
                     ),
                     isGenerating = false,
                     requestedByModel = false,
+                    seedUsed = seed,
                     progress = 1f,
                     elapsedMs = elapsedMs
                 )
@@ -2159,6 +2201,7 @@ class MainActivity : AppCompatActivity() {
             ),
             isGenerating = false,
             error = null,
+            seedUsed = seed,
             // Dropped, not recycled: the last frame may still be the bitmap an
             // ImageView or a pending diff is showing. The reference is all this
             // needs to release - the finished picture comes from pngPath.

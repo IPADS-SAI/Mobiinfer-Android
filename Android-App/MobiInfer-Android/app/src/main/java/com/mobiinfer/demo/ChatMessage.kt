@@ -61,6 +61,9 @@ sealed class ChatMessage {
         // Set when the image was requested by the language model through the
         // generate_image tool rather than by the image-mode switch.
         val requestedByModel: Boolean = false,
+        // The seed that actually produced this picture, kept so a redraw can be
+        // made under a different one instead of repeating the same image.
+        val seedUsed: Long? = null,
         // 0..1 while generating. -1 means "unknown" (indeterminate spinner).
         val progress: Float = -1f,
         // Human readable stage, e.g. "理解提示词中…" or "第 3/8 步".
