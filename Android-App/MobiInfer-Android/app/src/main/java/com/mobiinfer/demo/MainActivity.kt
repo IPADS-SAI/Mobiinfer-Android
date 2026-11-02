@@ -2275,6 +2275,16 @@ class MainActivity : AppCompatActivity() {
         val request = currentImageRequest(prompt, imageModel)
         lastImageStartAt = SystemClock.elapsedRealtime()
         val outFile = ImageOutput.newOutputFile(ctx)
+        // Started before prepareImageEngine(), like the image-mode path: preparing
+        // the engine unloads the chat model and loads the image stack, which takes
+        // tens of seconds. Building the UI afterwards left the bubble frozen on
+        // its placeholder for that whole wait, and then started the clock from
+        // zero anyway - so the bar shot up and sat at its cap until the picture
+        // arrived. Owning it here makes the wait part of the draw it belongs to.
+        val drawUi = ImageProgressUi(resultId, request).also {
+            it.expectSteps(request.steps)
+            it.onStart()
+        }
         // The stream that produced this call still owns the llama context; it
         // has to stop before the image stack can take the NPU (and before the
         // chat model may be unloaded). Only the chat stream: cancelling the
@@ -2291,6 +2301,7 @@ class MainActivity : AppCompatActivity() {
             // the difference between "the user cancelled" and "the draw
             // failed", and only the log can tell them apart.
             CriticalLog.log("image", "tool preparation cancelled: ${e.message}")
+            drawUi.stop()
             return false
         } catch (e: Exception) {
             Log.e(TAG, "Image tool: preparation failed", e)
@@ -2298,20 +2309,25 @@ class MainActivity : AppCompatActivity() {
             null
         }
         if (imageEngine == null) {
+            // The ticker is already running (it was started before preparation,
+            // so the wait was visible). Nothing else will stop it on this path.
+            drawUi.stop()
             markAssistantWaitingForImage(aiMsgId, false)
             if (messages.any { it.id == aiMsgId }) {
                 failImageResult(resultId, lastImagePreparationError ?: getString(R.string.image_generate_failed))
             }
             return false
         }
-        if (!messages.any { it.id == aiMsgId }) return false
+        if (!messages.any { it.id == aiMsgId }) {
+            drawUi.stop()
+            return false
+        }
         CriticalLog.log("image", "prepare returned a loaded engine (isLoaded=${imageEngine.isLoaded})")
 
         updateAiStatus(aiMsgId, getString(R.string.tool_generating_image, prompt))
-        val drawUi = ImageProgressUi(resultId, request).also {
-            it.expectSteps(request.steps)
-            it.onStart()
-        }
+        // Registered inside the same try that detaches it below: if anything
+        // between here and generate() threw, the engine would keep a listener
+        // pointing at a stopped ticker.
         imageEngine.setProgressListener(imageGenerationToken, drawUi)
         Log.i(TAG, "Image tool: drawing ${request.width}x${request.height} steps=${request.steps} cfg=${request.cfg}")
         CriticalLog.log("image", "tool generate start: native heap ${nativeHeapMb()} MB")
