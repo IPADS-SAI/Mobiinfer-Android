@@ -185,6 +185,9 @@
             android:layout_height="wrap_content"
             android:importantForAccessibility="no"
             android:orientation="horizontal"
+            android:paddingBottom="6dp"
+            android:clipChildren="false"
+            android:clipToPadding="false"
             android:gravity="start|center_vertical">
 
             <com.google.android.material.button.MaterialButton
@@ -193,7 +196,6 @@
                 android:layout_width="wrap_content"
                 android:layout_height="28dp"
                 android:layout_gravity="center_vertical"
-                android:layout_marginBottom="6dp"
                 android:minWidth="0dp"
                 android:minHeight="0dp"
                 android:insetTop="0dp"
