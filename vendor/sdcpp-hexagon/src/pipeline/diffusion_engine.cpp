@@ -140,6 +140,9 @@ void StableDiffusionGGML::capture_runner_sources() {
 }
 
 void StableDiffusionGGML::end_runners() {
+    // Dropping the conditioners below does not call runner_end() on them, and a
+    // released encoder must not stay unregistered past the end of the scope.
+    recover_text_encoder();
     if (cond_stage_model)
         cond_stage_model->runner_end();
     if (diffusion_model)
@@ -163,6 +166,78 @@ void StableDiffusionGGML::end_runners() {
     for (auto& lora : runtime_lora_models)
         if (lora.model)
             lora.model->runner_end();
+}
+
+void StableDiffusionGGML::release_text_encoder() {
+    if (cond_stage_model == nullptr || conditioner_released || model_manager == nullptr) {
+        return;
+    }
+    // The low-memory hook fires from inside a capacity refusal, which can happen
+    // during this encoder's own segment; runner_end() asserts on that.
+    if (!cond_stage_model->can_release_now()) {
+        LOG_VERBOSE("text encoder is mid-graph; not releasing it now");
+        return;
+    }
+    const int64_t t0 = ggml_time_ms();
+    cond_stage_model->release_resources();
+    const size_t released = model_manager->release_component_params(ModelComponent::Conditioner);
+    if (released == 0) {
+        // Nothing registered (unlikely) or in use; leave the flag clear so the
+        // next attempt retries instead of pair-recovering nothing.
+        LOG_WARN("text encoder weights could not be released now");
+        return;
+    }
+    conditioner_released = true;
+    LOG_INFO("released text encoder, %.2f MB in %.2fs",
+             released / (1024.0 * 1024.0),
+             (ggml_time_ms() - t0) / 1000.0);
+}
+
+void StableDiffusionGGML::recover_text_encoder() {
+    if (cond_stage_model == nullptr || !conditioner_released) {
+        return;
+    }
+    const int64_t t0 = ggml_time_ms();
+    // Required for the contract Conditioner::recover_resources relies on: the
+    // reload reports under the encoding phase, not as fresh weight loading.
+    // Restored on every path, including a throw from recover_resources.
+    struct StageRestore {
+        sd_progress_stage_t previous;
+        explicit StageRestore(sd_progress_stage_t prev) : previous(prev) {}
+        ~StageRestore() { sd_progress_set_stage(previous); }
+    } stage_restore(sd_progress_get_stage());
+    sd_progress_set_stage(SD_PROGRESS_STAGE_ENCODING);
+    try {
+        cond_stage_model->recover_resources(model_manager->loader().get_tensor_storage_map(), model_manager);
+    } catch (const std::exception& error) {
+        LOG_ERROR("text encoder could not be rebuilt: %s", error.what());
+        return;
+    }
+    // Registration is the commit point: only after it succeeds does the encoder
+    // count as resident again. On failure the flag stays set, so the next encode
+    // retries instead of using a half-registered conditioner.
+    if (!register_runner_params(ModelComponent::Conditioner, cond_stage_model, SDBackendModule::TE)) {
+        LOG_ERROR("failed to register the text encoder again");
+        return;
+    }
+    conditioner_released = false;
+    LOG_INFO("text encoder back in memory, taking %.2fs", (ggml_time_ms() - t0) / 1000.0);
+}
+
+void StableDiffusionGGML::setup_conditioner_low_memory_hooks() {
+    sd_low_memory_hooks_t hooks;
+    hooks.on_edge = [](void* user_data) -> size_t {
+        auto* sd = static_cast<StableDiffusionGGML*>(user_data);
+        sd->release_text_encoder();
+        return 0;
+    };
+    hooks.on_recover = [](void* user_data) {
+        static_cast<StableDiffusionGGML*>(user_data)->recover_text_encoder();
+    };
+    hooks.user_data = this;
+    // Ownership-aware: a second context must not take over the first one's
+    // hook, because the callback re-enters whichever context installed it.
+    LowMemoryHooksGuard::install(hooks);
 }
 
 bool StableDiffusionGGML::reset_runners(const RunnerGroups& groups) {
@@ -932,6 +1007,7 @@ bool StableDiffusionGGML::init(const sd_ctx_params_t* sd_ctx_params) {
     disable_segmented_compute = sd_ctx_params->disable_segmented_compute;
     eager_load                = sd_ctx_params->eager_load;
     release_conditioner_after_encode = sd_ctx_params->release_conditioner_after_encode;
+    keep_conditioner_after_encode    = sd_ctx_params->keep_conditioner_after_encode;
     backend_spec              = SAFE_STR(sd_ctx_params->backend);
     params_backend_spec       = SAFE_STR(sd_ctx_params->params_backend);
     split_mode_spec           = SAFE_STR(sd_ctx_params->split_mode);

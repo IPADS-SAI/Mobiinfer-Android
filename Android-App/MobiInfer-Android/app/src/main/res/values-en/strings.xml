@@ -329,6 +329,7 @@
     <string name="image_stage_encoding_title">Reading prompt</string>
     <string name="image_stage_sampling_title">Drawing</string>
     <string name="image_stage_decoding_title">Decoding</string>
+    <string name="image_stage_reloading_title">Loading text encoder</string>
     <string name="tool_reloading_model">Reloading the model…</string>
     <string name="image_progress_label_short">%1$d%% · %2$s</string>
     <string name="image_param_steps_hint">Denoising iterations, matched to the checkpoint: 8 for the 8-step turbo build, 4 for the 4-step distill build. Straying far from that degrades the image.</string>

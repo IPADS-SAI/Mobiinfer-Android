@@ -118,11 +118,43 @@ bool        sd_progress_is_uploading();
 enum sd_progress_stage_t {
     SD_PROGRESS_STAGE_SAMPLING = 0,
     SD_PROGRESS_STAGE_DECODING = 1,
+    SD_PROGRESS_STAGE_ENCODING = 2,
 };
 
 void sd_progress_set_stage(sd_progress_stage_t stage);
 sd_progress_stage_t sd_progress_get_stage();
 void* sd_get_progress_callback_data();
+
+// Called by the model loader when a load would not fit and the weights it
+// replaces (a text encoder mid-draw) have to be swapped out first, and once
+// the load fits again. Unlike the progress callback these are requested before
+// anything is evicted, so the receiver can still do something about it.
+struct sd_low_memory_hooks_t {
+    // Frees memory the swap can take back, before the loader evicts anything.
+    // Returns the bytes it could now ask for from the start.
+    size_t (*on_edge)(void* user_data) = nullptr;
+    // The load fits again; the receiver reloads whatever on_edge dropped.
+    void (*on_recover)(void* user_data) = nullptr;
+    void* user_data                     = nullptr;
+};
+
+void sd_set_low_memory_hooks(const sd_low_memory_hooks_t& hooks);
+
+// Call sites that notice a load will not fit report it here before giving up,
+// then retry after the receiver released what it could.
+struct LowMemoryHooksGuard {
+    static void edge();
+    static void recover();
+    // Install/remove only if the slot is free / owned by `user_data`, so a
+    // second context cannot hijack a hook that belongs to the first and a
+    // context being freed cannot clear someone else's.
+    static bool install(const sd_low_memory_hooks_t& hooks);
+    static void clear_for(void* user_data);
+    // True once edge() has run, so a caller that saw a load fail can tell
+    // whether the hooks already fired on its behalf (and therefore whether a
+    // retry is worth it). recover() clears it.
+    static bool engaged();
+};
 
 // Clears the pass counter; call once at the start of each generate_image() so
 // sample_pass numbers the sampling batches of that draw, not of the process.

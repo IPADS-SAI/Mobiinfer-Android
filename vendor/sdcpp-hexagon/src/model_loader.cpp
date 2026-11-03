@@ -1061,10 +1061,28 @@ std::vector<ggml_backend_buffer_t> ModelLoader::get_device_mmap_buffers() const 
     return buffers;
 }
 
+
 bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                                bool enable_mmap,
                                const std::set<std::string>* target_tensor_names,
                                bool log_progress) {
+    const bool ok = load_tensors_attempt(on_new_tensor_cb, enable_mmap, target_tensor_names, log_progress);
+    // The whole-model load either fits or fails; a fully-failed attempt is not
+    // retried here (the single-tensor path below is where a retry is cheap).
+    // Bring the encoder back so the caller sees the state it started with.
+    if (ok && LowMemoryHooksGuard::engaged()) {
+        LowMemoryHooksGuard::recover();
+    }
+    // A failed attempt keeps the hooks engaged: the caller retries (see
+    // ModelLoader::load_tensor) or the draw fails with the encoder still
+    // released, which the next request simply loads again.
+    return ok;
+}
+
+bool ModelLoader::load_tensors_attempt(on_new_tensor_cb_t on_new_tensor_cb,
+                                       bool enable_mmap,
+                                       const std::set<std::string>* target_tensor_names,
+                                       bool log_progress) {
     if (!validate_sources(target_tensor_names)) {
         return false;
     }
@@ -1075,6 +1093,7 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
     std::atomic<int64_t> copy_to_backend_time_ms(0);
     std::atomic<int64_t> convert_time_ms(0);
     std::atomic<uint64_t> bytes_processed(0);
+    std::atomic<bool> out_of_memory(false);
 
     int num_threads_to_use = n_threads_;
     const char* parallel_load_env = getenv("SD_HEXAGON_PARALLEL_LOAD");
@@ -1315,10 +1334,14 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                     char* read_buf    = nullptr;
                     char* target_buf  = nullptr;
                     char* convert_buf = nullptr;
+                    // Only a staging copy can run out of memory here; a host
+                    // destination is filled straight from the file.
+                    bool stages_copy = false;
                     if (dst_tensor->buffer == nullptr || ggml_backend_buffer_is_host(dst_tensor->buffer)) {
                         if (tensor_storage.type == dst_tensor->type) {
                             GGML_ASSERT(ggml_nbytes(dst_tensor) == tensor_storage.nbytes());
                             if (tensor_storage.is_f64 || tensor_storage.is_i64) {
+                                stages_copy = true;
                                 read_buffer.resize(tensor_storage.nbytes_to_read());
                                 read_buf = (char*)read_buffer.data();
                             } else {
@@ -1326,13 +1349,16 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                             }
                             target_buf = (char*)dst_tensor->data;
                         } else {
+                            stages_copy = true;
                             read_buffer.resize(std::max(tensor_storage.nbytes(), tensor_storage.nbytes_to_read()));
                             read_buf    = (char*)read_buffer.data();
                             target_buf  = read_buf;
                             convert_buf = (char*)dst_tensor->data;
                         }
                     } else {
-                        if (!direct_mapped_source) {
+                        // A direct-mapped source reads straight out of the mapping.
+                        stages_copy = !direct_mapped_source;
+                        if (stages_copy) {
                             read_buffer.resize(std::max(tensor_storage.nbytes(), tensor_storage.nbytes_to_read()));
                         }
                         read_buf   = (char*)read_buffer.data();
@@ -1348,6 +1374,20 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
                     if (direct_mapped_source) {
                         read_buf = reinterpret_cast<char*>(const_cast<uint8_t*>(mmapped->data() + tensor_storage.offset));
                         target_buf = read_buf;
+                    } else if (stages_copy) {
+                        // Running out of memory while staging means the same as
+                        // a residency refusal: the draw does not fit right now.
+                        try {
+                            if (!read_data(read_buf, nbytes_to_read)) {
+                                failed = true;
+                                break;
+                            }
+                        } catch (const std::bad_alloc&) {
+                            LOG_ERROR("read tensor data failed: out of memory staging '%s'", tensor_storage.name.c_str());
+                            out_of_memory = true;
+                            failed        = true;
+                            break;
+                        }
                     } else if (!read_data(read_buf, nbytes_to_read)) {
                         failed = true;
                         break;
@@ -1445,6 +1485,11 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb,
         }
     }
 
+    if (out_of_memory) {
+        LOG_WARN("loading stopped: not enough memory for a staging buffer");
+        return false;
+    }
+
     int64_t end_time = ggml_time_ms();
     if (log_progress) {
         LOG_INFO("loading tensors completed, taking %.2fs (read: %.2fs, memcpy: %.2fs, convert: %.2fs, copy_to_backend: %.2fs)",
@@ -1498,17 +1543,34 @@ bool ModelLoader::load_tensor(const TensorStorage& tensor_storage, ggml_tensor* 
         return true;
     };
 
-    if (!load_tensors(on_new_tensor_cb, false, &target_tensor_names, false)) {
-        LOG_ERROR("load tensor failed: '%s'", tensor_storage.name.c_str());
-        return false;
-    }
+    auto attempt = [&]() -> bool {
+        loaded = false;
+        if (!load_tensors(on_new_tensor_cb, false, &target_tensor_names, false)) {
+            LOG_ERROR("load tensor failed: '%s'", tensor_storage.name.c_str());
+            return false;
+        }
+        if (!loaded) {
+            LOG_ERROR("load tensor failed: tensor '%s' not found", tensor_storage.name.c_str());
+            return false;
+        }
+        return true;
+    };
 
-    if (!loaded) {
-        LOG_ERROR("load tensor failed: tensor '%s' not found", tensor_storage.name.c_str());
-        return false;
+    // The residency manager reports a load that does not fit before giving up;
+    // release what the hooks can spare and try once more.
+    bool ok = attempt();
+    // The residency manager calls edge() itself when it cannot make room, so a
+    // failed attempt has already tried that path; retry only when it actually
+    // fired, otherwise the same failure just costs a second scan.
+    if (!ok && LowMemoryHooksGuard::engaged()) {
+        LOG_WARN("loading '%s' did not fit: releasing what the residency hooks can spare, then retrying",
+                 tensor_storage.name.c_str());
+        ok = attempt();
     }
-
-    return true;
+    if (LowMemoryHooksGuard::engaged()) {
+        LowMemoryHooksGuard::recover();
+    }
+    return ok;
 }
 
 bool ModelLoader::load_float_tensor(const std::string& name,

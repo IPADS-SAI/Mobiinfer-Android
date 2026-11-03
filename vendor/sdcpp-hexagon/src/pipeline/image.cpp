@@ -154,6 +154,11 @@ namespace sd::pipeline {
                                                                                   const RefImageParams& ref_image_params) {
         int64_t prepare_start_ms = ggml_time_ms();
 
+        // The encoder is only needed while a prompt is encoded; this draw decodes
+        // images with the VAE before it encodes, so whatever freed it last gets
+        // it back first.
+        sd->recover_text_encoder();
+
         sd::Tensor<float> init_image_tensor;
         sd::Tensor<float> control_image_tensor;
         sd::Tensor<float> mask_image_tensor;
@@ -582,14 +587,18 @@ namespace sd::pipeline {
         int64_t t1 = ggml_time_ms();
         LOG_INFO("get_learned_condition completed, taking %.2fs", (t1 - prepare_start_ms) * 1.0f / 1000);
 
-        // The prompt is fully encoded at this point and nothing below touches the
-        // text encoder, so release it before the diffusion model starts. This is
-        // what makes a large TE affordable on a device: the DiT gets the memory.
-        if (sd->release_conditioner_after_encode && sd->cond_stage_model) {
-            conditioner_runner_end.release_now();
-            int64_t t_rel0 = ggml_time_ms();
-            sd->cond_stage_model->release_resources();
-            LOG_INFO("released text encoder, taking %.2fs", (ggml_time_ms() - t_rel0) * 1.0f / 1000);
+        // Encoded, so the prompt is in hand and the encoder is dead weight until
+        // the next request: it is released before the VAE and the DiT ask for
+        // memory, and loaded again by the next prompt. Two opt-ins reach here:
+        //   keep_conditioner_after_encode   - never release (this draw only)
+        //   release_conditioner_after_encode - the pre-existing public switch,
+        //     whose documented meaning is "free the encoder once the prompt is
+        //     encoded"; it now goes through the same recoverable path instead of
+        //     tearing the conditioner down, so a second prompt still works.
+        // Neither set: keep the previous behaviour of leaving the encoder alone.
+        (void) conditioner_runner_end;
+        if (sd->release_conditioner_after_encode && !sd->keep_conditioner_after_encode) {
+            sd->release_text_encoder();
         }
 
         ImageGenerationEmbeds embeds;
@@ -884,6 +893,12 @@ namespace sd::pipeline {
         // Pass numbering restarts here so a second draw in the same process
         // still reports sampling pass 1 and keeps its previews.
         sd_reset_preview_passes();
+        // The encoder is reloaded lazily since it was released after the previous
+        // prompt; that load reports through the progress channel and belongs to
+        // the encoding phase, not to weight loading. The stage moves to SAMPLING
+        // just before the denoiser runs; there is no idle value, and within one
+        // draw the phase only ever moves forward.
+        sd_progress_set_stage(SD_PROGRESS_STAGE_ENCODING);
 
         sd->rng->manual_seed(request.seed);
         sd->sampler_rng->manual_seed(request.seed);
@@ -939,6 +954,11 @@ namespace sd::pipeline {
             sd->rng->manual_seed(cur_seed);
             sd->sampler_rng->manual_seed(cur_seed);
             sd::Tensor<float> noise = sd::randn_like<float>(latents.init_latent, sd->rng);
+
+            // Every phase before this point (reloading the encoder, encoding,
+            // loading the DiT) is reported as encoding; the denoiser is where
+            // the progress channel starts counting steps.
+            sd_progress_set_stage(SD_PROGRESS_STAGE_SAMPLING);
 
             sd::Tensor<float> x_0 = sd->sample(sd->diffusion_model,
                                                true,
@@ -1161,6 +1181,9 @@ namespace sd::pipeline {
 
         int64_t t1 = ggml_time_ms();
         LOG_INFO("generate_image completed in %.2fs", (t1 - t0) * 1.0f / 1000);
+        // Back to the default so a context that outlives this draw (the CLI's
+        // next call, a model switch) does not report under "encoding".
+        sd_progress_set_stage(SD_PROGRESS_STAGE_SAMPLING);
         if (num_images_out != nullptr) {
             *num_images_out = num_images;
         }

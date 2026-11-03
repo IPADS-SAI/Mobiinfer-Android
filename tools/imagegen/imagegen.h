@@ -49,6 +49,16 @@ struct imagegen_params {
     // Free the TE params+buffers after the prompt is encoded (saves memory,
     // re-loads TE on the next prompt). Useful on memory-tight devices.
     bool release_te_after_encode;
+    // A draw drops the text encoder once the prompt is encoded and loads it
+    // again for the next prompt (its reload is reported as IMAGEGEN_STAGE_ENCODING).
+    // This keeps the encoder resident while the diffusion model runs, for hosts
+    // that would rather not pay the reload per prompt.
+    bool keep_te_after_encode;
+    // Per-module params backend, e.g. "diffusion=cpu,te=cpu,vae=cpu". Setting
+    // it disables sdcpp's auto-fit entirely (auto_fit_enabled requires an empty
+    // params_backend), so [backend] is used exactly as given. That is how the
+    // text encoder is pinned to the NPU while the diffusion weights stay in RAM.
+    const char * params_backend;
 
     // Called while the weights are being loaded, so a UI can show the first
     // part of the run instead of a spinner. Same stage/step convention as

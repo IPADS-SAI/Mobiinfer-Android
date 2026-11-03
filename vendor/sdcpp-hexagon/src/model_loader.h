@@ -88,6 +88,12 @@ protected:
     std::map<std::string, std::string> metadata_;
     int n_threads_;
 
+    // One load pass; load_tensors() adds the low-memory handling around it.
+    bool load_tensors_attempt(on_new_tensor_cb_t on_new_tensor_cb,
+                              bool use_mmap,
+                              const std::set<std::string>* target_tensor_names,
+                              bool log_progress);
+
     size_t add_file_path(const std::string& file_path);
     void add_tensor_storage(const TensorStorage& tensor_storage);
 

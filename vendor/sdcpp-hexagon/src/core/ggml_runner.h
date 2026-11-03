@@ -304,8 +304,20 @@ public:
     // first graph resident, so subclasses may inspect actual weight values.
     // Returns false to abort the compute.
     virtual bool on_params_ready(ggml_cgraph* graph) { return true; }
+    // True while compute() owns this runner's graph; runner_end() asserts on it.
+    bool graph_active() const { return graph_active_; }
 
     void reset_compute_ctx();
+
+    // True while the parameter context still exists. A runner whose weights
+    // have been swapped out has lost it; see Conditioner::release_resources.
+    bool params_ctx_alive() const { return params_ctx != nullptr; }
+
+    // Recreates the parameter context after release_resources() dropped it.
+    // Only tensor shapes are rebuilt: the weights stay wherever the residency
+    // manager put them and the next compute() loads them lazily, exactly as on
+    // the model's first use.
+    void recover_params_ctx();
 
 public:
     void free_cache_ctx_and_buffer();

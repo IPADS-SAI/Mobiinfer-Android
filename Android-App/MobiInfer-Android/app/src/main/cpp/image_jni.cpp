@@ -21,6 +21,7 @@
 #include <ctime>
 #include <mutex>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <string>
 
@@ -211,6 +212,10 @@ Java_com_mobiinfer_demo_ImageEngine_nativeInit(
     params.n_threads            = nThreads;
     params.backend              = be.empty() ? nullptr : be.c_str();
     params.enable_mmap          = true;
+    // The encoder is released once the prompt is encoded and reloaded for the
+    // next prompt: on this device the diffusion model cannot fit beside it on
+    // the DSP.
+    params.release_te_after_encode = true;
     // Weight loading reports through the same listener the draw uses, so the
     // progress bar starts at 0 instead of appearing at "loading done".
     params.on_load_step         = step_trampoline;
