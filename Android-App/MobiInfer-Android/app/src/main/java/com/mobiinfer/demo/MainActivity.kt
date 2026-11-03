@@ -1120,7 +1120,7 @@ class MainActivity : AppCompatActivity() {
                     vaePath = LlamaEngine.imageVaePath(ctx, imageModel),
                     tokenizerPath = LlamaEngine.imageTokenizerPath(ctx, imageModel),
                     nThreads = 0,
-                    backend = "diffusion=HTP0,te=cpu,vae=HTP0"
+                    backend = "diffusion=HTP0,te=HTP0,vae=HTP0"
                 )
             }
         } finally {
@@ -1545,6 +1545,9 @@ class MainActivity : AppCompatActivity() {
         // only says so once denoising starts, which is too late for the
         // estimate of the phases before it.
         private var expectedSteps = 0
+        // Whether the reload label was used for an encoder that is faulted back
+        // in during this draw (see onStep).
+        private var reloadLabelSeen = false
 
         private var lastPreviewStep = -1
         private var lastPreviewMs = 0L
@@ -1602,8 +1605,17 @@ class MainActivity : AppCompatActivity() {
                     // upload flag: honouring them relabelled ~9 s of encoding as
                     // weight loading, and the phase text never showed
                     // "理解提示词" at all.
-                    if (currentStage == ImageEngine.STAGE_LOADING) {
+                    //
+                    // The one exception is the draw's first encoder event: the
+                    // previous draw released the encoder and this one has to
+                    // fault it back in before it can encode, which is what the
+                    // reloading label is for. Later loading events stay inside
+                    // the encoding phase.
+                    if (currentStage == ImageEngine.STAGE_LOADING ||
+                        (!reloadLabelSeen && encodingStartedAt > 0L && samplingStartedAt == 0L)
+                    ) {
                         enterStage(ImageEngine.STAGE_LOADING)
+                        reloadLabelSeen = true
                     }
                 }
                 ImageEngine.STAGE_SAMPLING -> {
@@ -1684,7 +1696,8 @@ class MainActivity : AppCompatActivity() {
             // Phases only move forward. The text encoder loads its own weights
             // lazily while it runs, and those events arrive as LOADING; without
             // this the label went back to "loading weights" in the middle of
-            // encoding and never showed "理解提示词".
+            // encoding and never showed "理解提示词". The single reload label is
+            // decided in onStep().
             if (stage == ImageEngine.STAGE_LOADING && currentStage != ImageEngine.STAGE_LOADING) return
             currentStage = stage
             // The tick keeps running across every phase now: it is the only
@@ -1694,6 +1707,9 @@ class MainActivity : AppCompatActivity() {
                 // The encoder's own clock starts here. It must not reuse
                 // startedAt, which already includes the weight loading.
                 ImageEngine.STAGE_ENCODING -> if (encodingStartedAt == 0L) encodingStartedAt = now
+                // Reloading is part of the encoding the user waits for, so it
+                // shares the encoder's clock rather than starting a new phase.
+                ImageEngine.STAGE_RELOADING -> if (encodingStartedAt == 0L) encodingStartedAt = now
                 ImageEngine.STAGE_SAMPLING -> if (samplingStartedAt == 0L) samplingStartedAt = now
                 ImageEngine.STAGE_DECODING -> if (decodeStartedAt == 0L) decodeStartedAt = now
             }
@@ -1706,6 +1722,7 @@ class MainActivity : AppCompatActivity() {
 
         private fun currentStageTitleFor(stage: Int): Int = when (stage) {
             ImageEngine.STAGE_ENCODING -> R.string.image_stage_encoding_title
+            ImageEngine.STAGE_RELOADING -> R.string.image_stage_reloading_title
             ImageEngine.STAGE_SAMPLING -> R.string.image_stage_sampling_title
             ImageEngine.STAGE_DECODING -> R.string.image_stage_decoding_title
             else -> R.string.image_stage_loading_title

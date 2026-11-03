@@ -103,6 +103,31 @@ void imagegen_trace(const char * fmt, ...) {
     g_trace_cb(msg, g_trace_data);
 }
 
+// sdcpp drops every LOG_* line unless a log callback is installed
+// (sd_log_dispatch returns early on a null callback), so without this the
+// phase boundaries and memory accounting only exist in the source. Forwarded
+// through the same trace hook the JNI layer writes to pipeline.log.
+// `text` arrives with a trailing newline; every newline is folded to a space so
+// the log stays one line per event. Messages longer than the buffer are
+// truncated by snprintf rather than dropped.
+void sdcpp_log_bridge(sd_log_level_t level, const char * text, void * /*data*/) {
+    if (text == nullptr || g_trace_cb == nullptr) {
+        return;
+    }
+    char msg[512];
+    std::snprintf(msg, sizeof(msg), "[sdcpp:%s] %s",
+                  level == SD_LOG_ERROR   ? "E"
+                  : level == SD_LOG_WARN  ? "W"
+                                          : "I",
+                  text);
+    for (char * c = msg; *c != '\0'; ++c) {
+        if (*c == '\n' || *c == '\r') {
+            *c = ' ';
+        }
+    }
+    g_trace_cb(msg, g_trace_data);
+}
+
 // Keeps the preview cheap: latent-resolution RGB is blown up by
 // preview_latent_video(), a 64 px long side is plenty for a progress thumbnail
 // and keeps the JNI copy at ~12 KB.
@@ -281,6 +306,10 @@ imagegen_ctx * imagegen_init(const imagegen_params * params) {
         return nullptr;
     }
 
+    // Before new_sd_ctx(): the weight accounting, the backend setup and the
+    // tokenizer/version detection all log while the context is being built.
+    sd_set_log_callback(sdcpp_log_bridge, nullptr);
+
     sd_ctx_params_t sp;
     sd_ctx_params_init(&sp);
 
@@ -299,6 +328,37 @@ imagegen_ctx * imagegen_init(const imagegen_params * params) {
         sp.backend = params->backend;
     }
     sp.enable_mmap                  = params->enable_mmap;
+    // The TE's params must live on the same device it computes on. With
+    // te=HTP0 and te's params on the CPU, every segment stages a second copy
+    // into the DSP and the first one alone overflows the mapping window
+    // (measured: 3842 MB needed vs 3489 MB available). Naming HTP0 for te's
+    // params makes stage_tensors_to_compute_backend a no-op for the encoder.
+    // Setting params_backend disables sdcpp's auto-fit entirely, so the DiT and
+    // VAE choices auto-fit used to make are spelled out as well.
+    //
+    // The DiT streams from the model file (diffusion=disk) rather than staying
+    // resident in RAM. Measured on a 16 GB device with the FP16 DiT (10.16 GB
+    // against a 4 GiB DSP): RAM-resident runs re-uploaded a whole segment every
+    // step and evicted 472 times, 8374 ms/step; streaming evicts once and takes
+    // 4309 ms/step. Holding those weights resident leaves them competing with
+    // the page cache, so each re-upload re-faults them from storage. A model
+    // that does fit the DSP entirely is not slowed down by this (Q4: 558 ms
+    // resident vs 574 ms streaming, within noise).
+    //
+    // Only derived when the caller actually asked for the encoder on the NPU:
+    // naming HTP0 unconditionally would break every CPU/Vulkan caller and any
+    // build without the Hexagon backend, since a params spec that names an
+    // absent device fails context creation. Callers that say nothing keep
+    // sdcpp's auto-fit.
+    static std::string derived_params_backend;
+    derived_params_backend.clear();
+    if (params->params_backend != nullptr && params->params_backend[0] != '\0') {
+        sp.params_backend = params->params_backend;
+    } else if (params->backend != nullptr &&
+               std::string(params->backend).find("te=HTP") != std::string::npos) {
+        derived_params_backend = "diffusion=disk,te=HTP0,vae=cpu";
+        sp.params_backend      = derived_params_backend.c_str();
+    }
     // Direct conv is on by default here. sdcpp's probe only accepts it on Vulkan,
     // MUSA and CUDA/ROCm, so on HTP it would never be chosen on its own; the
     // kernel is validated on this device, and the im2col path it replaces is the
@@ -314,6 +374,7 @@ imagegen_ctx * imagegen_init(const imagegen_params * params) {
     } else {
         sp.conv_direct_mode = kDefaultConvDirectMode;
     }
+    sp.keep_conditioner_after_encode = params->keep_te_after_encode;
     // Releasing the encoder frees its weights before the diffusion stage, at the
     // cost of re-faulting them on the next encode. Worth setting only where the
     // whole stack would not otherwise fit; callers on this device leave it off.
@@ -405,6 +466,8 @@ bool imagegen_generate(imagegen_ctx * ctx,
         // Tile geometry is left at the sdcpp defaults: a larger tile costs more
         // per forward pass than the reduced tile count saves, and a smaller
         // overlap does not change the tile count at the sizes used here.
+        // (Measured: raising it to 512 px took a 1024x1024 decode from 38 s to
+        // 654 s, so the default stands.)
     }
 
     // This API version has no per-step callback; the callback is only used to

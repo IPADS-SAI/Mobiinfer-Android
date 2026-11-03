@@ -342,6 +342,7 @@ void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     sd_ctx_params->batched_cfg               = true;
     sd_ctx_params->eager_load                = false;
     sd_ctx_params->release_conditioner_after_encode = false;
+    sd_ctx_params->keep_conditioner_after_encode     = false;
     sd_ctx_params->enable_mmap               = false;
     sd_ctx_params->flash_attn_mode           = nullptr;
     sd_ctx_params->conv_direct_mode          = nullptr;
@@ -404,6 +405,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              "flash_attn: %s\n"
              "flash_attn_mode: %s\n"
              "release_conditioner_after_encode: %s\n"
+             "keep_conditioner_after_encode: %s\n"
              "conv_direct_mode: %s\n"
              "diffusion_flash_attn: %s\n"
              "sage_attn: %s\n"
@@ -448,6 +450,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              BOOL_STR(sd_ctx_params->flash_attn),
              sd_ctx_params->flash_attn_mode && sd_ctx_params->flash_attn_mode[0] ? sd_ctx_params->flash_attn_mode : "auto (legacy flags honored)",
              sd_ctx_params->release_conditioner_after_encode ? "true" : "false",
+             sd_ctx_params->keep_conditioner_after_encode ? "true" : "false",
              sd_ctx_params->conv_direct_mode && sd_ctx_params->conv_direct_mode[0] ? sd_ctx_params->conv_direct_mode : "auto (legacy flags honored)",
              BOOL_STR(sd_ctx_params->diffusion_flash_attn),
              BOOL_STR(sd_ctx_params->sage_attn),
@@ -666,11 +669,16 @@ sd_ctx_t* new_sd_ctx(const sd_ctx_params_t* sd_ctx_params) {
         free(sd_ctx);
         return nullptr;
     }
+    // The context that survives a load that does not fit receives the low
+    // memory edge and reloads what it released (see sd_set_low_memory_hooks).
+    sd_ctx->sd->setup_conditioner_low_memory_hooks();
     return sd_ctx;
 }
 
 void free_sd_ctx(sd_ctx_t* sd_ctx) {
     if (sd_ctx->sd != nullptr) {
+        // Only drop the hook if this context owns it.
+        LowMemoryHooksGuard::clear_for(sd_ctx->sd);
         delete sd_ctx->sd;
         sd_ctx->sd = nullptr;
     }

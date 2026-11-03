@@ -458,6 +458,12 @@ bool GGMLRunner::assign_graph_cut_layer_split_backends(ggml_cgraph* gf) {
     return true;
 }
 
+void GGMLRunner::recover_params_ctx() {
+    if (params_ctx == nullptr && !graph_active_) {
+        alloc_params_ctx();
+    }
+}
+
 bool GGMLRunner::runner_start() {
     if (runner_started_) {
         return true;
@@ -702,6 +708,34 @@ std::optional<sd::Tensor<float>> GGMLRunner::compute(get_graph_cb_t get_graph,
         return std::nullopt;
     }
     const int64_t t_exec_end = PROFILE_SEGMENTS_NOW();
+    // Always reported: wstart vs sched is the upload/compute split for every
+    // phase, and the counters it needs are cheap.
+    // Device-side memory: the DSP's allocations are invisible to the host
+    // process (they never enter VmHWM and /sys/kernel/dmabuf needs root), so
+    // this is the only place they can be observed.
+    std::string dev_mem;
+    if (auto residency = residency_manager.lock()) {
+        if (runtime_backend != nullptr) {
+            const auto stats = residency->device_memory_stats(runtime_backend);
+            if (stats.reported_total > 0 || stats.tracked_resident > 0) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), " | dev %s free=%.0fMB total=%.0fMB resident=%.0fMB",
+                         ggml_backend_name(runtime_backend),
+                         stats.reported_free / 1048576.0,
+                         stats.reported_total / 1048576.0,
+                         stats.tracked_resident / 1048576.0);
+                dev_mem = buf;
+            }
+        }
+    }
+    LOG_INFO("[seg] %s exec=%.1fms segs=%llu wstart=%.1f sched=%.1f%s | meas=%.1f prep=%.1f build=%.1f bind=%.1f alloc=%.1f copyin=%.1f enq=%.1f wsend=%.1f prune=%.1f cache=%.1f sync=%.1f",
+             get_desc().c_str(), (t_exec_end - t_exec_start) / 1000.0,
+             (unsigned long long) g_seg_count, g_seg_wstart_us / 1000.0,
+             g_sched_compute_us / 1000.0, dev_mem.c_str(),
+             g_seg_measure_us / 1000.0, g_seg_prep_us / 1000.0, g_seg_build_us / 1000.0,
+             g_seg_bind_us / 1000.0, g_seg_alloc_us / 1000.0, g_seg_copyin_us / 1000.0,
+             g_seg_enqueue_us / 1000.0, g_seg_wsend_us / 1000.0, g_seg_prune_us / 1000.0,
+             g_seg_cache_us / 1000.0, g_seg_sync_us / 1000.0);
     if (getenv("SD_PROFILE_PHASES")) {
         int64_t wait_us = 0;
         for (size_t ri = 0; ri < ggml_backend_reg_count(); ri++) {

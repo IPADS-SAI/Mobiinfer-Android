@@ -641,6 +641,31 @@ class LlamaEngine private constructor(
             hasExtraFile(context, name) &&
                 prefs(context).getBoolean(extraOwnerKey(model.id, name), false)
 
+        /**
+         * Claims [name] for [model] when a sibling model already installed the
+         * shared copy, so switching to a checkpoint whose 5.6 GB of accessories
+         * are already on disk does not present itself as "not downloaded".
+         *
+         * The claim used to be written only from the download path, which made
+         * completeness depend on the user having pressed Download at least once
+         * for *that* model: a model selected some other way (a preset switch, a
+         * restored selection) stayed permanently incomplete even though every
+         * byte was present, and its only remedy was fetching them again.
+         *
+         * Two things keep this honest:
+         *  - the file must be fully present (non-empty, no `.part` beside it),
+         *    which [hasExtraFile] already checks;
+         *  - no download of that name may be in flight, otherwise the claim
+         *    would adopt a half-written file that the writer is still replacing.
+         */
+        private fun adoptIfAlreadyInstalled(context: Context, model: ModelInfo, name: String) {
+            if (prefs(context).getBoolean(extraOwnerKey(model.id, name), false)) return
+            if (liveSharedDownloads.contains(name)) return
+            if (!hasExtraFile(context, name)) return
+            claimExtraFile(context, model, name)
+            Log.i(TAG, "Adopted shared $name for ${model.id}: already installed")
+        }
+
         private fun extraOwnerKey(modelId: String, name: String): String =
             "$KEY_SHARED_EXTRA.$modelId.$name"
 
@@ -787,7 +812,10 @@ class LlamaEngine private constructor(
             if (missingExpertFile(context, model) != null) return false
             if (!File(dir, model.ggufFileName).exists()) return false
             if (model.extraFiles.isNotEmpty()) {
-                return model.extraFiles.all { hasExtraFile(context, model, it) }
+                return model.extraFiles.all { name ->
+                    adoptIfAlreadyInstalled(context, model, name)
+                    hasExtraFile(context, model, name)
+                }
             }
             if (model.isTextOnly) return true
             if (model.isTts) {

@@ -40,6 +40,17 @@ struct DeviceResidencyManager {
     virtual ~DeviceResidencyManager() = default;
 
     virtual bool segmented_compute_enabled() const                                          = 0;
+    // Device-side view of the backend's memory: what the backend reports as
+    // free/total for its device, and how much the manager has accounted for
+    // there. The DSP's own allocations never show up in the process's VmHWM, so
+    // this is the only way to see them without root. Defaults are all zero for
+    // backends that cannot report.
+    struct DeviceMemoryStats {
+        size_t reported_free   = 0;
+        size_t reported_total  = 0;
+        size_t tracked_resident = 0;
+    };
+    virtual DeviceMemoryStats device_memory_stats(ggml_backend_t /*backend*/) const { return {}; }
     virtual bool prefetch_enabled() const                                                   = 0;
     virtual void set_workspace_reclaimer(uintptr_t owner_id, std::function<bool()> reclaim) = 0;
     virtual void remove_runtime_owner(uintptr_t owner_id)                                   = 0;

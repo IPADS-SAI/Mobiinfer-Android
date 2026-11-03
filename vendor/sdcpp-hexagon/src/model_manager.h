@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <list>
+#include <mutex>
 #include <map>
 #include <memory>
 #include <set>
@@ -147,6 +148,13 @@ private:
     size_t compute_backend_alloc_size(const std::vector<TensorState*>& states,
                                       bool missing_only) const;
     size_t compute_backend_resident_bytes(ggml_backend_t compute_backend) const;
+    // Device-reported free/total for the backend's device. These are the only
+    // view of DSP memory available without root: the DSP's allocations never
+    // appear in the app's VmHWM, and /sys/kernel/dmabuf needs root.
+    void compute_backend_device_memory(ggml_backend_t compute_backend,
+                                       size_t& free_bytes,
+                                       size_t& total_bytes) const;
+    DeviceMemoryStats device_memory_stats(ggml_backend_t backend) const override;
     struct CapacityCheck {
         size_t required_device_bytes  = 0;
         size_t required_budget_bytes  = 0;
@@ -229,6 +237,12 @@ public:
 
     bool unregister_param_tensors(ModelComponent component,
                                   size_t* registered_tensor_size = nullptr);
+
+    // Drops every buffer and every weight of [component] so another component
+    // can use the memory; a runner that keeps its shapes can register and load
+    // them again later. Refused while any of them is in use, and returns the
+    // bytes released.
+    size_t release_component_params(ModelComponent component);
 
     template <typename Runner>
     bool register_runner_params(ModelComponent component,

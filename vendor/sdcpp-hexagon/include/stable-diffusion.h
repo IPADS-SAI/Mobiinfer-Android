@@ -257,6 +257,7 @@ typedef struct {
     const char* flash_attn_mode;  // on/off/auto or module assignments (e.g. "auto,te=off"); NULL/empty honors legacy flags.
     const char* conv_direct_mode;  // on/off/auto or diffusion/vae/controlnet assignments; NULL/empty honors legacy flags.
     bool release_conditioner_after_encode;  // Free the text encoder's params and runtime buffers once the prompt is encoded; the TE is reloaded on the next prompt
+    bool keep_conditioner_after_encode;     // Keep the text encoder's weights resident after the prompt is encoded (default false: a draw releases them so the VAE and the diffusion model get the memory, and the next prompt loads them again)
 } sd_ctx_params_t;
 
 typedef struct {

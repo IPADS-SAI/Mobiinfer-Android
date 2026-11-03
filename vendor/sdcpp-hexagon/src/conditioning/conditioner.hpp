@@ -163,7 +163,73 @@ public:
     // weights resident while the diffusion model runs. The next get_learned_condition
     // reloads them on demand.
     virtual void release_resources() {}
+    // False while the conditioner is mid-graph (runner_end() asserts on that).
+    virtual bool can_release_now() const { return true; }
+    // Called once the memory is free again. Rebuilds what release_resources()
+    // dropped; overloads that keep their runner only need to restore the
+    // parameter context.
+    virtual void recover_resources(const String2TensorStorage& tensor_storage_map,
+                                   std::shared_ptr<RunnerWeightManager> weight_manager) {}
+
+    // Configuration the pipeline applies after construction. An overload of
+    // recover_resources() that has to build a fresh runner gets none of it from
+    // the constructor, so the setters record what was asked for and
+    // recover_resources() replays it through this. Without that a second draw
+    // would silently run with different math (no flash attention), default
+    // scaling, and no graph memory limit.
+    struct RunnerConfig {
+        bool  has_max_graph_vram = false;
+        size_t max_graph_vram_bytes = 0;
+        bool  has_runtime_backends = false;
+        std::vector<ggml_backend_t> runtime_backends;
+        bool  has_layer_split = false;
+        bool  layer_split_enabled = false;
+        bool  has_layer_split_limits = false;
+        std::vector<size_t> layer_split_limits;
+        bool  has_flash_attention = false;
+        bool  flash_attention_enabled = false;
+        bool  has_scales = false;
+        float linear_scale = 1.0f;
+        float attn_scale   = 1.0f;
+        bool  has_weight_adapter = false;
+        std::shared_ptr<WeightAdapter> weight_adapter;
+    };
+    RunnerConfig runner_config_;
+
+    // Re-applies runner_config_ to a freshly built conditioner. Call at the end
+    // of every recover_resources() overload that reconstructs runners.
+    void replay_runner_config() {
+        if (runner_config_.has_max_graph_vram) {
+            set_max_graph_vram_bytes(runner_config_.max_graph_vram_bytes);
+        }
+        if (runner_config_.has_runtime_backends) {
+            set_runtime_backends(runner_config_.runtime_backends);
+        }
+        if (runner_config_.has_layer_split) {
+            set_graph_cut_layer_split_enabled(runner_config_.layer_split_enabled);
+        }
+        if (runner_config_.has_layer_split_limits) {
+            set_graph_cut_layer_split_backend_vram_limits(runner_config_.layer_split_limits);
+        }
+        if (runner_config_.has_flash_attention) {
+            set_flash_attention_enabled(runner_config_.flash_attention_enabled);
+        }
+        if (runner_config_.has_scales) {
+            set_scale_overrides(runner_config_.linear_scale, runner_config_.attn_scale);
+        }
+        if (runner_config_.has_weight_adapter) {
+            set_weight_adapter(runner_config_.weight_adapter);
+        }
+    }
 };
+
+// Only the parameter context is dropped for a runner that is still alive: its
+// shapes are rebuilt, the weights are loaded by the next compute().
+static inline void restore_runner_params_ctx(GGMLRunner& runner) {
+    if (!runner.params_ctx_alive()) {
+        runner.recover_params_ctx();
+    }
+}
 
 // ldm.modules.encoders.modules.FrozenCLIPEmbedder
 // Ref: https://github.com/AUTOMATIC1111/stable-diffusion-webui/blob/cad87bf4e3e0b0a759afa94e933527c3123d59bc/modules/sd_hijack_clip.py#L283
@@ -179,6 +245,9 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
     std::vector<uint8_t> token_embed_custom2;
     std::map<std::string, std::pair<int, int>> embedding_pos_map;
 
+    ggml_backend_t model_backend      = nullptr;
+    bool model_force_f32              = false;
+
     int resolve_clip_skip(int value) const override {
         return value > 0 ? value : ((sd_version_is_sd2(version) || sd_version_is_sdxl(version)) ? 2 : 1);
     }
@@ -189,7 +258,8 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
                                       SDVersion version                                   = VERSION_SD1,
                                       std::shared_ptr<RunnerWeightManager> weight_manager = nullptr,
                                       const TokenizerConfig& tokenizers                   = {})
-        : version(version) {
+        : version(version),
+          model_backend(backend) {
         const int pad_id = sd_version_is_sd2(version) ? 0 : 49407;
         tokenizer        = tokenizers.create(TokenizerConfig::MAIN, 49408, pad_id, false, true);
         if (!tokenizer) {
@@ -201,6 +271,7 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
             tokenizer->add_special_token(name);
         }
         bool force_clip_f32 = !embedding_map.empty();
+        model_force_f32     = force_clip_f32;
         if (sd_version_is_sd1(version)) {
             text_model = std::make_shared<CLIPTextModelRunner>(backend, tensor_storage_map, "cond_stage_model.transformer.text_model", OPENAI_CLIP_VIT_L_14, true, force_clip_f32, weight_manager);
         } else if (sd_version_is_sd2(version)) {
@@ -219,6 +290,8 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
     }
 
     void set_max_graph_vram_bytes(size_t max_vram_bytes) override {
+        runner_config_.has_max_graph_vram   = true;
+        runner_config_.max_graph_vram_bytes = max_vram_bytes;
         text_model->set_max_graph_vram_bytes(max_vram_bytes);
         if (sd_version_is_sdxl(version)) {
             text_model2->set_max_graph_vram_bytes(max_vram_bytes);
@@ -247,6 +320,8 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
     }
 
     void set_flash_attention_enabled(bool enabled) override {
+        runner_config_.has_flash_attention       = true;
+        runner_config_.flash_attention_enabled = enabled;
         text_model->set_flash_attention_enabled(enabled);
         if (sd_version_is_sdxl(version)) {
             text_model2->set_flash_attention_enabled(enabled);
@@ -254,6 +329,9 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
     }
 
     void set_scale_overrides(float linear_scale, float attn_scale) override {
+        runner_config_.has_scales   = true;
+        runner_config_.linear_scale = linear_scale;
+        runner_config_.attn_scale   = attn_scale;
         text_model->set_scale_overrides(linear_scale, attn_scale);
         if (sd_version_is_sdxl(version)) {
             text_model2->set_scale_overrides(linear_scale, attn_scale);
@@ -261,6 +339,8 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
     }
 
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
+        runner_config_.has_weight_adapter = true;
+        runner_config_.weight_adapter     = adapter;
         text_model->set_weight_adapter(adapter);
         if (sd_version_is_sdxl(version)) {
             text_model2->set_weight_adapter(adapter);
@@ -272,6 +352,30 @@ struct FrozenCLIPEmbedderWithCustomWords : public Conditioner {
         if (sd_version_is_sdxl(version)) {
             text_model2->runner_end();
         }
+    }
+
+    void release_resources() override {
+        restore_runner_params_ctx(*text_model);
+        if (sd_version_is_sdxl(version)) {
+            restore_runner_params_ctx(*text_model2);
+        }
+    }
+
+    void recover_resources(const String2TensorStorage& tensor_storage_map,
+                           std::shared_ptr<RunnerWeightManager> weight_manager) override {
+        if (sd_version_is_sd1(version)) {
+            text_model = std::make_shared<CLIPTextModelRunner>(model_backend, tensor_storage_map, "cond_stage_model.transformer.text_model", OPENAI_CLIP_VIT_L_14, true, model_force_f32, weight_manager);
+        } else if (sd_version_is_sd2(version)) {
+            text_model = std::make_shared<CLIPTextModelRunner>(model_backend, tensor_storage_map, "cond_stage_model.transformer.text_model", OPEN_CLIP_VIT_H_14, true, model_force_f32, weight_manager);
+        } else if (sd_version_is_sdxl(version)) {
+            text_model  = std::make_shared<CLIPTextModelRunner>(model_backend, tensor_storage_map, "cond_stage_model.transformer.text_model", OPENAI_CLIP_VIT_L_14, false, model_force_f32, weight_manager);
+            text_model2 = std::make_shared<CLIPTextModelRunner>(model_backend, tensor_storage_map, "cond_stage_model.1.transformer.text_model", OPEN_CLIP_VIT_BIGG_14, false, model_force_f32, weight_manager);
+        }
+        restore_runner_params_ctx(*text_model);
+        if (text_model2) {
+            restore_runner_params_ctx(*text_model2);
+        }
+        replay_runner_config();
     }
 
     bool load_embedding(std::string embd_name, std::string embd_path, std::vector<int32_t>& bpe_tokens) {
@@ -657,12 +761,15 @@ struct SD3CLIPEmbedder : public Conditioner {
     std::shared_ptr<CLIPTextModelRunner> clip_g;
     std::shared_ptr<T5Runner> t5;
 
+    ggml_backend_t model_backend = nullptr;
+
     int resolve_clip_skip(int value) const override { return value > 0 ? value : 2; }
 
     SD3CLIPEmbedder(ggml_backend_t backend,
                     const String2TensorStorage& tensor_storage_map      = {},
                     std::shared_ptr<RunnerWeightManager> weight_manager = nullptr,
-                    const TokenizerConfig& tokenizers                   = {}) {
+                    const TokenizerConfig& tokenizers                   = {})
+        : model_backend(backend) {
         bool use_clip_l = false;
         bool use_clip_g = false;
         bool use_t5     = false;
@@ -711,6 +818,8 @@ struct SD3CLIPEmbedder : public Conditioner {
     }
 
     void set_max_graph_vram_bytes(size_t max_vram_bytes) override {
+        runner_config_.has_max_graph_vram   = true;
+        runner_config_.max_graph_vram_bytes = max_vram_bytes;
         if (clip_l) {
             clip_l->set_max_graph_vram_bytes(max_vram_bytes);
         }
@@ -764,7 +873,35 @@ struct SD3CLIPEmbedder : public Conditioner {
         }
     }
 
+    void release_resources() override {
+        if (clip_l) {
+            restore_runner_params_ctx(*clip_l);
+        }
+        if (clip_g) {
+            restore_runner_params_ctx(*clip_g);
+        }
+        if (t5) {
+            restore_runner_params_ctx(*t5);
+        }
+    }
+
+    void recover_resources(const String2TensorStorage& tensor_storage_map,
+                           std::shared_ptr<RunnerWeightManager> weight_manager) override {
+        if (clip_l) {
+            clip_l = std::make_shared<CLIPTextModelRunner>(model_backend, tensor_storage_map, "text_encoders.clip_l.transformer.text_model", OPENAI_CLIP_VIT_L_14, false, false, weight_manager);
+        }
+        if (clip_g) {
+            clip_g = std::make_shared<CLIPTextModelRunner>(model_backend, tensor_storage_map, "text_encoders.clip_g.transformer.text_model", OPEN_CLIP_VIT_BIGG_14, false, false, weight_manager);
+        }
+        if (t5) {
+            t5 = std::make_shared<T5Runner>(model_backend, tensor_storage_map, "text_encoders.t5xxl.transformer", false, weight_manager);
+        }
+        replay_runner_config();
+    }
+
     void set_flash_attention_enabled(bool enabled) override {
+        runner_config_.has_flash_attention       = true;
+        runner_config_.flash_attention_enabled = enabled;
         if (clip_l) {
             clip_l->set_flash_attention_enabled(enabled);
         }
@@ -777,6 +914,9 @@ struct SD3CLIPEmbedder : public Conditioner {
     }
 
     void set_scale_overrides(float linear_scale, float attn_scale) override {
+        runner_config_.has_scales   = true;
+        runner_config_.linear_scale = linear_scale;
+        runner_config_.attn_scale   = attn_scale;
         if (clip_l) {
             clip_l->set_scale_overrides(linear_scale, attn_scale);
         }
@@ -789,6 +929,8 @@ struct SD3CLIPEmbedder : public Conditioner {
     }
 
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
+        runner_config_.has_weight_adapter = true;
+        runner_config_.weight_adapter     = adapter;
         if (clip_l) {
             clip_l->set_weight_adapter(adapter);
         }
@@ -1099,14 +1241,16 @@ struct FluxCLIPEmbedder : public Conditioner {
     T5UniGramTokenizer t5_tokenizer;
     std::shared_ptr<CLIPTextModelRunner> clip_l;
     std::shared_ptr<T5Runner> t5;
-    size_t chunk_len = 256;
+    size_t chunk_len             = 256;
+    ggml_backend_t model_backend = nullptr;
 
     int resolve_clip_skip(int value) const override { return value > 0 ? value : 2; }
 
     FluxCLIPEmbedder(ggml_backend_t backend,
                      const String2TensorStorage& tensor_storage_map      = {},
                      std::shared_ptr<RunnerWeightManager> weight_manager = nullptr,
-                     const TokenizerConfig& tokenizers                   = {}) {
+                     const TokenizerConfig& tokenizers                   = {})
+        : model_backend(backend) {
         bool use_clip_l = false;
         bool use_t5     = false;
         for (auto pair : tensor_storage_map) {
@@ -1149,6 +1293,8 @@ struct FluxCLIPEmbedder : public Conditioner {
     }
 
     void set_max_graph_vram_bytes(size_t max_vram_bytes) override {
+        runner_config_.has_max_graph_vram   = true;
+        runner_config_.max_graph_vram_bytes = max_vram_bytes;
         if (clip_l) {
             clip_l->set_max_graph_vram_bytes(max_vram_bytes);
         }
@@ -1191,6 +1337,8 @@ struct FluxCLIPEmbedder : public Conditioner {
     }
 
     void set_flash_attention_enabled(bool enabled) override {
+        runner_config_.has_flash_attention       = true;
+        runner_config_.flash_attention_enabled = enabled;
         if (clip_l) {
             clip_l->set_flash_attention_enabled(enabled);
         }
@@ -1200,6 +1348,9 @@ struct FluxCLIPEmbedder : public Conditioner {
     }
 
     void set_scale_overrides(float linear_scale, float attn_scale) override {
+        runner_config_.has_scales   = true;
+        runner_config_.linear_scale = linear_scale;
+        runner_config_.attn_scale   = attn_scale;
         if (clip_l) {
             clip_l->set_scale_overrides(linear_scale, attn_scale);
         }
@@ -1209,6 +1360,8 @@ struct FluxCLIPEmbedder : public Conditioner {
     }
 
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
+        runner_config_.has_weight_adapter = true;
+        runner_config_.weight_adapter     = adapter;
         if (clip_l) {
             clip_l->set_weight_adapter(adapter);
         }
@@ -1224,6 +1377,26 @@ struct FluxCLIPEmbedder : public Conditioner {
         if (t5) {
             t5->runner_end();
         }
+    }
+
+    void release_resources() override {
+        if (clip_l) {
+            restore_runner_params_ctx(*clip_l);
+        }
+        if (t5) {
+            restore_runner_params_ctx(*t5);
+        }
+    }
+
+    void recover_resources(const String2TensorStorage& tensor_storage_map,
+                           std::shared_ptr<RunnerWeightManager> weight_manager) override {
+        if (clip_l) {
+            clip_l = std::make_shared<CLIPTextModelRunner>(model_backend, tensor_storage_map, "text_encoders.clip_l.transformer.text_model", OPENAI_CLIP_VIT_L_14, true, false, weight_manager);
+        }
+        if (t5) {
+            t5 = std::make_shared<T5Runner>(model_backend, tensor_storage_map, "text_encoders.t5xxl.transformer", false, weight_manager);
+        }
+        replay_runner_config();
     }
 
     std::vector<std::pair<std::vector<int>, std::vector<float>>> tokenize(std::string text,
@@ -1398,6 +1571,8 @@ struct T5CLIPEmbedder : public Conditioner {
     int mask_pad     = 0;
     bool is_umt5     = false;
 
+    ggml_backend_t model_backend = nullptr;
+
     T5CLIPEmbedder(ggml_backend_t backend,
                    const String2TensorStorage& tensor_storage_map      = {},
                    bool use_mask                                       = false,
@@ -1405,7 +1580,9 @@ struct T5CLIPEmbedder : public Conditioner {
                    bool is_umt5                                        = false,
                    std::shared_ptr<RunnerWeightManager> weight_manager = nullptr,
                    const char* model_args                              = nullptr)
-        : use_mask(use_mask), mask_pad(mask_pad), t5_tokenizer(is_umt5) {
+        : t5_tokenizer(is_umt5), is_umt5(is_umt5), model_backend(backend) {
+        this->use_mask = use_mask;
+        this->mask_pad = mask_pad;
         for (const auto& [key, value] : parse_key_value_args(model_args, "model arg")) {
             if (key == "chroma_use_t5_mask") {
                 bool parsed = false;
@@ -1446,6 +1623,8 @@ struct T5CLIPEmbedder : public Conditioner {
     }
 
     void set_max_graph_vram_bytes(size_t max_vram_bytes) override {
+        runner_config_.has_max_graph_vram   = true;
+        runner_config_.max_graph_vram_bytes = max_vram_bytes;
         if (t5) {
             t5->set_max_graph_vram_bytes(max_vram_bytes);
         }
@@ -1476,18 +1655,25 @@ struct T5CLIPEmbedder : public Conditioner {
     }
 
     void set_flash_attention_enabled(bool enabled) override {
+        runner_config_.has_flash_attention       = true;
+        runner_config_.flash_attention_enabled = enabled;
         if (t5) {
             t5->set_flash_attention_enabled(enabled);
         }
     }
 
     void set_scale_overrides(float linear_scale, float attn_scale) override {
+        runner_config_.has_scales   = true;
+        runner_config_.linear_scale = linear_scale;
+        runner_config_.attn_scale   = attn_scale;
         if (t5) {
             t5->set_scale_overrides(linear_scale, attn_scale);
         }
     }
 
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
+        runner_config_.has_weight_adapter = true;
+        runner_config_.weight_adapter     = adapter;
         if (t5) {
             t5->set_weight_adapter(adapter);
         }
@@ -1497,6 +1683,20 @@ struct T5CLIPEmbedder : public Conditioner {
         if (t5) {
             t5->runner_end();
         }
+    }
+
+    void release_resources() override {
+        if (t5) {
+            restore_runner_params_ctx(*t5);
+        }
+    }
+
+    void recover_resources(const String2TensorStorage& tensor_storage_map,
+                           std::shared_ptr<RunnerWeightManager> weight_manager) override {
+        if (t5) {
+            t5 = std::make_shared<T5Runner>(model_backend, tensor_storage_map, "text_encoders.t5xxl.transformer", is_umt5, weight_manager);
+        }
+        replay_runner_config();
     }
 
     std::tuple<std::vector<int>, std::vector<float>, std::vector<float>> tokenize(std::string text,
@@ -1640,11 +1840,13 @@ struct T5CLIPEmbedder : public Conditioner {
 struct MiniT2IConditioner : public Conditioner {
     T5UniGramTokenizer tokenizer;
     std::shared_ptr<T5Runner> t5;
-    size_t prompt_length = 256;
+    size_t prompt_length         = 256;
+    ggml_backend_t model_backend = nullptr;
 
     MiniT2IConditioner(ggml_backend_t backend,
                        const String2TensorStorage& tensor_storage_map      = {},
-                       std::shared_ptr<RunnerWeightManager> weight_manager = nullptr) {
+                       std::shared_ptr<RunnerWeightManager> weight_manager = nullptr)
+        : model_backend(backend) {
         bool use_t5 = false;
         for (const auto& pair : tensor_storage_map) {
             if (pair.first.find("text_encoders.t5xxl") != std::string::npos) {
@@ -1666,6 +1868,8 @@ struct MiniT2IConditioner : public Conditioner {
     }
 
     void set_max_graph_vram_bytes(size_t max_vram_bytes) override {
+        runner_config_.has_max_graph_vram   = true;
+        runner_config_.max_graph_vram_bytes = max_vram_bytes;
         if (t5) {
             t5->set_max_graph_vram_bytes(max_vram_bytes);
         }
@@ -1696,18 +1900,25 @@ struct MiniT2IConditioner : public Conditioner {
     }
 
     void set_flash_attention_enabled(bool enabled) override {
+        runner_config_.has_flash_attention       = true;
+        runner_config_.flash_attention_enabled = enabled;
         if (t5) {
             t5->set_flash_attention_enabled(enabled);
         }
     }
 
     void set_scale_overrides(float linear_scale, float attn_scale) override {
+        runner_config_.has_scales   = true;
+        runner_config_.linear_scale = linear_scale;
+        runner_config_.attn_scale   = attn_scale;
         if (t5) {
             t5->set_scale_overrides(linear_scale, attn_scale);
         }
     }
 
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
+        runner_config_.has_weight_adapter = true;
+        runner_config_.weight_adapter     = adapter;
         if (t5) {
             t5->set_weight_adapter(adapter);
         }
@@ -1717,6 +1928,20 @@ struct MiniT2IConditioner : public Conditioner {
         if (t5) {
             t5->runner_end();
         }
+    }
+
+    void release_resources() override {
+        if (t5) {
+            restore_runner_params_ctx(*t5);
+        }
+    }
+
+    void recover_resources(const String2TensorStorage& tensor_storage_map,
+                           std::shared_ptr<RunnerWeightManager> weight_manager) override {
+        if (t5) {
+            t5 = std::make_shared<T5Runner>(model_backend, tensor_storage_map, "text_encoders.t5xxl.transformer", false, weight_manager);
+        }
+        replay_runner_config();
     }
 
     SDCondition get_learned_condition(int n_threads,
@@ -1766,6 +1991,8 @@ struct SenseNovaU1Conditioner : public Conditioner {
     }
 
     void set_flash_attention_enabled(bool enabled) override {
+        runner_config_.has_flash_attention       = true;
+        runner_config_.flash_attention_enabled = enabled;
         SD_UNUSED(enabled);
     }
 
@@ -1829,11 +2056,13 @@ struct AnimaConditioner : public Conditioner {
     std::shared_ptr<Tokenizer> qwen_tokenizer;
     T5UniGramTokenizer t5_tokenizer;
     std::shared_ptr<LLM::LLMRunner> llm;
+    ggml_backend_t model_backend = nullptr;
 
     AnimaConditioner(ggml_backend_t backend,
                      const String2TensorStorage& tensor_storage_map      = {},
                      std::shared_ptr<RunnerWeightManager> weight_manager = nullptr,
-                     const TokenizerConfig& tokenizers                   = {}) {
+                     const TokenizerConfig& tokenizers                   = {})
+        : model_backend(backend) {
         llm            = std::make_shared<LLM::LLMRunner>(LLM::LLMArch::QWEN3,
                                                           backend,
                                                           tensor_storage_map,
@@ -1855,6 +2084,8 @@ struct AnimaConditioner : public Conditioner {
     }
 
     void set_max_graph_vram_bytes(size_t max_vram_bytes) override {
+        runner_config_.has_max_graph_vram   = true;
+        runner_config_.max_graph_vram_bytes = max_vram_bytes;
         llm->set_max_graph_vram_bytes(max_vram_bytes);
     }
 
@@ -1875,19 +2106,41 @@ struct AnimaConditioner : public Conditioner {
     }
 
     void set_flash_attention_enabled(bool enabled) override {
+        runner_config_.has_flash_attention       = true;
+        runner_config_.flash_attention_enabled = enabled;
         llm->set_flash_attention_enabled(enabled);
     }
 
     void set_scale_overrides(float linear_scale, float attn_scale) override {
+        runner_config_.has_scales   = true;
+        runner_config_.linear_scale = linear_scale;
+        runner_config_.attn_scale   = attn_scale;
         llm->set_scale_overrides(linear_scale, attn_scale);
     }
 
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
+        runner_config_.has_weight_adapter = true;
+        runner_config_.weight_adapter     = adapter;
         llm->set_weight_adapter(adapter);
     }
 
     void runner_end() override {
         llm->runner_end();
+    }
+
+    void release_resources() override {
+        restore_runner_params_ctx(*llm);
+    }
+
+    void recover_resources(const String2TensorStorage& tensor_storage_map,
+                           std::shared_ptr<RunnerWeightManager> weight_manager) override {
+        llm = std::make_shared<LLM::LLMRunner>(LLM::LLMArch::QWEN3,
+                                               model_backend,
+                                               tensor_storage_map,
+                                               "text_encoders.llm",
+                                               false,
+                                               weight_manager);
+        replay_runner_config();
     }
 
     std::tuple<std::vector<int>, std::vector<float>, std::vector<int>, std::vector<float>> tokenize(std::string text) {
@@ -2078,6 +2331,8 @@ struct LLMEmbedder : public Conditioner {
     }
 
     void set_max_graph_vram_bytes(size_t max_vram_bytes) override {
+        runner_config_.has_max_graph_vram   = true;
+        runner_config_.max_graph_vram_bytes = max_vram_bytes;
         llm->set_max_graph_vram_bytes(max_vram_bytes);
         if (byt5) {
             byt5->set_max_graph_vram_bytes(max_vram_bytes);
@@ -2117,6 +2372,8 @@ struct LLMEmbedder : public Conditioner {
     }
 
     void set_flash_attention_enabled(bool enabled) override {
+        runner_config_.has_flash_attention       = true;
+        runner_config_.flash_attention_enabled = enabled;
         llm->set_flash_attention_enabled(enabled);
         if (byt5) {
             byt5->set_flash_attention_enabled(enabled);
@@ -2124,6 +2381,9 @@ struct LLMEmbedder : public Conditioner {
     }
 
     void set_scale_overrides(float linear_scale, float attn_scale) override {
+        runner_config_.has_scales   = true;
+        runner_config_.linear_scale = linear_scale;
+        runner_config_.attn_scale   = attn_scale;
         llm->set_scale_overrides(linear_scale, attn_scale);
         if (byt5) {
             byt5->set_scale_overrides(linear_scale, attn_scale);
@@ -2131,6 +2391,8 @@ struct LLMEmbedder : public Conditioner {
     }
 
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
+        runner_config_.has_weight_adapter = true;
+        runner_config_.weight_adapter     = adapter;
         if (llm) {
             llm->set_weight_adapter(adapter);
         }
@@ -2148,10 +2410,19 @@ struct LLMEmbedder : public Conditioner {
         }
     }
 
-    // A text encoder is used once per prompt, so after encoding there is no reason
-    // to keep its weights resident while the diffusion model runs. Dropping it here
-    // frees the whole model (e.g. 4.6 GB for Qwen3.5-9B) and the next prompt pays
-    // the reload again. Opt-in via sd_ctx_params_t::release_conditioner_after_encode.
+    // A text encoder is used once per prompt, so after encoding there is no
+    // reason to keep its weights resident while the diffusion model runs.
+    // Dropping it here frees the whole model (e.g. 4.6 GB for Qwen3.5-9B) and
+    // the next prompt pays the reload again. Opt-in via
+    // sd_ctx_params_t::release_conditioner_after_encode.
+    // runner_end() asserts that no graph is executing, and the low-memory hook
+    // can fire in the middle of this encoder's own segment (a capacity refusal
+    // inside its graph). Releasing there would trip that assertion instead of
+    // failing the load, so the engine asks first.
+    bool can_release_now() const override {
+        return (!llm || !llm->graph_active()) && (!byt5 || !byt5->graph_active());
+    }
+
     void release_resources() override {
         if (llm) {
             llm->runner_end();
@@ -2159,8 +2430,20 @@ struct LLMEmbedder : public Conditioner {
         if (byt5) {
             byt5->runner_end();
         }
-        llm.reset();
-        byt5.reset();
+        // byt5 is deliberately NOT reset here: the manager still holds the
+        // ggml_tensor pointers it registered, and release_text_encoder() unregisters
+        // them right after this call. Destroying the runner first would leave those
+        // states dangling. recover_resources() recreates it if it is missing.
+    }
+
+    void recover_resources(const String2TensorStorage& tensor_storage_map,
+                           std::shared_ptr<RunnerWeightManager> weight_manager) override {
+        if (!llm) {
+            return;
+        }
+        if (!llm->params_ctx_alive()) {
+            llm->recover_params_ctx();
+        }
     }
 
     std::tuple<std::vector<int>, std::vector<float>, std::vector<float>> tokenize(std::string text,
@@ -3343,9 +3626,11 @@ struct LLMEmbedder : public Conditioner {
 struct MingImageEmbedder : public Conditioner {
     std::shared_ptr<Tokenizer> tokenizer;
     std::shared_ptr<MingImageTE::MingImageTextRunner> text_model;
-    const std::string prefix = "text_encoders.llm";
+    const std::string prefix     = "text_encoders.llm";
+    ggml_backend_t model_backend = nullptr;
 
-    MingImageEmbedder(ggml_backend_t backend, const String2TensorStorage& tensors, std::shared_ptr<RunnerWeightManager> weight_manager, const TokenizerConfig& tokenizers) {
+    MingImageEmbedder(ggml_backend_t backend, const String2TensorStorage& tensors, std::shared_ptr<RunnerWeightManager> weight_manager, const TokenizerConfig& tokenizers)
+        : model_backend(backend) {
         if (!tokenizers.has(TokenizerConfig::MAIN)) {
             throw std::runtime_error("Ming-Image requires the Ling tokenizer.json; pass --tokenizer FILE");
         }
@@ -3362,14 +3647,28 @@ struct MingImageEmbedder : public Conditioner {
     void get_layer_split_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
         text_model->get_param_tensors(tensors, prefix);
     }
-    void set_flash_attention_enabled(bool enabled) override { text_model->set_flash_attention_enabled(enabled); }
-    void set_max_graph_vram_bytes(size_t bytes) override { text_model->set_max_graph_vram_bytes(bytes); }
+    void set_flash_attention_enabled(bool enabled) override {
+        runner_config_.has_flash_attention       = true;
+        runner_config_.flash_attention_enabled = enabled;
+        text_model->set_flash_attention_enabled(enabled);
+    }
+    void set_max_graph_vram_bytes(size_t bytes) override {
+        runner_config_.has_max_graph_vram   = true;
+        runner_config_.max_graph_vram_bytes = bytes;
+        text_model->set_max_graph_vram_bytes(bytes);
+    }
     void set_runtime_backends(const std::vector<ggml_backend_t>& backends) override { text_model->set_runtime_backends(backends); }
     void set_graph_cut_layer_split_enabled(bool enabled) override { text_model->set_graph_cut_layer_split_enabled(enabled); }
     void set_graph_cut_layer_split_backend_vram_limits(const std::vector<size_t>& limits) override { text_model->set_graph_cut_layer_split_backend_vram_limits(limits); }
     void set_scale_overrides(float linear, float attention) override { text_model->set_scale_overrides(linear, attention); }
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override { text_model->set_weight_adapter(adapter); }
     void runner_end() override { text_model->runner_end(); }
+    void release_resources() override { restore_runner_params_ctx(*text_model); }
+    void recover_resources(const String2TensorStorage& tensor_storage_map,
+                           std::shared_ptr<RunnerWeightManager> weight_manager) override {
+        text_model = std::make_shared<MingImageTE::MingImageTextRunner>(model_backend, tensor_storage_map, prefix, weight_manager);
+        replay_runner_config();
+    }
 
     SDCondition get_learned_condition(int n_threads, const ConditionerParams& input) override {
         if (input.ref_images != nullptr && !input.ref_images->empty()) {
@@ -3485,6 +3784,8 @@ struct LLaDAImageEmbedder : public Conditioner {
     std::string text_projection_prefix;
     std::string sigvq_prefix;
 
+    ggml_backend_t model_backend = nullptr;
+
     LLaDAImageEmbedder(ggml_backend_t backend,
                        const String2TensorStorage& tensor_storage_map      = {},
                        const std::string& llm_prefix                       = "text_encoders.llm",
@@ -3496,7 +3797,8 @@ struct LLaDAImageEmbedder : public Conditioner {
         : llm_prefix(llm_prefix),
           query_former_prefix(query_former_prefix),
           text_projection_prefix(text_projection_prefix),
-          sigvq_prefix(sigvq_prefix) {
+          sigvq_prefix(sigvq_prefix),
+          model_backend(backend) {
         if (!tokenizers.has(TokenizerConfig::MAIN)) {
             throw std::runtime_error("LLaDA-Image requires an external LLaDA2 tokenizer.json; pass --tokenizer FILE or set sd_ctx_params_t::tokenizer");
         }
@@ -3543,6 +3845,8 @@ struct LLaDAImageEmbedder : public Conditioner {
     }
 
     void set_flash_attention_enabled(bool enabled) override {
+        runner_config_.has_flash_attention       = true;
+        runner_config_.flash_attention_enabled = enabled;
         llm->set_flash_attention_enabled(enabled);
         query_former->set_flash_attention_enabled(enabled);
         text_projection->set_flash_attention_enabled(enabled);
@@ -3552,6 +3856,8 @@ struct LLaDAImageEmbedder : public Conditioner {
     }
 
     void set_max_graph_vram_bytes(size_t max_vram_bytes) override {
+        runner_config_.has_max_graph_vram   = true;
+        runner_config_.max_graph_vram_bytes = max_vram_bytes;
         llm->set_max_graph_vram_bytes(max_vram_bytes);
         query_former->set_max_graph_vram_bytes(max_vram_bytes);
         text_projection->set_max_graph_vram_bytes(max_vram_bytes);
@@ -3577,12 +3883,48 @@ struct LLaDAImageEmbedder : public Conditioner {
     }
 
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
+        runner_config_.has_weight_adapter = true;
+        runner_config_.weight_adapter     = adapter;
         llm->set_weight_adapter(adapter);
         query_former->set_weight_adapter(adapter);
         text_projection->set_weight_adapter(adapter);
         if (sigvq != nullptr) {
             sigvq->set_weight_adapter(adapter);
         }
+    }
+
+    void release_resources() override {
+        restore_runner_params_ctx(*llm);
+        restore_runner_params_ctx(*query_former);
+        restore_runner_params_ctx(*text_projection);
+        if (sigvq) {
+            restore_runner_params_ctx(*sigvq);
+        }
+    }
+
+    void recover_resources(const String2TensorStorage& tensor_storage_map,
+                           std::shared_ptr<RunnerWeightManager> weight_manager) override {
+        llm = std::make_shared<LLM::LLMRunner>(LLM::LLMArch::LLADA2_MOE,
+                                               model_backend,
+                                               tensor_storage_map,
+                                               llm_prefix,
+                                               false,
+                                               weight_manager);
+        query_former    = std::make_shared<LLaDAImageTE::QueryFormerRunner>(model_backend,
+                                                                            tensor_storage_map,
+                                                                            query_former_prefix,
+                                                                            weight_manager);
+        text_projection = std::make_shared<LLaDAImageTE::TextProjectionRunner>(model_backend,
+                                                                               tensor_storage_map,
+                                                                               text_projection_prefix,
+                                                                               weight_manager);
+        if (sigvq) {
+            sigvq = std::make_shared<LLaDAImageTE::SigVQRunner>(model_backend,
+                                                                tensor_storage_map,
+                                                                sigvq_prefix,
+                                                                weight_manager);
+        }
+        replay_runner_config();
     }
 
     void runner_end() override {
@@ -3684,7 +4026,9 @@ struct LTXAVEmbedder : public Conditioner {
     std::shared_ptr<LLM::LLMRunner> llm;
     std::shared_ptr<LTXAVTextProjectionRunner> projector;
     std::string projector_prefix;
-    bool dual_projection = false;
+    bool dual_projection         = false;
+    std::string model_llm_prefix = "text_encoders.llm";
+    ggml_backend_t model_backend = nullptr;
 
     // Gemma 4 keeps a per-layer output scalar that no Gemma 3 checkpoint has, and widens its
     // full-attention heads to 512 so their q_proj is twice a sliding layer's.
@@ -3709,7 +4053,9 @@ struct LTXAVEmbedder : public Conditioner {
                   const std::string& projector_prefix                 = "text_embedding_projection",
                   std::shared_ptr<RunnerWeightManager> weight_manager = nullptr,
                   const TokenizerConfig& tokenizers                   = {})
-        : projector_prefix(projector_prefix) {
+        : projector_prefix(projector_prefix),
+          model_llm_prefix(llm_prefix),
+          model_backend(backend) {
         LLM::LLMArch arch = detect_gemma_arch(tensor_storage_map, llm_prefix);
         LOG_INFO("ltxav text encoder: %s", arch == LLM::LLMArch::GEMMA4_12B ? "gemma 4" : "gemma 3");
         llm       = std::make_shared<LLM::LLMRunner>(arch,
@@ -3739,16 +4085,23 @@ struct LTXAVEmbedder : public Conditioner {
     }
 
     void set_flash_attention_enabled(bool enabled) override {
+        runner_config_.has_flash_attention       = true;
+        runner_config_.flash_attention_enabled = enabled;
         llm->set_flash_attention_enabled(enabled);
         projector->set_flash_attention_enabled(enabled);
     }
 
     void set_scale_overrides(float linear_scale, float attn_scale) override {
+        runner_config_.has_scales   = true;
+        runner_config_.linear_scale = linear_scale;
+        runner_config_.attn_scale   = attn_scale;
         llm->set_scale_overrides(linear_scale, attn_scale);
         projector->set_scale_overrides(linear_scale, attn_scale);
     }
 
     void set_max_graph_vram_bytes(size_t max_vram_bytes) override {
+        runner_config_.has_max_graph_vram   = true;
+        runner_config_.max_graph_vram_bytes = max_vram_bytes;
         llm->set_max_graph_vram_bytes(max_vram_bytes);
         projector->set_max_graph_vram_bytes(max_vram_bytes);
     }
@@ -3770,8 +4123,30 @@ struct LTXAVEmbedder : public Conditioner {
     }
 
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
+        runner_config_.has_weight_adapter = true;
+        runner_config_.weight_adapter     = adapter;
         llm->set_weight_adapter(adapter);
         projector->set_weight_adapter(adapter);
+    }
+
+    void release_resources() override {
+        restore_runner_params_ctx(*llm);
+        restore_runner_params_ctx(*projector);
+    }
+
+    void recover_resources(const String2TensorStorage& tensor_storage_map,
+                           std::shared_ptr<RunnerWeightManager> weight_manager) override {
+        llm = std::make_shared<LLM::LLMRunner>(detect_gemma_arch(tensor_storage_map, model_llm_prefix),
+                                               model_backend,
+                                               tensor_storage_map,
+                                               model_llm_prefix,
+                                               false,
+                                               weight_manager);
+        projector = std::make_shared<LTXAVTextProjectionRunner>(model_backend,
+                                                                tensor_storage_map,
+                                                                projector_prefix,
+                                                                weight_manager);
+        replay_runner_config();
     }
 
     void runner_end() override {

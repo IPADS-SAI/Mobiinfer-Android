@@ -395,6 +395,40 @@ bool ModelManager::unregister_tensor_states(const std::unordered_set<TensorState
     return true;
 }
 
+size_t ModelManager::release_component_params(ModelComponent component) {
+    std::unordered_set<TensorState*> states;
+    size_t released_bytes = 0;
+    size_t pinned         = 0;
+    for (const auto& state : tensor_states_) {
+        if (state == nullptr || state->component != component) {
+            continue;
+        }
+        if (state->pin_count > 0) {
+            ++pinned;
+        } else {
+            released_bytes += state->tensor != nullptr ? ggml_nbytes(state->tensor) : 0;
+        }
+        states.insert(state.get());
+    }
+    if (states.empty()) {
+        return 0;
+    }
+    if (pinned > 0 || !unregister_tensor_states(states, nullptr)) {
+        // Not while the runner is using them; whatever needed the memory fails
+        // instead of sharing a buffer with a running graph.
+        LOG_WARN("model manager cannot release %zu %s tensors now, %zu are in use",
+                 states.size() - pinned,
+                 model_component_name(component),
+                 pinned);
+        return 0;
+    }
+    LOG_INFO("model manager released %zu %s tensors, %.2f MB",
+             states.size(),
+             model_component_name(component),
+             released_bytes / (1024.0 * 1024.0));
+    return released_bytes;
+}
+
 bool ModelManager::load_all_params_eagerly() {
     std::vector<TensorState*> all_states;
     all_states.reserve(tensor_states_.size());
@@ -1209,6 +1243,10 @@ void ModelManager::release_compute_staging_blocks(bool force,
         }
 
         if (can_release) {
+            LOG_INFO("[evict] staging block released: %zu tensors %.2f MB (force=%d)",
+                     block->staged_tensors.size(),
+                     block->buffer != nullptr ? ggml_backend_buffer_get_size(block->buffer) / (1024.0 * 1024.0) : 0.0,
+                     (int) force);
             if (block->buffer != nullptr) {
                 auto& stats = released[block->compute_backend];
                 stats.bytes += ggml_backend_buffer_get_size(block->buffer);
@@ -1478,6 +1516,26 @@ size_t ModelManager::compute_backend_alloc_size(const std::vector<TensorState*>&
         total_size += alloc_size;
     }
     return total_size;
+}
+
+void ModelManager::compute_backend_device_memory(ggml_backend_t compute_backend,
+                                                 size_t& free_bytes,
+                                                 size_t& total_bytes) const {
+    free_bytes  = 0;
+    total_bytes = 0;
+    if (compute_backend == nullptr) {
+        return;
+    }
+    if (ggml_backend_dev_t device = ggml_backend_get_device(compute_backend)) {
+        ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
+    }
+}
+
+ModelManager::DeviceMemoryStats ModelManager::device_memory_stats(ggml_backend_t backend) const {
+    DeviceMemoryStats stats;
+    compute_backend_device_memory(backend, stats.reported_free, stats.reported_total);
+    stats.tracked_resident = compute_backend_resident_bytes(backend);
+    return stats;
 }
 
 size_t ModelManager::compute_backend_resident_bytes(ggml_backend_t compute_backend) const {
@@ -1767,7 +1825,31 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
     auto add             = [](size_t a, size_t b) { return b > SIZE_MAX - a ? SIZE_MAX : a + b; };
     const size_t missing = compute_backend_alloc_size(states, true);
     // Backend scratch buffers and pipelines are not included in graph measurements.
-    constexpr size_t safety_margin = 512ULL * 1024ULL * 1024ULL;
+    // Overridable because the right value is device specific: a margin that is a
+    // little too large evicts a whole segment (hundreds of MB of re-upload per
+    // step), and one that is too small fails an allocation. Measured on v81 with
+    // the Q4 DiT: 12 x 294 MB + 45 MB runtime fits the 4 GiB DSP only if the
+    // margin stays small.
+    // The generic default stays conservative. On a 4 GiB DSP this much headroom
+    // is larger than a whole DiT segment, so an embedder that wants the weights
+    // to stay resident has to say so: the Android Hexagon path sets
+    // SD_CAPACITY_MARGIN_MB=64, which measured 520 ms/step instead of 2000 ms
+    // because all 12 Q4 segments then fit. Keeping the default high here means
+    // a device whose scratch use we have not measured keeps the safe value.
+    static const size_t safety_margin = [] {
+        const char* env = getenv("SD_CAPACITY_MARGIN_MB");
+        if (env == nullptr || env[0] == '\0') {
+            return static_cast<size_t>(512) * 1024 * 1024;
+        }
+        char* end      = nullptr;
+        const long mb  = strtol(env, &end, 10);
+        // Reject junk and anything that could overflow when scaled.
+        if (end == env || mb <= 0 || mb > 65536) {
+            LOG_WARN("ignoring invalid SD_CAPACITY_MARGIN_MB='%s'", env);
+            return static_cast<size_t>(512) * 1024 * 1024;
+        }
+        return static_cast<size_t>(mb) * 1024 * 1024;
+    }();
     result.required_device_bytes   = add(add(request.pending_allocation_bytes, missing), safety_margin);
     result.required_budget_bytes   = add(request.runtime_peak_bytes(), missing);
     auto available_device_bytes    = [&](ggml_backend_t backend) {
@@ -1857,6 +1939,27 @@ bool ModelManager::ensure_compute_backend_capacity(
     const std::vector<ggml_tensor*>& required_params,
     const std::vector<std::vector<ggml_tensor*>>& preferred_eviction_order,
     const std::vector<ggml_tensor*>& protected_params) {
+    if (getenv("SD_TRACE_CAPACITY") != nullptr) {
+        // Report the numbers check_capacity() itself will use, rather than a
+        // re-derivation: the earlier version hardcoded the old 512 MB margin and
+        // summed buffers that may not exist yet.
+        std::vector<TensorState*> traced;
+        if (resolve_required_tensor_states(required_params, traced, request.compute_backend)) {
+            const CapacityCheck traced_capacity = check_capacity(request, traced, false);
+            LOG_INFO("[cap] params=%zu pending=%.1fMB resident=%.1fMB need=%.1fMB device_avail=%.1fMB need=%.1fMB budget_avail=%.1fMB",
+                     required_params.size(),
+                     request.pending_allocation_bytes / 1048576.0,
+                     compute_backend_resident_bytes(request.compute_backend) / 1048576.0,
+                     traced_capacity.required_device_bytes / 1048576.0,
+                     traced_capacity.available_device_bytes == SIZE_MAX
+                         ? -1.0
+                         : traced_capacity.available_device_bytes / 1048576.0,
+                     traced_capacity.required_budget_bytes / 1048576.0,
+                     traced_capacity.available_budget_bytes == SIZE_MAX
+                         ? -1.0
+                         : traced_capacity.available_budget_bytes / 1048576.0);
+        }
+    }
     std::vector<TensorState*> required_states;
     if (!resolve_required_tensor_states(required_params, required_states, request.compute_backend)) {
         return false;
@@ -2016,5 +2119,9 @@ bool ModelManager::ensure_compute_backend_capacity(
              capacity.required_budget_bytes / (1024.0 * 1024.0),
              available_device.c_str(),
              available_budget.c_str());
+    // Reported before the requester gives up, so it can release memory this
+    // manager does not own (the text encoder while the diffusion model loads)
+    // and retry. LowMemoryHooksGuard lives in core/util.cpp.
+    LowMemoryHooksGuard::edge();
     return false;
 }

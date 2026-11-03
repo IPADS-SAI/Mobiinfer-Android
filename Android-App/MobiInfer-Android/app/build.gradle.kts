@@ -23,7 +23,7 @@ android {
         // to the WebP icons in mipmap-{m,h,xh,xxh,xxxh}dpi/.
         minSdk = 24
         targetSdk = 36
-        versionCode = 5
+        versionCode = 6
         versionName = "0.4"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -374,12 +374,26 @@ val buildImageGen = tasks.register("buildImageGen") {
             f.copyTo(File(destDir, name), overwrite = true)
             logger.lifecycle("Copied $name -> ${File(destDir, name).absolutePath}")
         }
-        // HTP skels.
+        // HTP skels. CMakeLists declares four (build_htp_skel v73/v75/v79/v81).
+        // v79/v81 must build. v73/v75 are attempted as optional targets: the
+        // Hexagon 21.0.04 linker intermittently aborts on them ("unable to
+        // execute command: Aborted (core dumped)" from hexagon-link, same
+        // sources and flags that link cleanly on another run), so a skel that
+        // does happen to exist is packaged and its absence is not an error.
         for (name in listOf("libggml-htp-v79.so", "libggml-htp-v81.so")) {
             val f = fileTree(bd).matching { include("**/ggml-hexagon/$name") }.files.firstOrNull()
                 ?: error("buildImageGen: missing skel $name under ${bd.absolutePath}")
             f.copyTo(File(destDir, name), overwrite = true)
             logger.lifecycle("Copied $name -> ${File(destDir, name).absolutePath}")
+        }
+        for (name in listOf("libggml-htp-v73.so", "libggml-htp-v75.so")) {
+            val f = fileTree(bd).matching { include("**/ggml-hexagon/$name") }.files.firstOrNull()
+            if (f != null) {
+                f.copyTo(File(destDir, name), overwrite = true)
+                logger.lifecycle("Copied $name -> ${File(destDir, name).absolutePath}")
+            } else {
+                logger.lifecycle("Skipping $name: not produced by this toolchain run")
+            }
         }
         // Runtime dep: OpenMP (libstable-diffusion.so NEEDED). The wrapper and
         // sd lib use the NDK's static libc++ (no libc++_shared dependency), so

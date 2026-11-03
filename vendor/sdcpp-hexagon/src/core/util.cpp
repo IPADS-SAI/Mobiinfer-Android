@@ -656,6 +656,55 @@ sd_progress_stage_t sd_progress_get_stage() {
     return tls_progress_stage;
 }
 
+static sd_low_memory_hooks_t g_low_memory_hooks;
+// Set by edge(), cleared by recover(): tells a caller that a failing load
+// already caused the hooks to fire, so retrying once is worthwhile.
+static bool g_low_memory_engaged = false;
+
+void sd_set_low_memory_hooks(const sd_low_memory_hooks_t& hooks) {
+    g_low_memory_hooks = hooks;
+}
+
+// The hook is process-global (the residency manager has no context pointer), so
+// ownership is tracked by the owner token each context passes as user_data.
+bool LowMemoryHooksGuard::install(const sd_low_memory_hooks_t& hooks) {
+    if (g_low_memory_hooks.on_edge != nullptr && g_low_memory_hooks.user_data != hooks.user_data) {
+        LOG_WARN("low memory hooks already belong to another context; not replacing them");
+        return false;
+    }
+    g_low_memory_hooks    = hooks;
+    g_low_memory_engaged  = false;
+    return true;
+}
+
+void LowMemoryHooksGuard::clear_for(void* user_data) {
+    if (g_low_memory_hooks.on_edge != nullptr && g_low_memory_hooks.user_data == user_data) {
+        g_low_memory_hooks   = sd_low_memory_hooks_t{};
+        g_low_memory_engaged = false;
+    }
+}
+
+// Called from the model loader (and the residency manager) before they give
+// up. on_edge may unload whatever it can spare; on_recover brings it back once
+// the load fits.
+void LowMemoryHooksGuard::edge() {
+    g_low_memory_engaged = true;
+    if (g_low_memory_hooks.on_edge != nullptr) {
+        g_low_memory_hooks.on_edge(g_low_memory_hooks.user_data);
+    }
+}
+
+void LowMemoryHooksGuard::recover() {
+    if (g_low_memory_hooks.on_recover != nullptr) {
+        g_low_memory_hooks.on_recover(g_low_memory_hooks.user_data);
+    }
+    g_low_memory_engaged = false;
+}
+
+bool LowMemoryHooksGuard::engaged() {
+    return g_low_memory_engaged;
+}
+
 // RAII so the flag is cleared even when the embedder callback throws: leaving
 // it set would relabel every later event of the *same* run, including the
 // denoising steps, as weight loading.

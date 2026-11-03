@@ -102,6 +102,10 @@ public:
     bool disable_segmented_compute = false;
     bool eager_load                = false;
     bool release_conditioner_after_encode = false;
+    bool keep_conditioner_after_encode    = false;
+    // Set between release_text_encoder() and recover_text_encoder(): the
+    // conditioner's weights are not registered with the model manager.
+    bool conditioner_released = false;
     std::string backend_spec;
     std::string params_backend_spec;
     std::string split_mode_spec;
@@ -215,6 +219,13 @@ public:
     void capture_runner_sources();
 
     void end_runners();
+
+    // Drop the text encoder's weights and buffers (keep its runner and shapes)
+    // so the rest of the draw fits; setup_conditioner_low_memory_hooks() puts
+    // them back when memory runs short and after the loads that needed it.
+    void release_text_encoder();
+    void recover_text_encoder();
+    void setup_conditioner_low_memory_hooks();
 
     bool reset_runners(const RunnerGroups& groups);
 

@@ -339,6 +339,7 @@
     <string name="image_stage_encoding_title">理解提示词</string>
     <string name="image_stage_sampling_title">生成画面</string>
     <string name="image_stage_decoding_title">解码图片</string>
+    <string name="image_stage_reloading_title">重新载入文本编码器</string>
     <string name="tool_reloading_model">正在重新加载模型…</string>
     <string name="image_progress_label_short">%1$d%% · %2$s</string>
     <string name="image_param_steps_hint">去噪迭代次数，按所选模型的训练步数来：8 步 Turbo 用 8，4 步蒸馏用 4。偏离太多画面会变差。</string>

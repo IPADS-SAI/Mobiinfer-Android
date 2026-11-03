@@ -47,6 +47,11 @@ class ImageEngine private constructor(
         const val STAGE_SAMPLING = 2
         const val STAGE_DECODING = 3
         const val STAGE_DONE = 4
+        // The encoder's weights were dropped after the previous prompt (the draw
+        // released them so the VAE and the diffusion model get the memory) and
+        // are being faulted back in. Same phase as STAGE_ENCODING, different
+        // words: the user is waiting on a reload, not on the prompt.
+        const val STAGE_RELOADING = 5
 
         private const val INIT_TIMEOUT_MS = 30_000L
 
@@ -143,6 +148,7 @@ class ImageEngine private constructor(
             STAGE_DECODING -> {
                 if (decodeStartedAt == 0L) decodeStartedAt = now
             }
+            STAGE_RELOADING -> Unit
         }
     }
 
@@ -244,10 +250,27 @@ class ImageEngine private constructor(
                 Log.i(TAG, "Loading native library for image generation...")
                 System.loadLibrary("imagegen")
                 nativeSetenv("GGML_HEXAGON_HOSTBUF", "1")
-                nativeSetenv("GGML_HEXAGON_ARCH", hexagonArchForDevice())
+                val hexArch = hexagonArchForDevice()
+                nativeSetenv("GGML_HEXAGON_ARCH", hexArch)
+                // Headroom on the device budget: the residency planner keeps this
+                // much headroom for scratch the graph does not declare. sdcpp's
+                // generic default is 512 MB, which on a 4 GiB DSP is more than
+                // a whole DiT segment - the Q4 weights (12 x 294 MB + 45 MB
+                // runtime) stop fitting and one segment is re-uploaded every
+                // sampling step. Measured on v81: 512 MB -> ~2000 ms/step with
+                // wstart ~600 ms, 64 MB -> ~520 ms/step with wstart 0.1 ms
+                // (all segments resident). v73/v75/v79 DSPs are smaller, so
+                // they get the tighter value too; it is a headroom, not a
+                // reservation, and a failed allocation still surfaces as an
+                // error rather than a crash.
+                nativeSetenv("SD_CAPACITY_MARGIN_MB", "64")
                 nativeSetenv("GGML_HEXAGON_CONV2D", "1")
                 nativeSetenv("SD_TE_CUT_STRIDE", "24")
                 nativeSetenv("SD_HEXAGON_PARALLEL_LOAD", "1")
+                // The [seg] log line reports wstart (weight upload) against
+                // sched (DSP work); its counters only accumulate when this is
+                // set, otherwise the line prints zeros.
+                nativeSetenv("SD_PROFILE_SEGMENTS", "1")
                 nativeSetenv("ADSP_LIBRARY_PATH",
                     "${context.applicationInfo.nativeLibraryDir};/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/system/vendor/lib/rfsa/adsp")
                 nativeSetProgressListener(bridge)
@@ -323,20 +346,45 @@ class ImageEngine private constructor(
         Log.i(TAG, "Image engine freed")
     }
 
-    // GGML_HEXAGON_ARCH: v79 for Snapdragon 8 Elite (SM8750 / OnePlus 13),
-    // v81 for 8 Elite Gen5 (SM8850). Defaults to v79; harmless if the skel for
-    // the detected arch is present alongside.
+    // GGML_HEXAGON_ARCH: which DSP skel the HTP backend loads.
     private fun hexagonArchForDevice(): String {
         val soc = runCatching {
             (Class.forName("android.os.SystemProperties")
                 .getMethod("get", String::class.java)
                 .invoke(null, "ro.soc.model") as? String)
         }.getOrNull() ?: ""
-        return when {
-            // Matches the libggml-htp-v*.so skels the Gradle build ships.
-            soc.contains("SM8850", true) -> "v81"
-            else -> "v79"
+        // Hexagon arch, newest first. The skel and the DSP must match: loading
+        // the wrong one fails at session creation with a clear loader error, it
+        // does not corrupt state.
+        //
+        // Only libggml-htp-v79.so and libggml-htp-v81.so are packaged today -
+        // the Hexagon 21.0.04 linker aborts on v73/v75 (see build.gradle.kts),
+        // so those SoCs fall back to the v79 skel below and the DSP rejects it
+        // at session creation rather than crashing. The mapping is kept for all
+        // four so shipping the missing skels is the only change needed.
+        val arch = when {
+            soc.contains("SM8850", true) -> "v81"   // 8 Elite Gen 5
+            soc.contains("SM8750", true) -> "v79"   // 8 Elite
+            soc.contains("SM8650", true) -> "v75"   // 8 Gen 3
+            soc.contains("SM8635", true) -> "v75"   // 8s Gen 3
+            soc.contains("SM7675", true) -> "v75"   // 7+ Gen 3
+            soc.contains("SM7550", true) -> "v75"   // 7 Gen 3
+            soc.contains("SM8550", true) -> "v73"   // 8 Gen 2
+            soc.contains("SM8475", true) -> "v73"   // 8+ Gen 1
+            soc.contains("SM8450", true) -> "v73"   // 8 Gen 1
+            else -> ""
         }
+        if (arch.isEmpty()) {
+            // Not fatal: report what we saw so a wrong guess is diagnosable.
+            CriticalLog.log("imagegen", "unrecognised SoC \'$soc\', assuming v79 for the HTP skel")
+            return "v79"
+        }
+        if (arch != "v79" && arch != "v81") {
+            // Recognised, but no skel is shipped for it yet.
+            CriticalLog.log("imagegen", "SoC \'$soc\' is $arch; only v79/v81 skels ship, using v79")
+            return "v79"
+        }
+        return arch
     }
 
     suspend fun loadModel(
