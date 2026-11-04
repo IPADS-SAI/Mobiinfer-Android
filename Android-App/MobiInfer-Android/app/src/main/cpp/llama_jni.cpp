@@ -141,27 +141,51 @@ extern "C" int mobiinfer_htp_session_count() {
     return g_htp_sessions;
 }
 
-// True when the device's HTP needs a reduced layout to fit in the per-session
-// mapping window. Overridable with MOBIINFER_LOW_VMEM=0/1 for A/B testing.
+// Ask the Hexagon backend for the DSP architecture. Returns <= 0 when the
+// backend (or the arch query proc) is not available yet.
+static int query_hexagon_arch() {
+    using get_arch_fn = int (*)(ggml_backend_reg_t);
+    const auto reg = ggml_backend_reg_by_name("HTP");
+    if (!reg) {
+        return -1;
+    }
+    auto get_arch = reinterpret_cast<get_arch_fn>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_get_arch"));
+    if (!get_arch) {
+        return -1;
+    }
+    return get_arch(reg);
+}
+
+// Hexagon v73/v75 expose only ~3.34 GB of virtual address space per HTP
+// session, while v79+ has a larger window. The default layout reserves
+// n_batch(2048) * vocab(151936) * 4 bytes (~1.19 GiB) for logits alone; on a
+// v75 that cannot coexist with Qwen3-VL's ~2.6 GiB of weights, the KV cache
+// and the vision projector. fastrpc_mmap then fails for `result_output` and
+// the process aborts. Detect those parts and shrink the layout automatically
+// instead of hard-failing. Override with MOBIINFER_TIGHT_VMEM=0/1 for A/B.
+static bool tight_htp_vmem() {
+    const char * override = getenv("MOBIINFER_TIGHT_VMEM");
+    if (override && *override) {
+        return *override != '0';
+    }
+    const int arch = query_hexagon_arch();
+    if (arch <= 0) {
+        LOGw("Hexagon arch unavailable; assuming a tight HTP mapping window");
+        return true;
+    }
+    return arch < 79;
+}
+
+// True when the device's HTP needs the legacy reduced MoE layout to fit in
+// the per-session mapping window. Overridable with MOBIINFER_LOW_VMEM=0/1.
 extern "C" int mobiinfer_low_vmem_required() {
     const char * override = getenv("MOBIINFER_LOW_VMEM");
     if (override && *override) {
         return *override != '0';
     }
 
-    using get_arch_fn = int (*)(ggml_backend_reg_t);
-    get_arch_fn get_arch = nullptr;
-    const auto reg = ggml_backend_reg_by_name("HTP");
-    if (reg) {
-        get_arch = reinterpret_cast<get_arch_fn>(
-                ggml_backend_reg_get_proc_address(reg, "ggml_backend_hexagon_get_arch"));
-    }
-    if (!get_arch) {
-        LOGw("Hexagon arch unavailable; using the conservative low-vmem layout");
-        return 1;
-    }
-
-    const int arch = get_arch(reg);
+    const int arch = query_hexagon_arch();
     LOGi("Hexagon arch v%d%s", arch,
          arch > 0 && arch < 75 ? " (low-vmem layout required)" : "");
     if (arch <= 0) {
@@ -186,6 +210,21 @@ constexpr int   DEFAULT_CONTEXT_SIZE    = 4096;
 constexpr int   V46_CONTEXT_SIZE        = 8192;
 constexpr int   OVERFLOW_HEADROOM       = 4;
 constexpr int   BATCH_SIZE              = 2048;
+// Tight-HTP-vmem layout used on Hexagon v73/v75 (see tight_htp_vmem()):
+// n_batch=256 shrinks the logits buffer from ~1.19 GiB to ~148 MiB and
+// n_ctx=2048 shrinks the KV cache from ~576 MiB to ~288 MiB. Together with
+// a CPU vision projector, the whole Qwen3-VL graph then fits one HTP session.
+// n_ctx must stay >= 2 * n_batch + the image-token budget: at n_ctx=1024 an
+// image prefill reaching position 981 cannot allocate the next 256-token
+// chunk ("failed to find a memory slot", M-RoPE X=Y abort). One extra 1024
+// tokens of KV costs ~144 MiB, leaving ~142 MiB of the 3190 MiB HTP window.
+constexpr int   TIGHT_VMEM_BATCH_SIZE       = 256;
+constexpr int   TIGHT_VMEM_CONTEXT_SIZE     = 2048;
+// Qwen3-VL defaults to a 4096-token / 4M-pixel image budget. Cap it at the
+// model's documented minimum of 1024 tokens on tight-VMEM parts; this is
+// applied via mtmd_context_params.image_max_tokens, which rewrites
+// image_max_pixels = tokens * patch_area (clip-model.h).
+constexpr int   TIGHT_VMEM_IMAGE_MAX_TOKENS = 1024;
 // Aligned with the model's generation_config.json (do_sample=true,
 // temperature=0.7, top_k=0, top_p=1.0, repetition_penalty=1.0). top_k=0 and
 // top_p=1.0 effectively disable those filters, so sampling is pure
@@ -365,12 +404,20 @@ JNIEXPORT jint JNICALL
 Java_com_mobiinfer_demo_LlamaEngine_load(JNIEnv *env, jobject, jstring jmodel_path,
                                                 jstring jexperts_path, jint memory_budget_mb, jint context_size) {
     llama_model_params model_params = llama_model_default_params();
+    const bool tight_vmem = tight_htp_vmem();
     g_requested_context_size = context_size > 0 ? context_size : DEFAULT_CONTEXT_SIZE;
+    if (tight_vmem && g_requested_context_size > TIGHT_VMEM_CONTEXT_SIZE) {
+        // Keep the KV cache small enough for the single HTP mapping window.
+        g_requested_context_size = TIGHT_VMEM_CONTEXT_SIZE;
+    }
     model_params.n_gpu_layers = 99;
 
     g_moe = jexperts_path != nullptr;
     g_experts_path.clear();
-    g_batch_size = g_moe ? 8 : BATCH_SIZE;
+    g_batch_size = g_moe ? 8 : (tight_vmem ? TIGHT_VMEM_BATCH_SIZE : BATCH_SIZE);
+    LOGi("HTP layout: tight_vmem=%d arch=v%d n_batch=%d n_ctx=%d",
+         tight_vmem ? 1 : 0, query_hexagon_arch(), g_batch_size,
+         g_requested_context_size);
     g_minicpmv_version = 0;
     if (g_moe) {
         const char *path = env->GetStringUTFChars(jexperts_path, nullptr);
@@ -474,9 +521,13 @@ Java_com_mobiinfer_demo_LlamaEngine_loadMmproj(JNIEnv *env, jobject,
     char architecture[64] = {};
     llama_model_meta_val_str(g_model, "general.architecture", architecture, sizeof(architecture));
     // Qwen3-VL uses the registered Hexagon GPU device for vision by default.
-    mparams.use_gpu = std::string(architecture) == "qwen3vl";
-    LOGi("Vision backend request: architecture=%s backend=%s", architecture,
-         mparams.use_gpu ? "HTP" : "CPU");
+    // On tight-VMEM parts the projector's ~0.8 GiB would evict the main
+    // model's logits buffer from the single HTP session, so keep vision on the
+    // CPU there. The text model still runs fully on the NPU.
+    const bool tight_vmem = tight_htp_vmem();
+    mparams.use_gpu = (std::string(architecture) == "qwen3vl") && !tight_vmem;
+    LOGi("Vision backend request: architecture=%s tight_vmem=%d backend=%s",
+         architecture, tight_vmem ? 1 : 0, mparams.use_gpu ? "HTP" : "CPU");
     mparams.print_timings = false;
 
     g_image_max_slice_nums       = (jint) jimage_max_slice_nums;
@@ -485,6 +536,16 @@ Java_com_mobiinfer_demo_LlamaEngine_loadMmproj(JNIEnv *env, jobject,
     mparams.n_threads = N_THREADS;
     if (g_image_min_tokens > 0) mparams.image_min_tokens = g_image_min_tokens;
     if (g_image_max_tokens > 0) mparams.image_max_tokens = g_image_max_tokens;
+    if (tight_vmem) {
+        // Keep the image-token budget inside the reduced context. Without
+        // this, a 3072x4096 photo expands to ~4M pixels / 9 slices and the
+        // prefill runs past n_ctx, aborting with an M-RoPE position error.
+        // Applied last so an explicit Kotlin-side limit cannot undo the cap.
+        mparams.image_min_tokens = -1;
+        mparams.image_max_tokens = TIGHT_VMEM_IMAGE_MAX_TOKENS;
+        LOGi("Tight-VMEM vision: image_max_tokens capped to %d",
+             mparams.image_max_tokens);
+    }
 
     g_ctx_vision = mtmd_init_from_file(mmproj_path, g_model, mparams);
     env->ReleaseStringUTFChars(jmmproj_path, mmproj_path);
@@ -1141,10 +1202,40 @@ Java_com_mobiinfer_demo_LlamaEngine_prefillImage(
         return 4;
     }
 
+    // Tight-VMEM parts (Hexagon v73/v75) only get n_ctx=2048.  The text path
+    // guards against overrunning it with shift_context() inside
+    // decode_tokens_in_batches(), but the vision path calls
+    // mtmd_helper_eval_chunks() directly: a second image in the same
+    // conversation reuses M-RoPE positions that are already occupied in the
+    // KV cache and llama_decode() fails with "failed to find a memory slot
+    // for batch of size 256" (the turn is then silently dropped by the UI).
+    // Reclaim the conversation KV, keeping the system prompt, so every
+    // vision turn starts from a clean position range.
+    const bool tight_vmem = tight_htp_vmem();
+    auto reclaim_vision_context = [&]() {
+        LOGi("%s: reclaiming vision KV: position %d -> %d (n_ctx=%d)",
+             __func__, (int) current_position, (int) system_prompt_position, g_n_ctx);
+        llama_memory_seq_rm(llama_get_memory(g_context), 0,
+                            system_prompt_position, -1);
+        current_position = system_prompt_position;
+    };
+    if (tight_vmem && current_position > system_prompt_position + 1) {
+        reclaim_vision_context();
+    }
+
     llama_pos new_n_past;
-    if (mtmd_helper_eval_chunks(g_ctx_vision, g_context, chunks,
-                                current_position, 0, g_batch_size,
-                                false, &new_n_past)) {
+    bool eval_failed = mtmd_helper_eval_chunks(g_ctx_vision, g_context, chunks,
+                                               current_position, 0, g_batch_size,
+                                               false, &new_n_past);
+    if (eval_failed && tight_vmem) {
+        // Fallback for any position conflict the pre-check could not predict.
+        LOGw("%s: image eval failed; retrying once after a full KV reclaim", __func__);
+        reclaim_vision_context();
+        eval_failed = mtmd_helper_eval_chunks(g_ctx_vision, g_context, chunks,
+                                              current_position, 0, g_batch_size,
+                                              false, &new_n_past);
+    }
+    if (eval_failed) {
         LOGe("%s: mtmd_helper_eval_chunks failed!", __func__);
         mtmd_input_chunks_free(chunks);
         return 5;
