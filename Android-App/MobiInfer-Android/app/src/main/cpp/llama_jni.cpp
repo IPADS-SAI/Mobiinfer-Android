@@ -164,6 +164,14 @@ static int query_hexagon_arch() {
 // and the vision projector. fastrpc_mmap then fails for `result_output` and
 // the process aborts. Detect those parts and shrink the layout automatically
 // instead of hard-failing. Override with MOBIINFER_TIGHT_VMEM=0/1 for A/B.
+//
+// Both the general layout shrink (tight_htp_vmem) and the reduced MoE layout
+// (mobiinfer_low_vmem_required) must key off this SAME threshold. Keeping two
+// literals here previously left v75-v78 classified as tight yet still loading
+// the full MoE layout (vision on HTP + DSpark + 256-slot bank); that overflows
+// the 32-bit window and aborts with fastrpc_mmap err 0x1 on the expert buffer.
+static constexpr int kTightVmemArchThreshold = 79;
+
 static bool tight_htp_vmem() {
     const char * override = getenv("MOBIINFER_TIGHT_VMEM");
     if (override && *override) {
@@ -174,11 +182,12 @@ static bool tight_htp_vmem() {
         LOGw("Hexagon arch unavailable; assuming a tight HTP mapping window");
         return true;
     }
-    return arch < 79;
+    return arch < kTightVmemArchThreshold;
 }
 
 // True when the device's HTP needs the legacy reduced MoE layout to fit in
 // the per-session mapping window. Overridable with MOBIINFER_LOW_VMEM=0/1.
+// Shares kTightVmemArchThreshold with tight_htp_vmem() (see note above).
 extern "C" int mobiinfer_low_vmem_required() {
     const char * override = getenv("MOBIINFER_LOW_VMEM");
     if (override && *override) {
@@ -187,12 +196,12 @@ extern "C" int mobiinfer_low_vmem_required() {
 
     const int arch = query_hexagon_arch();
     LOGi("Hexagon arch v%d%s", arch,
-         arch > 0 && arch < 75 ? " (low-vmem layout required)" : "");
+         arch > 0 && arch < kTightVmemArchThreshold ? " (low-vmem layout required)" : "");
     if (arch <= 0) {
         LOGw("Hexagon arch query returned v%d; using the conservative low-vmem layout", arch);
         return 1;
     }
-    return arch < 75 ? 1 : 0;
+    return arch < kTightVmemArchThreshold ? 1 : 0;
 }
 
 // Inference parameters mirror the iOS demo defaults (MTMDParams.swift / mtmd-ios.cpp):
