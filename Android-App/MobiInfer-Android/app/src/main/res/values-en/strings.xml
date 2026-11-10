@@ -343,4 +343,20 @@
     <string name="image_param_seed_box">0–9999, leave empty for a new seed each time</string>
     <string name="tool_generating_image_short">Generating the image…</string>
     <string name="tool_loading_image_model">Loading the image model…</string>
+    <!-- Self-update -->
+    <string name="check_updates">Check for updates</string>
+    <string name="version_label">v%1$s</string>
+    <string name="update_checking">Checking for updates…</string>
+    <string name="update_up_to_date">You are up to date</string>
+    <string name="update_check_failed">Update check failed. Check your connection.</string>
+    <string name="update_available_title">Version %1$s is available</string>
+    <string name="update_action">Update</string>
+    <string name="update_later">Later</string>
+    <string name="update_size">Download size: %.1f MB</string>
+    <string name="update_downloading">Downloading the update…</string>
+    <string name="update_download_failed">Download failed. Please try again.</string>
+    <string name="update_mobile_title">Mobile network</string>
+    <string name="update_mobile_message">The update will use mobile data. Wi-Fi is recommended. Continue?</string>
+    <string name="update_allow_install">Allow "install unknown apps" and come back; the install will continue.</string>
+    <string name="update_busy">Busy generating. Try again when it finishes.</string>
 </resources>

@@ -27,6 +27,11 @@
     <!-- TTS: recording reference audio for voice cloning. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
 
+    <!-- Self-update: lets the app hand a downloaded APK to the system installer.
+         Android 8+ additionally requires the user to allow "install unknown
+         apps" for this package; ApkUpdater checks and sends them there. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
     <application
         android:name=".MiniCPMApplication"
         android:allowBackup="true"

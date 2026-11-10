@@ -3,4 +3,6 @@
      is exposed. -->
 <paths>
     <files-path name="generated_images" path="generated_images/" />
+    <!-- Downloaded update APK, see ApkUpdater.apkFile(). -->
+    <cache-path name="updates" path="updates/" />
 </paths>

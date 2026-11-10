@@ -1,10 +1,12 @@
 package com.mobiinfer.demo
 
 import android.content.ClipData
+import android.content.Context
 import android.content.ClipboardManager
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.net.ConnectivityManager
 import android.net.Uri
 import android.os.Bundle
 import android.os.Looper
@@ -17,6 +19,7 @@ import android.view.inputmethod.InputMethodManager
 import android.widget.ArrayAdapter
 import android.widget.ImageButton
 import android.widget.ListPopupWindow
+import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -132,6 +135,12 @@ class MainActivity : AppCompatActivity() {
     private var createdWithLocale: String? = null
     private var isLocaleRestart = false
 
+    // Self-update state: one silent check per process, at most one dialog, and
+    // the downloaded APK kept while the user grants "install unknown apps".
+    private var updateCheckStarted = false
+    private var updatePrompt: AlertDialog? = null
+    private var pendingInstall: File? = null
+
     private data class PreparedImage(
         val prompt: String,
         val bytes: ByteArray,
@@ -194,10 +203,15 @@ class MainActivity : AppCompatActivity() {
 
         setupClickListeners()
         initEngine()
+
+        // Silent once-a-day check; the manual entry is in the drawer footer.
+        checkForUpdates(manual = false)
     }
 
     private fun initViews() {
         recyclerChat = findViewById(R.id.recycler_chat)
+        findViewById<TextView>(R.id.tv_version).text =
+            getString(R.string.version_label, UpdateChecker.installedVersionName(this))
         etInput = findViewById(R.id.et_input)
         btnSend = findViewById(R.id.btn_send)
         btnImage = findViewById(R.id.btn_image)
@@ -574,6 +588,10 @@ class MainActivity : AppCompatActivity() {
         }
         findViewById<com.google.android.material.button.MaterialButton>(R.id.btn_new_conversation)
             .setOnClickListener { startNewConversation() }
+        findViewById<View>(R.id.btn_check_update).setOnClickListener {
+            drawerLayout.closeDrawers()
+            checkForUpdates(manual = true)
+        }
 
         etInput.setOnFocusChangeListener { _, hasFocus ->
             if (hasFocus) {
@@ -3539,6 +3557,118 @@ class MainActivity : AppCompatActivity() {
         return super.dispatchTouchEvent(ev)
     }
 
+    // ---- Self-update -----------------------------------------------------
+
+    /**
+     * Called once per process at startup (silent) and from the drawer footer
+     * (manual). The manifest is small; the download only starts after the user
+     * confirms the dialog.
+     */
+    private fun checkForUpdates(manual: Boolean) {
+        if (manual) {
+            Toast.makeText(this, R.string.update_checking, Toast.LENGTH_SHORT).show()
+        } else {
+            if (updateCheckStarted) return
+            updateCheckStarted = true
+        }
+        lifecycleScope.launch {
+            when (val result = UpdateChecker.check(this@MainActivity, force = manual)) {
+                is UpdateCheck.Available -> showUpdateDialog(result.info)
+                UpdateCheck.UpToDate -> if (manual) {
+                    Toast.makeText(this@MainActivity, R.string.update_up_to_date, Toast.LENGTH_SHORT)
+                        .show()
+                }
+                UpdateCheck.Failed -> if (manual) {
+                    Toast.makeText(this@MainActivity, R.string.update_check_failed, Toast.LENGTH_LONG)
+                        .show()
+                }
+            }
+        }
+    }
+
+    private fun showUpdateDialog(info: UpdateInfo) {
+        if (isFinishing || isDestroyed) return
+        if (updatePrompt?.isShowing == true) return
+        // A version below the manifest's floor cannot be dismissed.
+        val mandatory = UpdateChecker.installedVersionCode(this) < info.minSupportedVersionCode
+        val message = buildString {
+            append(info.notes.trim())
+            if (info.sizeBytes > 0) {
+                if (isNotEmpty()) append("\n\n")
+                append(getString(R.string.update_size, info.sizeBytes / 1024.0 / 1024.0))
+            }
+        }
+        val builder = AlertDialog.Builder(this)
+            .setTitle(getString(R.string.update_available_title, info.versionName))
+            .setMessage(message)
+            .setPositiveButton(R.string.update_action) { _, _ -> startUpdate(info) }
+        if (mandatory) {
+            builder.setCancelable(false)
+        } else {
+            builder.setNegativeButton(R.string.update_later, null)
+        }
+        updatePrompt = builder.show()
+    }
+
+    private fun startUpdate(info: UpdateInfo) {
+        if (isBusy()) {
+            Toast.makeText(this, R.string.update_busy, Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (!onMeteredNetwork()) {
+            downloadAndInstall(info)
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.update_mobile_title)
+            .setMessage(R.string.update_mobile_message)
+            .setPositiveButton(R.string.update_action) { _, _ -> downloadAndInstall(info) }
+            .setNegativeButton(R.string.cancel, null)
+            .show()
+    }
+
+    private fun downloadAndInstall(info: UpdateInfo) {
+        val bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            isIndeterminate = info.sizeBytes <= 0
+            val pad = (24 * resources.displayMetrics.density).toInt()
+            setPadding(pad, pad / 2, pad, pad / 4)
+        }
+        val progressDialog = AlertDialog.Builder(this)
+            .setTitle(R.string.update_downloading)
+            .setView(bar)
+            .setCancelable(false)
+            .create()
+        progressDialog.show()
+
+        lifecycleScope.launch {
+            val apk = ApkUpdater.download(this@MainActivity, info) { percent ->
+                runOnUiThread { if (progressDialog.isShowing) bar.progress = percent }
+            }
+            progressDialog.dismiss()
+            if (isFinishing || isDestroyed) return@launch
+            if (apk == null) {
+                Toast.makeText(this@MainActivity, R.string.update_download_failed, Toast.LENGTH_LONG)
+                    .show()
+                return@launch
+            }
+            if (!ApkUpdater.canInstall(this@MainActivity)) {
+                // The user comes back through onResume(), which retries.
+                pendingInstall = apk
+                Toast.makeText(this@MainActivity, R.string.update_allow_install, Toast.LENGTH_LONG)
+                    .show()
+                ApkUpdater.requestInstallPermission(this@MainActivity)
+                return@launch
+            }
+            ApkUpdater.install(this@MainActivity, apk)
+        }
+    }
+
+    private fun onMeteredNetwork(): Boolean = runCatching {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        cm.isActiveNetworkMetered
+    }.getOrDefault(false)
+
     override fun onResume() {
         super.onResume()
         val currentTag = LocaleManager.currentLanguage(this).tag
@@ -3553,6 +3683,13 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(this, TtsActivity::class.java))
             finish()
             return
+        }
+        pendingInstall?.let { apk ->
+            if (ApkUpdater.canInstall(this)) {
+                pendingInstall = null
+                ApkUpdater.install(this, apk)
+                return
+            }
         }
         if (!::engine.isInitialized) return
         // The image model / generation parameters may have changed in the
