@@ -19,6 +19,23 @@ extern "C" {
 #define HTP_MM_HMX_TILE_N_ELMS 1024
 #define HTP_MM_HMX_MIN_NROWS   4
 
+// MoE（MUL_MAT_ID）专用的 HMX 准入阈值：**M(token 数) <= 该值走 HVX**。
+//
+// 为什么和 dense matmul 的 HTP_MM_HMX_MIN_NROWS 分开：HMX 的 M tile 是硬性 32 行
+// （HTP_MM_HMX_TILE_N_ROWS），而 `hmx_mm_op_matmul_id()` 对**每个专家**做
+// `m_padded = align_up(该专家的行数, 32)`。MoE decode 里每个专家平均只分到
+// **1.6 行**（实测：n=5 时每层 24.7 个不同专家、5 个 token），padding 到 32
+// 就是 20 倍放大。HVX 按 K 维切线程、按行处理，没有这个浪费。
+//
+// 实测（test-backend-ops perf，q3_K / n_mats=88 / n_used=8 / m=512 / k=2048，
+// `exps/hmx-threshold-20261106/`）：
+//   n<=4  : HMX 未准入（沿用旧阈值），HVX 108~193us
+//   n=5   : HMX 1022us vs HVX 263us  → HMX **慢 3.9 倍**
+//   n=12  : HMX 2086us vs HVX 476us  → HMX 慢 4.4 倍
+//   n>=13 : HVX **不支持**（VTCM 装不下），只能走 HMX
+// 所以 MoE 的合理分界就是「HVX 能支持的最大 n」= 12。
+#define HTP_MM_MOE_HMX_MIN_NROWS 12
+
 // --- Weight Repacked Tile Sizes ---
 #define HTP_MM_WEIGHT_TILE_SIZE_Q4_0   576
 #define HTP_MM_WEIGHT_TILE_SIZE_Q4_1   640

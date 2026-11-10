@@ -148,7 +148,8 @@ static size_t opt_mbuf_dyn    = 512ul * 1024 * 1024;      // max dynamic (comput
 static size_t opt_mbuf_static = 1ul * 1024 * 1024 * 1024; // max static (weight/KV) buffer size
 static size_t opt_mbuf_total  = 0;                        // total buffer space limit (0 = unconstrained)
 
-static int    opt_moe_hmx_min_rows = HTP_MM_HMX_MIN_NROWS;
+// MoE（MUL_MAT_ID）的 HMX 准入阈值，见 HTP_MM_MOE_HMX_MIN_NROWS 的注释。
+static int    opt_moe_hmx_min_rows = HTP_MM_MOE_HMX_MIN_NROWS;
 static int    opt_mm_select  = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 static int    opt_fa_select  = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 static int    opt_fa_head_split = 1; // 1 = partition flash_attn by KV heads in multicore (default on), 0 = token-based (original)
@@ -10176,6 +10177,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_nhmx      = str_nhmx     ? atoi(str_nhmx)                         : opt_nhmx;
     opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
     if (str_moe_hmx_min_rows) {
+        // 下界仍是 dense 的 4：低于它没有意义（HVX 在极小 n 上只是略优）。
         opt_moe_hmx_min_rows = std::max((int) HTP_MM_HMX_MIN_NROWS, std::min(4096, atoi(str_moe_hmx_min_rows)));
         GGML_LOG_INFO("ggml-hex: MoE HMX threshold > %d rows\n", opt_moe_hmx_min_rows);
     }
