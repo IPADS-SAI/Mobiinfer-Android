@@ -329,7 +329,6 @@ static std::string get_driver_path() {
 using dl_handle_ptr = std::unique_ptr<dl_handle, dl_handle_deleter>;
 
 int htpdrv_init() {
-    static dl_handle_ptr lib_cdsp_rpc_handle = nullptr;
     static bool initialized = false;
 #ifdef _WIN32
     std::string drv_path = get_driver_path() + "\\" + "libcdsprpc.dll";
@@ -378,7 +377,9 @@ int htpdrv_init() {
     dlsym(handle.get(), remote_handle64_close_pfn_t, remote_handle64_close_pfn, remote_handle64_close, false);
     dlsym(handle.get(), remote_system_request_pfn_t, remote_system_request_pfn, remote_system_request, true);
 
-    lib_cdsp_rpc_handle = std::move(handle);
+    // Backend registry sessions live until process exit. Keep their driver loaded
+    // so static teardown cannot unload FastRPC after Binder has been destroyed.
+    handle.release(); // NOLINT
     initialized         = true;
 
     return AEE_SUCCESS;
