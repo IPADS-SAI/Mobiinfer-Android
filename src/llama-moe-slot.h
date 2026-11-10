@@ -20,6 +20,9 @@ public:
     bool uses_layer(int layer) const;
     bool lookahead_prefetch_enabled() const;
     int  lookahead_prefetch_depth() const;
+    /// 提前**几层**提交 gate 预测（跨层流水的 horizon）。1 = 只预测下一层（旧行为）。
+    /// 建图时按它插 horizon 个 gate，process() 时按它逐个 arm 目标层。
+    int  lookahead_horizon() const;
     int  lookahead_prefetch_max_rows() const;
     /// 每层 decode 窗口宽度（slot 数）。0 = 未启用按层窗口。
     int  decode_window() const;

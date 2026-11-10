@@ -459,15 +459,41 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
         ggml_tensor * attn_post_norm = build_norm(cur, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
         cb(attn_post_norm, "attn_post_norm", il);
 
+        // ── 跨层流水：一次性把接下来 horizon 层的 gate 都提交掉 ──────────────
+        //
+        // 老实现只算 il+1 一层的 gate，于是读盘最多只能提前**一层**发起。实测一层的
+        // 提前量只有 ~2.1 ms，而一批 8 个专家要 8 ms，75% 的预读因此迟到（§4.46）。
+        // 这里把 horizon 个 gate 全部用**同一个** attn_post_norm 算出来（跳过的层越多
+        // 越不准，越大越亏；**默认 2**，实测优于 1 和 4，数值见 README §3.33），
+        // tensor 沿 ne0 拼成一个
+        // [horizon*depth, rows] 的张量交给 slot runtime，它按块拆回目标层。
         ggml_tensor * lookahead_next = nullptr;
         if (moe_slots && moe_slots->lookahead_prefetch_enabled() &&
-            ubatch.n_tokens <= (uint32_t) moe_slots->lookahead_prefetch_max_rows() &&
-            il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp != nullptr) {
-            ggml_tensor * prefetch_router_logits = build_lora_mm(model.layers[il + 1].ffn_gate_inp, attn_post_norm);
-            cb(prefetch_router_logits, "prefetch_router_logits", il);
-            lookahead_next = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, prefetch_router_logits, moe_slots->lookahead_prefetch_depth()));
-            cb(lookahead_next, "prefetch_topk", il);
-            ggml_build_forward_expand(gf, lookahead_next);
+            ubatch.n_tokens <= (uint32_t) moe_slots->lookahead_prefetch_max_rows()) {
+            const int horizon = moe_slots->lookahead_horizon();
+            std::vector<ggml_tensor *> preds;
+            preds.reserve((size_t) horizon);
+            for (int k = 1; k <= horizon && il + k < n_layer; ++k) {
+                if (model.layers[il + k].ffn_gate_inp == nullptr) {
+                    break;
+                }
+                ggml_tensor * prefetch_router_logits =
+                    build_lora_mm(model.layers[il + k].ffn_gate_inp, attn_post_norm);
+                cb(prefetch_router_logits, "prefetch_router_logits", il);
+                ggml_tensor * top = ggml_cont(ctx0, ggml_argsort_top_k(
+                    ctx0, prefetch_router_logits, moe_slots->lookahead_prefetch_depth()));
+                cb(top, "prefetch_topk", il);
+                ggml_build_forward_expand(gf, top);
+                preds.push_back(top);
+            }
+            if (!preds.empty()) {
+                lookahead_next = preds[0];
+                for (size_t i = 1; i < preds.size(); ++i) {
+                    lookahead_next = ggml_cont(ctx0, ggml_concat(ctx0, lookahead_next, preds[i], 0));
+                    cb(lookahead_next, "prefetch_topk_cat", il);
+                    ggml_build_forward_expand(gf, lookahead_next);
+                }
+            }
         }
         if (moe_slots) {
             moe_slots->set_lookahead_pred(lookahead_next);
