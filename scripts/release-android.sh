@@ -192,7 +192,7 @@ GITHUB_URL="https://github.com/$GITHUB_REPO/releases/download/$TAG/MobiInfer-And
 
 NOTES_ZH="MobiInfer-Android $TAG"
 if [[ -n "$NOTES_FILE" && -f "$NOTES_FILE" ]]; then
-    NOTES_ZH=$(sed '1{/^## /d;}' "$NOTES_FILE")
+    NOTES_ZH=$(sed '1{/^## /d;}' "$NOTES_FILE" | sed '/./,$!d')
 fi
 
 UPDATE_JSON="$DIST/update.json"
