@@ -28,7 +28,7 @@
 #
 # Environment overrides:
 #   GITCODE_REPO, GITCODE_REMOTE, CHENGDU_HOST, CHENGDU_WEBROOT, PUBLIC_BASE,
-#   GITHUB_REPO, GRADLE_USER_HOME, ANDROID_HOME
+#   GITHUB_REPO, ANDROID_HOME
 #
 set -euo pipefail
 
@@ -88,8 +88,9 @@ log "release $TAG ($VERSION_NAME, versionCode $VERSION_CODE)"
 
 if (( DO_BUILD )); then
     log "building :app:assembleRelease"
-    ( cd "$APP_DIR" && GRADLE_USER_HOME=${GRADLE_USER_HOME:-$ROOT/.gradle-user-home} \
-        ./gradlew :app:assembleRelease )
+    # Keep the Gradle user home at its default: the release signing
+    # properties live in ~/.gradle/gradle.properties and are only visible there.
+    ( cd "$APP_DIR" && ./gradlew :app:assembleRelease )
 fi
 
 if [[ -z "$APK" ]]; then
