@@ -162,8 +162,9 @@ except Exception:
     sys.exit(0)
 assets = data.get("assets", data if isinstance(data, list) else [])
 for a in assets:
-    if a.get("type") == "attach":
-        print(a.get("id", ""), a.get("name", ""))
+    # Source archives have no id; only attached assets can be deleted.
+    if a.get("id") and str(a.get("name", "")).endswith((".apk", "SHA256SUMS")):
+        print(a.get("id"), a.get("name"))
 ' | while read -r asset_id asset_name; do
             [[ -n "$asset_id" ]] || continue
             case "$asset_name" in
