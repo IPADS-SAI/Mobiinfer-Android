@@ -9,12 +9,13 @@
 #   5. create the GitCode release and upload the APK + SHA256SUMS
 #   6. publish update.json (GitCode -> Chengdu -> GitHub) and mirror the APK
 #
-# The App reads update.json from https://mobiinfer.yiguzhaojin.cn/update.json
-# at most once a day and installs the first mirror whose bytes match sha256
-# and whose signer matches the installed app.
+# The App reads update.json from the endpoint baked into the build (see the
+# updateManifestUrl property in app/build.gradle.kts) at most once a day and
+# installs the first mirror whose bytes match sha256 and whose signer matches
+# the installed app.
 #
 # Usage:
-#   scripts/release-android.sh --tag v0.4.2 [options]
+#   scripts/release-android.sh --tag v1.0.0 [options]
 #
 # Options:
 #   --tag <tag>            Release tag (default: v<versionName>)
@@ -33,10 +34,15 @@
 #   --no-chengdu           Do not upload the APK / update.json to Chengdu
 #   --chengdu              Publish to Chengdu even together with --no-push
 #   --allow-dirty          Tag HEAD even if the working tree has changes
+#   --allow-unpinned-cert  Skip the CERT_SHA256 signer-identity check
 #
 # Environment overrides:
 #   GITCODE_REPO, GITCODE_REMOTE, CHENGDU_HOST, CHENGDU_WEBROOT, PUBLIC_BASE,
-#   GITHUB_REPO, ANDROID_HOME
+#   GITHUB_REPO, CERT_SHA256, ANDROID_HOME
+#
+# Per-machine values belong in scripts/release.local.env (gitignored); see
+# scripts/release.local.env.example. GITHUB_REPO defaults to the `origin`
+# remote when unset.
 #
 set -euo pipefail
 
@@ -45,12 +51,25 @@ APP_DIR="$ROOT/Android-App/MobiInfer-Android"
 GRADLE_FILE="$APP_DIR/app/build.gradle.kts"
 DIST="$APP_DIR/app/build/release-dist"
 
-GITCODE_REPO=${GITCODE_REPO:-YYDH2121/MobiInfer-Android}
+if [[ -f "$ROOT/scripts/release.local.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "$ROOT/scripts/release.local.env"
+    set +a
+fi
+
+GITCODE_REPO=${GITCODE_REPO:-}
 GITCODE_REMOTE=${GITCODE_REMOTE:-gitcode}
-GITHUB_REPO=${GITHUB_REPO:-IPADS-SAI/Mobiinfer-Android}
-CHENGDU_HOST=${CHENGDU_HOST:-chengdu}
-CHENGDU_WEBROOT=${CHENGDU_WEBROOT:-/var/www/mobiinfer}
-PUBLIC_BASE=${PUBLIC_BASE:-https://mobiinfer.yiguzhaojin.cn}
+GITHUB_REPO=${GITHUB_REPO:-}
+CHENGDU_HOST=${CHENGDU_HOST:-}
+CHENGDU_WEBROOT=${CHENGDU_WEBROOT:-}
+PUBLIC_BASE=${PUBLIC_BASE:-}
+CERT_SHA256=${CERT_SHA256:-}
+
+if [[ -z "$GITHUB_REPO" ]]; then
+    origin_url=$(git -C "$ROOT" remote get-url origin 2>/dev/null || true)
+    GITHUB_REPO=$(sed -nE 's#.*github\.com[:/]([^/]+/[^/]+?)(\.git)?$#\1#p' <<<"$origin_url")
+fi
 
 TAG=""
 APK=""
@@ -65,6 +84,7 @@ PRERELEASE=0
 REPLACE=0
 VERIFY=1
 DO_DEBUG=0
+ALLOW_UNPINNED=0
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 log() { printf '\n== %s\n' "$*"; }
@@ -95,6 +115,7 @@ while [[ $# -gt 0 ]]; do
         --no-chengdu)    DO_CHENGDU=0; shift ;;
         --chengdu)       DO_CHENGDU=1; CHENGDU_EXPLICIT=1; shift ;;
         --allow-dirty)   ALLOW_DIRTY=1; shift ;;
+        --allow-unpinned-cert) ALLOW_UNPINNED=1; shift ;;
         --replace)       REPLACE=1; shift ;;
         --no-verify)     VERIFY=0; shift ;;
         --with-debug)    DO_DEBUG=1; shift ;;
@@ -102,6 +123,20 @@ while [[ $# -gt 0 ]]; do
         *)               die "unknown option: $1 (try --help)" ;;
     esac
 done
+
+if [[ -z "$PUBLIC_BASE" ]]; then
+    die "PUBLIC_BASE is unset; copy scripts/release.local.env.example to scripts/release.local.env"
+fi
+if (( DO_PUSH )) && [[ -z "$GITCODE_REPO" ]]; then
+    die "GITCODE_REPO is unset (scripts/release.local.env)"
+fi
+if (( DO_CHENGDU )); then
+    [[ -n "$CHENGDU_HOST" ]] || die "CHENGDU_HOST is unset (scripts/release.local.env)"
+    [[ -n "$CHENGDU_WEBROOT" ]] || die "CHENGDU_WEBROOT is unset (scripts/release.local.env)"
+fi
+if [[ -z "$CERT_SHA256" ]] && (( ! ALLOW_UNPINNED )); then
+    die "CERT_SHA256 is unset; pin the release certificate or pass --allow-unpinned-cert"
+fi
 
 [[ -f "$GRADLE_FILE" ]] || die "missing $GRADLE_FILE"
 
@@ -154,11 +189,12 @@ grep -q 'v3 scheme (APK Signature Scheme v3): true' <<<"$verify_out" || die "APK
 
 # A valid signature is not enough: it must be the key users already have,
 # otherwise every installed client rejects the update.
-CERT_SHA256=${CERT_SHA256:-01e0352b9f352035d9908de007a05901cdc48f69eafda8a67a894336a5ac7630}
-apk_cert=$("$APKSIGNER" verify --print-certs "$APK" 2>/dev/null \
-    | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -1)
-[[ "$apk_cert" == "$CERT_SHA256" ]] \
-    || die "APK signer $apk_cert != pinned $CERT_SHA256 (wrong keystore?)"
+if [[ -n "$CERT_SHA256" ]]; then
+    apk_cert=$("$APKSIGNER" verify --print-certs "$APK" 2>/dev/null \
+        | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -1)
+    [[ "$apk_cert" == "$CERT_SHA256" ]] \
+        || die "APK signer $apk_cert != pinned $CERT_SHA256 (wrong keystore?)"
+fi
 
 mkdir -p "$DIST"
 DIST_APK="$DIST/MobiInfer-Android-v$VERSION_NAME.apk"
@@ -268,10 +304,13 @@ fi
 
 # ---------------------------------------------------------------- update.json
 
-GITCODE_URL="https://gitcode.com/$GITCODE_REPO/releases/download/$TAG/MobiInfer-Android-v$VERSION_NAME.apk"
+GITCODE_URL=""
+[[ -n "$GITCODE_REPO" ]] && GITCODE_URL="https://gitcode.com/$GITCODE_REPO/releases/download/$TAG/MobiInfer-Android-v$VERSION_NAME.apk"
 CHENGDU_URL="$PUBLIC_BASE/apk/MobiInfer-Android-v$VERSION_NAME.apk"
-GITHUB_URL="https://github.com/$GITHUB_REPO/releases/download/$TAG/MobiInfer-Android-v$VERSION_NAME.apk"
-GITCODE_DEBUG_URL="https://gitcode.com/$GITCODE_REPO/releases/download/$TAG/MobiInfer-Android-v$VERSION_NAME-debug.apk"
+GITHUB_URL=""
+[[ -n "$GITHUB_REPO" ]] && GITHUB_URL="https://github.com/$GITHUB_REPO/releases/download/$TAG/MobiInfer-Android-v$VERSION_NAME.apk"
+GITCODE_DEBUG_URL=""
+[[ -n "$GITCODE_REPO" ]] && GITCODE_DEBUG_URL="https://gitcode.com/$GITCODE_REPO/releases/download/$TAG/MobiInfer-Android-v$VERSION_NAME-debug.apk"
 CHENGDU_DEBUG_URL="$PUBLIC_BASE/apk/MobiInfer-Android-v$VERSION_NAME-debug.apk"
 
 NOTES_ZH="MobiInfer-Android $TAG"
@@ -294,7 +333,7 @@ doc = {
     "versionCode": int(env["VERSION_CODE"]),
     "versionName": env["VERSION_NAME"],
     "minSupportedVersionCode": int(env["MIN_SUPPORTED"]),
-    "apkUrls": [env["GITCODE_URL"], env["CHENGDU_URL"], env["GITHUB_URL"]],
+    "apkUrls": [u for u in (env["GITCODE_URL"], env["CHENGDU_URL"], env["GITHUB_URL"]) if u],
     "sha256": env["SHA256"],
     "sizeBytes": int(env["SIZE"]),
     "publishedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -304,7 +343,7 @@ if env.get("DEBUG_ENABLED") == "1":
     doc["debug"] = {
         "versionCode": int(env["VERSION_CODE"]),
         "versionName": env["VERSION_NAME"] + "-debug",
-        "apkUrls": [env["GITCODE_DEBUG_URL"], env["CHENGDU_DEBUG_URL"]],
+        "apkUrls": [u for u in (env["GITCODE_DEBUG_URL"], env["CHENGDU_DEBUG_URL"]) if u],
         "sha256": env["DEBUG_SHA256"],
         "sizeBytes": int(env["DEBUG_SIZE"]),
     }
@@ -348,7 +387,7 @@ if (( VERIFY )); then
         log "ok $url"
     }
 
-    if (( DO_PUSH )); then
+    if (( DO_PUSH )) && [[ -n "$GITCODE_URL" ]]; then
         verify_sha "$GITCODE_URL"
         if (( DO_DEBUG )); then
             verify_sha "$GITCODE_DEBUG_URL" "$DEBUG_SHA"
@@ -365,7 +404,7 @@ if (( VERIFY )); then
             || die "update.json advertises $manifest_code, expected $VERSION_CODE"
     fi
 
-    if (( DO_PUSH || DO_CHENGDU )) \
+    if [[ -n "$GITHUB_URL" ]] && (( DO_PUSH || DO_CHENGDU )) \
         && ! curl -fsSIL --max-time 30 "$GITHUB_URL" >/dev/null 2>&1; then
         log "note: GitHub fallback not published yet ($GITHUB_URL)"
     fi
