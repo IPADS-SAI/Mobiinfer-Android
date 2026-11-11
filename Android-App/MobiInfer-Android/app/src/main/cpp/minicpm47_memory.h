@@ -40,11 +40,16 @@ inline MiniCPM47MemoryConfig minicpm47_memory_config(int budget_mb) {
     // the draft3 default has not been remeasured against that calibration.
     const int bank = 256;
     const int ubatch = 128;
-    const int prefetch = 0;
     const int64_t fixed_bytes = 4650000000LL;
     const int total_slots = int(std::min<int64_t>(
         (int64_t(budget_mb) * 1000000 - fixed_bytes) / MiniCPM47MemoryConfig::slot_bytes,
         MiniCPM47MemoryConfig::max_useful_slots));
+    // Match bench/bench.sh defaults (PREFETCH=1 DEPTH=8 READ=8 WINDOW=80):
+    // 8 prefetch slots + 72..80 window slots. With the 10200 MB default budget
+    // this yields exactly 88 slots -> window 80 (see LlamaEngine default).
+    // Small budgets keep the old prefetch=0 behavior so the window does not
+    // shrink below what the device could already run.
+    const int prefetch = total_slots >= 80 ? 8 : 0;
     if (total_slots < prefetch + 8) {
         throw std::invalid_argument("MiniCPM-V 4.7 budget leaves fewer than 8 expert cache slots");
     }

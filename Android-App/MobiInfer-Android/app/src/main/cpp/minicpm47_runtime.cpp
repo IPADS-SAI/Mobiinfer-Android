@@ -90,6 +90,8 @@ struct MiniCPM47Runtime::Impl {
     int image_min_tokens = -1;
     int image_max_tokens = -1;
     int cache_slots = 0;
+    int ready = 1;    // LLAMA_MOE_EXPERT_READY (runtime.json "ready")
+    int refresh = 1;  // LLAMA_MOE_PREFETCH_REFRESH (runtime.json "refresh")
     bool context_truncated = false;
     std::array<double, 5> last_performance_stats = {0.0, 0.0, 0.0, 0.0, 0.0};
 
@@ -131,7 +133,7 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
     impl->memory_budget_mb = memory.budget_mb;
     impl->cache_slots = memory.cache_slots;
     int prefetch = memory.prefetch;
-    int io_threads = 4;
+    int io_threads = 8;
     int benchmark_cache_slots = -1;
     int benchmark_ubatch = memory.ubatch;
     int benchmark_bank = memory.bank;
@@ -153,6 +155,17 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
         impl->benchmark_eager_mmproj = config.value("eager_mmproj", true);
         cfg_draft_n_max = config.value("draft_n_max", -1);
         cfg_batch       = config.value("batch", 0);
+        impl->ready     = config.value("ready", 1);
+        impl->refresh   = config.value("refresh", 1);
+        if (impl->ready != 0 && impl->ready != 1) {
+            throw std::invalid_argument("runtime.json ready must be 0 or 1");
+        }
+        if (impl->refresh != 0 && impl->refresh != 1) {
+            throw std::invalid_argument("runtime.json refresh must be 0 or 1");
+        }
+        if (impl->refresh && !impl->ready) {
+            throw std::invalid_argument("runtime.json refresh=1 requires ready=1");
+        }
         cfg_layer_windows = config.value("layer_windows", std::string());
         cfg_prewarm     = config.value("prewarm", std::string());
         phase_reuse    = config.value("phase_reuse", phase_reuse);
@@ -189,6 +202,16 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
     }
     if (impl->cache_slots < 8) {
         throw std::invalid_argument("Benchmark prefetch leaves fewer than 8 expert cache slots");
+    }
+    // The ready/refresh pair is only valid with a real decode window and
+    // prefetch depth (engine: refresh needs ready + prefetch/read > 0).
+    // Small-budget devices keep prefetch=0, so degrade instead of throwing.
+    if (prefetch <= 0 && impl->refresh) {
+        LOGi("MiniCPM47 refresh disabled: prefetch=%d (small-budget config)", prefetch);
+        impl->refresh = 0;
+    }
+    if (!impl->ready && impl->refresh) {
+        impl->refresh = 0;
     }
     p.model.path = model;
     p.moe_experts = experts;
@@ -320,6 +343,16 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
     setenv("LLAMA_MOE_IO_THREADS", std::to_string(io_threads).c_str(), 1);
     setenv("LLAMA_MOE_LOOKAHEAD_PREFETCH", prefetch > 0 ? "1" : "0", 1);
     setenv("LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH", std::to_string(prefetch).c_str(), 1);
+    // bench v3 default (fastest arm, 2026-11-10): H2/Q4/MAX_ROWS 8,
+    // IO8/W80/P8, READY=1/REFRESH=1 (bench measured 21.9 t/s). Human asked
+    // the App default to match the bench default, so enable the ready/refresh
+    // pair here; it needs READY=1, H2, prefetch/read>0, window/depth>0 and
+    // bank>=2*depth+8, all of which hold for the defaults above.
+    setenv("LLAMA_MOE_LOOKAHEAD_HORIZON", "2", 1);
+    setenv("LLAMA_MOE_PREFETCH_QUEUE", "4", 1);
+    setenv("LLAMA_MOE_WINDOW_MAX_ROWS", "8", 1);
+    setenv("LLAMA_MOE_EXPERT_READY", impl->ready ? "1" : "0", 1);
+    setenv("LLAMA_MOE_PREFETCH_REFRESH", impl->refresh ? "1" : "0", 1);
     LOGi("MiniCPM47 expert configuration: cache=%d prefetch=%d io_threads=%d",
          impl->cache_slots, prefetch, io_threads);
     setenv("LLAMA_MOE_PREFILL_WARM_ROWS", "0", 1);

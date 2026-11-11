@@ -87,11 +87,11 @@ class LlamaEngine private constructor(
         private const val KEY_DEFAULT_MODEL_APPLIED = "default_model_applied_id"
         private const val KEY_IMAGE_MAX_SLICE = "image_max_slice_nums"
         private const val KEY_IMAGE_SCALE_FACTOR = "image_scale_factor"
-        private const val KEY_MEMORY_BUDGET_MB = "minicpm47_memory_budget_v2_mb"
+        private const val KEY_MEMORY_BUDGET_MB = "minicpm47_memory_budget_v3_mb"
         private const val KEY_RUNTIME_RELOAD = "minicpm47_memory_budget_reload_pending"
         private const val KEY_CONTEXT_SIZE = "context_size_tokens"
         const val MIN_MEMORY_BUDGET_MB = 5200
-        const val DEFAULT_MEMORY_BUDGET_MB = 8000
+        const val DEFAULT_MEMORY_BUDGET_MB = 10200
         const val ABSOLUTE_MAX_MEMORY_BUDGET_MB = 13000
         private const val MEMORY_RESERVE_MB = 3072
 
@@ -128,9 +128,19 @@ class LlamaEngine private constructor(
         fun getMemoryBudgetMb(context: Context): Int {
             val maxMb = getMaxMemoryBudgetMb(context)
             val preferences = prefs(context)
-            val stored = preferences.getInt(KEY_MEMORY_BUDGET_MB, DEFAULT_MEMORY_BUDGET_MB)
+            val stored = when {
+                // v3 changed the default (8000 -> 10200, which is what unlocks
+                // W80/P8). Keep an explicit v2 choice (users may have lowered it
+                // to avoid OOM / HTP mapping limits) instead of silently
+                // resetting it; only fresh installs get the new default.
+                preferences.contains(KEY_MEMORY_BUDGET_MB) ->
+                    preferences.getInt(KEY_MEMORY_BUDGET_MB, DEFAULT_MEMORY_BUDGET_MB)
+                preferences.contains("minicpm47_memory_budget_v2_mb") ->
+                    preferences.getInt("minicpm47_memory_budget_v2_mb", DEFAULT_MEMORY_BUDGET_MB)
+                else -> DEFAULT_MEMORY_BUDGET_MB
+            }
             val bounded = stored.coerceIn(MIN_MEMORY_BUDGET_MB, maxMb)
-            if (stored != bounded) {
+            if (!preferences.contains(KEY_MEMORY_BUDGET_MB) || stored != bounded) {
                 preferences.edit().putInt(KEY_MEMORY_BUDGET_MB, bounded)
                     .putBoolean(KEY_RUNTIME_RELOAD, true).apply()
             }
