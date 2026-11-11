@@ -7,6 +7,7 @@
 #   3. enforce the MobiInfer-Android-v<versionName>.apk name
 #   4. create the git tag and push it to GitCode
 #   5. create the GitCode release and upload the APK + SHA256SUMS
+#      (optionally mirror the same assets to the GitHub release)
 #   6. publish update.json (GitCode -> Chengdu -> GitHub) and mirror the APK
 #
 # The App reads update.json from the endpoint baked into the build (see the
@@ -26,6 +27,8 @@
 #   --no-build             Do not run gradle (requires --apk or a fresh build)
 #   --with-debug           Also build a debug APK and publish the "debug"
 #                          channel (GitCode + Chengdu)
+#   --with-github          Also create/update the GitHub release and upload
+#                          release + debug assets there
 #   --replace              Re-upload assets when the release already exists
 #                          (refused by default: published versions are immutable)
 #   --no-verify            Skip the post-publish download/checksum checks
@@ -84,6 +87,7 @@ PRERELEASE=0
 REPLACE=0
 VERIFY=1
 DO_DEBUG=0
+DO_GITHUB=0
 ALLOW_UNPINNED=0
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -119,6 +123,7 @@ while [[ $# -gt 0 ]]; do
         --replace)       REPLACE=1; shift ;;
         --no-verify)     VERIFY=0; shift ;;
         --with-debug)    DO_DEBUG=1; shift ;;
+        --with-github)   DO_GITHUB=1; shift ;;
         -h|--help)       usage; exit 0 ;;
         *)               die "unknown option: $1 (try --help)" ;;
     esac
@@ -129,6 +134,11 @@ if [[ -z "$PUBLIC_BASE" ]]; then
 fi
 if (( DO_PUSH )) && [[ -z "$GITCODE_REPO" ]]; then
     die "GITCODE_REPO is unset (scripts/release.local.env)"
+fi
+if (( DO_GITHUB )); then
+    (( DO_PUSH )) || die "--with-github requires pushing (drop --no-push)"
+    [[ -n "$GITHUB_REPO" ]] || die "GITHUB_REPO is unset and origin is not a GitHub remote"
+    command -v gh >/dev/null || die "--with-github needs the gh CLI"
 fi
 if (( DO_CHENGDU )); then
     [[ -n "$CHENGDU_HOST" ]] || die "CHENGDU_HOST is unset (scripts/release.local.env)"
@@ -266,6 +276,22 @@ for a in assets:
     fi
 
     gc release upload "$TAG" "$DIST_APK" "$DIST/SHA256SUMS" -R "$GITCODE_REPO"
+
+    if (( DO_GITHUB )); then
+        log "publishing GitHub release $TAG"
+        if gh release view "$TAG" -R "$GITHUB_REPO" >/dev/null 2>&1; then
+            existing=$(gh release view "$TAG" -R "$GITHUB_REPO" --json assets \
+                --jq '.assets[].name')
+            if grep -qxF "$(basename "$DIST_APK")" <<<"$existing" && (( ! REPLACE )); then
+                die "GitHub release $TAG already has $(basename "$DIST_APK"); pass --replace"
+            fi
+            gh release upload "$TAG" "$DIST_APK" "$DIST/SHA256SUMS" -R "$GITHUB_REPO" --clobber
+        else
+            create=(release create "$TAG" -R "$GITHUB_REPO" --title "$TAG" --notes-file "$NOTES_FILE")
+            (( PRERELEASE )) && create+=(--prerelease)
+            gh "${create[@]}" "$DIST_APK" "$DIST/SHA256SUMS"
+        fi
+    fi
 fi
 
 # ---------------------------------------------------------------- debug channel
@@ -300,6 +326,9 @@ if (( DO_DEBUG )); then
         scp -F "${HOME}/.ssh/config" -o BatchMode=yes \
             "$DEBUG_APK" "$CHENGDU_HOST:$CHENGDU_WEBROOT/apk/"
     fi
+    if (( DO_GITHUB )); then
+        gh release upload "$TAG" "$DEBUG_APK" -R "$GITHUB_REPO" --clobber
+    fi
 fi
 
 # ---------------------------------------------------------------- update.json
@@ -309,6 +338,8 @@ GITCODE_URL=""
 CHENGDU_URL="$PUBLIC_BASE/apk/MobiInfer-Android-v$VERSION_NAME.apk"
 GITHUB_URL=""
 [[ -n "$GITHUB_REPO" ]] && GITHUB_URL="https://github.com/$GITHUB_REPO/releases/download/$TAG/MobiInfer-Android-v$VERSION_NAME.apk"
+GITHUB_DEBUG_URL=""
+[[ -n "$GITHUB_REPO" ]] && GITHUB_DEBUG_URL="https://github.com/$GITHUB_REPO/releases/download/$TAG/MobiInfer-Android-v$VERSION_NAME-debug.apk"
 GITCODE_DEBUG_URL=""
 [[ -n "$GITCODE_REPO" ]] && GITCODE_DEBUG_URL="https://gitcode.com/$GITCODE_REPO/releases/download/$TAG/MobiInfer-Android-v$VERSION_NAME-debug.apk"
 CHENGDU_DEBUG_URL="$PUBLIC_BASE/apk/MobiInfer-Android-v$VERSION_NAME-debug.apk"
@@ -324,6 +355,7 @@ SHA256="$sha" SIZE="$size" NOTES_ZH="$NOTES_ZH" \
 GITCODE_URL="$GITCODE_URL" CHENGDU_URL="$CHENGDU_URL" GITHUB_URL="$GITHUB_URL" \
 DEBUG_ENABLED="$DO_DEBUG" DEBUG_SHA256="$DEBUG_SHA" DEBUG_SIZE="$DEBUG_SIZE" \
 GITCODE_DEBUG_URL="$GITCODE_DEBUG_URL" CHENGDU_DEBUG_URL="$CHENGDU_DEBUG_URL" \
+GITHUB_DEBUG_URL="$GITHUB_DEBUG_URL" \
 python3 - > "$UPDATE_JSON" <<'PY'
 import json, os, sys
 from datetime import datetime, timezone
@@ -343,7 +375,7 @@ if env.get("DEBUG_ENABLED") == "1":
     doc["debug"] = {
         "versionCode": int(env["VERSION_CODE"]),
         "versionName": env["VERSION_NAME"] + "-debug",
-        "apkUrls": [u for u in (env["GITCODE_DEBUG_URL"], env["CHENGDU_DEBUG_URL"]) if u],
+        "apkUrls": [u for u in (env["GITCODE_DEBUG_URL"], env["CHENGDU_DEBUG_URL"], env["GITHUB_DEBUG_URL"]) if u],
         "sha256": env["DEBUG_SHA256"],
         "sizeBytes": int(env["DEBUG_SIZE"]),
     }
@@ -391,6 +423,12 @@ if (( VERIFY )); then
         verify_sha "$GITCODE_URL"
         if (( DO_DEBUG )); then
             verify_sha "$GITCODE_DEBUG_URL" "$DEBUG_SHA"
+        fi
+    fi
+    if (( DO_GITHUB )) && [[ -n "$GITHUB_URL" ]]; then
+        verify_sha "$GITHUB_URL"
+        if (( DO_DEBUG )); then
+            verify_sha "$GITHUB_DEBUG_URL" "$DEBUG_SHA"
         fi
     fi
     if (( DO_CHENGDU )); then
