@@ -131,12 +131,17 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
         // 这里一律先按「非必需」创建，避免 create_tensor 在 gguf 缺项时直接抛；
         // 找不到来源时再按调用方传的 flags 决定是否报错。
         const bool required = !(flags & TENSOR_NOT_REQUIRED);
-        ggml_tensor * tensor = create_tensor_own_alloc(
-            ml, tensor_name, dims, flags | TENSOR_NOT_REQUIRED);
+        // Only the slot-bank path feeds routed weights from the runtime expert
+        // store (pre-packed tiled bytes on the alloc-only buffer). A regular
+        // full-GGUF model keeps the normal buffer so the backend can lazily
+        // repack it on the first graph.
+        ggml_tensor * tensor = moe_slot_bank_enabled()
+            ? create_tensor_own_alloc(ml, tensor_name, dims, flags | TENSOR_NOT_REQUIRED)
+            : create_tensor         (ml, tensor_name, dims, flags | TENSOR_NOT_REQUIRED);
 
         const auto * entry = moe_experts_entry(tensor_name.str().c_str());
 
-        if (!tensor && entry) {
+        if (!tensor && entry && moe_slot_bank_enabled()) {
             tensor = create_expert_tensor_from_manifest(ml, tensor_name, dims, entry->type);
         }
         if (!tensor) {
