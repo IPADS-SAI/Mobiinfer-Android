@@ -289,9 +289,14 @@ tasks.register("buildHtpSkels") {
     doLast {
         val cmake = "$sdkRoot/cmake/4.1.2/bin/cmake"
         destDir.mkdirs()
+        // Only this task's own family is pruned. libggml-htp-img-v*.so belongs
+        // to buildImageGen (vendored ggml, different op set) and must survive a
+        // -PskipImageGen build, otherwise skipping one build silently strips the
+        // text-to-image skels from the next APK.
         val selected = htpSkels.map { "libggml-htp-$it.so" }.toSet()
         destDir.listFiles { file ->
             file.isFile && file.name.startsWith("libggml-htp-") &&
+                !file.name.startsWith("libggml-htp-img-") &&
                 file.extension == "so" && file.name !in selected
         }?.forEach { stale ->
             stale.delete()
