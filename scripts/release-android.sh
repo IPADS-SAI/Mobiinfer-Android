@@ -23,6 +23,9 @@
 #   --min-supported <code> versionCode below which the update is mandatory
 #   --prerelease           Mark the GitCode release as a pre-release
 #   --no-build             Do not run gradle (requires --apk or a fresh build)
+#   --replace              Re-upload assets when the release already exists
+#                          (refused by default: published versions are immutable)
+#   --no-verify            Skip the post-publish download/checksum checks
 #   --no-push              Do not create/push the tag, touch GitCode or publish
 #                          update.json (implies --no-chengdu unless --chengdu)
 #   --no-chengdu           Do not upload the APK / update.json to Chengdu
@@ -57,6 +60,8 @@ DO_CHENGDU=1
 CHENGDU_EXPLICIT=0
 ALLOW_DIRTY=0
 PRERELEASE=0
+REPLACE=0
+VERIFY=1
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 log() { printf '\n== %s\n' "$*"; }
@@ -87,6 +92,8 @@ while [[ $# -gt 0 ]]; do
         --no-chengdu)    DO_CHENGDU=0; shift ;;
         --chengdu)       DO_CHENGDU=1; CHENGDU_EXPLICIT=1; shift ;;
         --allow-dirty)   ALLOW_DIRTY=1; shift ;;
+        --replace)       REPLACE=1; shift ;;
+        --no-verify)     VERIFY=0; shift ;;
         -h|--help)       usage; exit 0 ;;
         *)               die "unknown option: $1 (try --help)" ;;
     esac
@@ -185,28 +192,33 @@ if (( DO_PUSH )); then
 
     log "publishing GitCode release $TAG"
     if gc release view "$TAG" -R "$GITCODE_REPO" >/dev/null 2>&1; then
-        # Replace assets with the same names so reruns are idempotent.
-        gc release view "$TAG" -R "$GITCODE_REPO" --json 2>/dev/null \
+        asset_list=$(gc release view "$TAG" -R "$GITCODE_REPO" --json 2>/dev/null \
             | python3 -c '
 import json, sys
 try:
     data = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
-assets = data.get("assets", data if isinstance(data, list) else [])
+assets = data.get("assets", []) if isinstance(data, dict) else []
 for a in assets:
-    # Source archives have no id; only attached assets can be deleted.
-    if a.get("id") and str(a.get("name", "")).endswith((".apk", "SHA256SUMS")):
+    if a.get("id"):
         print(a.get("id"), a.get("name"))
-' | while read -r asset_id asset_name; do
-            [[ -n "$asset_id" ]] || continue
-            case "$asset_name" in
-                MobiInfer-Android-*.apk|SHA256SUMS)
-                    log "removing stale asset $asset_name"
-                    gc release delete-asset "$TAG" "$asset_id" -R "$GITCODE_REPO" --yes >/dev/null
-                    ;;
-            esac
-        done
+' || true)
+
+        if grep -q " $(basename "$DIST_APK")\$" <<<"$asset_list"; then
+            if (( ! REPLACE )); then
+                die "release $TAG already has $(basename "$DIST_APK"); bump versionName or pass --replace"
+            fi
+            log "replacing published assets (--replace)"
+            while read -r asset_id asset_name; do
+                [[ -n "$asset_id" ]] || continue
+                case "$asset_name" in
+                    MobiInfer-Android-*.apk|SHA256SUMS)
+                        gc release delete-asset "$TAG" "$asset_id" -R "$GITCODE_REPO" --yes >/dev/null
+                        ;;
+                esac
+            done <<<"$asset_list"
+        fi
     else
         create_args=(release create "$TAG" -R "$GITCODE_REPO" --title "$TAG" --notes-file "$NOTES_FILE")
         (( PRERELEASE )) && create_args+=(--prerelease)
@@ -267,6 +279,40 @@ if (( DO_CHENGDU )); then
         "sha256sum '$CHENGDU_WEBROOT/apk/$(basename "$DIST_APK")'" | cut -d' ' -f1)
     [[ "$remote_sha" == "$sha" ]] || die "uploaded APK hash mismatch on $CHENGDU_HOST"
     log "Chengdu hash verified"
+fi
+
+# ---------------------------------------------------------------- verify public URLs
+
+if (( VERIFY )); then
+    log "verifying public URLs"
+    verify_sha() {
+        local url=$1 tmp got
+        tmp=$(mktemp)
+        if ! curl -fsSL --max-time 300 -o "$tmp" "$url"; then
+            rm -f "$tmp"
+            die "cannot download $url"
+        fi
+        got=$(sha256_of "$tmp")
+        rm -f "$tmp"
+        [[ "$got" == "$sha" ]] || die "sha256 mismatch: $url"
+        log "ok $url"
+    }
+
+    if (( DO_PUSH )); then
+        verify_sha "$GITCODE_URL"
+    fi
+    if (( DO_CHENGDU )); then
+        verify_sha "$CHENGDU_URL"
+        manifest_code=$(curl -fsS --max-time 30 "$PUBLIC_BASE/update.json" \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin)["versionCode"])')
+        [[ "$manifest_code" == "$VERSION_CODE" ]] \
+            || die "update.json advertises $manifest_code, expected $VERSION_CODE"
+    fi
+
+    if (( DO_PUSH || DO_CHENGDU )) \
+        && ! curl -fsSIL --max-time 30 "$GITHUB_URL" >/dev/null 2>&1; then
+        log "note: GitHub fallback not published yet ($GITHUB_URL)"
+    fi
 fi
 
 log "done"
