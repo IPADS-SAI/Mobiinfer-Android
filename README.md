@@ -8,7 +8,7 @@
 
 **在手机上本地运行 35B 级 MoE 大模型**
 
-[![Release](https://img.shields.io/badge/release-v0.3.1--alpha-blue)](https://github.com/IPADS-SAI/Mobiinfer-Android/releases)
+[![Release](https://img.shields.io/badge/release-v0.4.5-blue)](https://github.com/IPADS-SAI/Mobiinfer-Android/releases)
 [![Platform](https://img.shields.io/badge/platform-Android%20%7C%20Snapdragon-3DDC84)](#)
 [![Backend](https://img.shields.io/badge/backend-Hexagon%20NPU%20(HTP)-blue)](#)
 [![Base](https://img.shields.io/badge/built%20on-llama.cpp--omni-orange)](#)
@@ -22,6 +22,11 @@
 
 ## 最新动态
 
+- [2026.11.11] 🚀 **发布 MobiInfer-Android v0.4.5，MiniCPM-V 4.7 MoE 解码峰值 23.3 tok/s**
+  - ⚡ **跨层专家流水**：专家读盘改走 O_DIRECT，提前 2 层提交 gate 预测（H+2），每专家独立任务队列 + 常驻读线程，把 I/O 藏进计算里；同机同 prompt 解码 23.3 tok/s。
+  - 🧵 **可与其他 App 并行推理**：MoE 推理不要求独占设备，其他应用在前台运行时仍可持续生成，吞吐保持 21.3–21.8 tok/s。
+  - 🧩 **Hexagon v85 支持**：v73 / v75 / v79 / v81 / v85 五份 skel 随包构建；后端同步上游 2026-11-10（repack、算子融合、长上下文 FA）。
+  - 🐛 修复低内存布局被误判导致 vision 回落 CPU、DSpark 关闭的回归；修复退出码 139。
 - [2026.11.02] 🎨 **支持 MOSS-Image 端侧文生图**：9B TE + fp16 5B DiT 在 Hexagon NPU 上运行。
 - [2026.10.29] 🛠️ 发布 **MobiInfer-Android v0.3.1-alpha**，改进 Hexagon 内存布局与加载超时处理，补充 v73 skel，并增强映射失败和调试日志诊断。
 - [2026.10.22] 🔥 **Day-0 适配** InternScience 最新 **Sage-A1.5 35B-A3B**在手机上的运行，支持 41 层专家从 HTP tiled 包流式加载。
@@ -100,12 +105,17 @@ MobiInfer-Android 引入完整的 **Qualcomm Hexagon NPU 后端**，打通了**�
 ## 性能数据
 
 > 📱 OnePlus 13（Snapdragon 8 Elite，HTP0 + HTP1），纯文本实测，128-token 输出。
+> 📱 iQOO 15 Ultra（Snapdragon 8 Elite Gen5，Hexagon v81），纯文本、260-token prompt、DSpark draft3。
 
 | 模型 | 配置 | SoC | Prompt长度 | Prefill (token/s) | Decode (token/s) |
 |---|---|---|---|---:|---:|
+| MiniCPM-V 4.7 35B-A3B | Q3 tiled，H+2 跨层流水 + O_DIRECT + DSpark3 | 8 Elite Gen5 | 260 | 38.5 | **23.3** |
+| MiniCPM-V 4.7 35B-A3B | 同上，其他 App 前台运行时 | 8 Elite Gen5 | 260 | — | 21.3–21.8 |
 | MiniCPM-V 4.7 35B-A3B| Q3，LES + DSpark | 8 Elite | 41 | 22.02 | 17.98 |
 | MiniCPM-V 4.7 35B-A3B| Q3 LES + DSpark| 8 Elite | 512 | 94.28 | 13.65 |
 | Qwen3-VL-4B-Instruct | Q4_K_M | 8 Elite | 512 | 1013.74 | 18.13 |
+
+> 并发口径：微信、桌面、系统常驻服务运行中复测，未做任何 force-stop；DSpark 接受率 83%。
 
 ---
 
