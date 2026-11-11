@@ -358,5 +358,6 @@
     <string name="update_mobile_title">Mobile network</string>
     <string name="update_mobile_message">The update will use mobile data. Wi-Fi is recommended. Continue?</string>
     <string name="update_allow_install">Allow "install unknown apps" and come back; the install will continue.</string>
+    <string name="update_install_failed">Could not open the system installer. Install the APK manually.</string>
     <string name="update_busy">Busy generating. Try again when it finishes.</string>
 </resources>

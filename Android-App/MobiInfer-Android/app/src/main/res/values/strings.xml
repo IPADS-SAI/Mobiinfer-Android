@@ -368,5 +368,6 @@
     <string name="update_mobile_title">当前为移动网络</string>
     <string name="update_mobile_message">下载安装包会消耗流量，建议使用 Wi-Fi。是否继续？</string>
     <string name="update_allow_install">请允许“安装未知应用”后返回，安装将继续</string>
+    <string name="update_install_failed">无法拉起系统安装器，请手动安装</string>
     <string name="update_busy">正在生成，请稍后再更新</string>
 </resources>

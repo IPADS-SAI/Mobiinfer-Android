@@ -40,6 +40,7 @@ import com.mobiinfer.demo.imagegen.ImageTool
 import com.mobiinfer.demo.imagegen.MemoryBudget
 import com.mobiinfer.demo.imagegen.SystemPrompts
 import io.noties.markwon.Markwon
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -3642,10 +3643,15 @@ class MainActivity : AppCompatActivity() {
         progressDialog.show()
 
         lifecycleScope.launch {
-            val apk = ApkUpdater.download(this@MainActivity, info) { percent ->
-                runOnUiThread { if (progressDialog.isShowing) bar.progress = percent }
+            val apk = try {
+                ApkUpdater.download(this@MainActivity, info) { percent ->
+                    runOnUiThread { if (progressDialog.isShowing) bar.progress = percent }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } finally {
+                progressDialog.dismiss()
             }
-            progressDialog.dismiss()
             if (isFinishing || isDestroyed) return@launch
             if (apk == null) {
                 Toast.makeText(this@MainActivity, R.string.update_download_failed, Toast.LENGTH_LONG)
@@ -3657,10 +3663,16 @@ class MainActivity : AppCompatActivity() {
                 pendingInstall = apk
                 Toast.makeText(this@MainActivity, R.string.update_allow_install, Toast.LENGTH_LONG)
                     .show()
-                ApkUpdater.requestInstallPermission(this@MainActivity)
+                if (!ApkUpdater.requestInstallPermission(this@MainActivity)) {
+                    pendingInstall = null
+                    Toast.makeText(this@MainActivity, R.string.update_install_failed, Toast.LENGTH_LONG)
+                        .show()
+                }
                 return@launch
             }
-            ApkUpdater.install(this@MainActivity, apk)
+            if (!ApkUpdater.install(this@MainActivity, apk)) {
+                Toast.makeText(this@MainActivity, R.string.update_install_failed, Toast.LENGTH_LONG).show()
+            }
         }
     }
 
@@ -3687,8 +3699,9 @@ class MainActivity : AppCompatActivity() {
         pendingInstall?.let { apk ->
             if (ApkUpdater.canInstall(this)) {
                 pendingInstall = null
-                ApkUpdater.install(this, apk)
-                return
+                if (!ApkUpdater.install(this, apk)) {
+                    Toast.makeText(this, R.string.update_install_failed, Toast.LENGTH_LONG).show()
+                }
             }
         }
         if (!::engine.isInitialized) return

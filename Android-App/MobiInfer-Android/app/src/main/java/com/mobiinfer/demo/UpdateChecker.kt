@@ -3,6 +3,7 @@ package com.mobiinfer.demo
 import android.content.Context
 import android.os.Build
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -47,6 +48,7 @@ object UpdateChecker {
     private const val MANIFEST_URL = "https://mobiinfer.yiguzhaojin.cn/update.json"
     private const val PREFS = "updater"
     private const val CHECK_INTERVAL_MS = 24L * 60 * 60 * 1000
+    private const val MAX_MANIFEST_BYTES = 64 * 1024
 
     /** versionCode of the installed package; 0 if the lookup fails. */
     fun installedVersionCode(context: Context): Long = runCatching {
@@ -85,8 +87,8 @@ object UpdateChecker {
                     prefs.getString("etag", null)?.let { setRequestProperty("If-None-Match", it) }
                 }
                 val code = conn.responseCode
-                prefs.edit().putLong("lastCheck", now).apply()
                 if (code == HttpURLConnection.HTTP_NOT_MODIFIED) {
+                    prefs.edit().putLong("lastCheck", now).apply()
                     return@withContext UpdateCheck.UpToDate
                 }
                 if (code != HttpURLConnection.HTTP_OK) {
@@ -94,15 +96,23 @@ object UpdateChecker {
                     return@withContext UpdateCheck.Failed
                 }
 
-                val body = conn.inputStream.bufferedReader().use { it.readText() }
-                conn.getHeaderField("ETag")?.let { prefs.edit().putString("etag", it).apply() }
-
+                // Do not let a misconfigured or hostile host stream the whole
+                // disk into memory before the JSON parser rejects it.
+                val body = readCapped(conn, MAX_MANIFEST_BYTES)
+                    ?: return@withContext UpdateCheck.Failed
                 val info = parse(context, body) ?: return@withContext UpdateCheck.Failed
+
+                prefs.edit()
+                    .putLong("lastCheck", now)
+                    .putString("etag", conn.getHeaderField("ETag"))
+                    .apply()
                 if (info.versionCode <= installedVersionCode(context)) {
                     UpdateCheck.UpToDate
                 } else {
                     UpdateCheck.Available(info)
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 // Offline, DNS failure, TLS error, truncated body: all silent.
                 Log.w(TAG, "check failed: ${e.javaClass.simpleName}")
@@ -111,6 +121,27 @@ object UpdateChecker {
                 conn?.disconnect()
             }
         }
+
+    private fun readCapped(conn: HttpURLConnection, cap: Int): String? {
+        if (conn.contentLengthLong > cap) {
+            Log.w(TAG, "manifest larger than $cap bytes")
+            return null
+        }
+        val body = StringBuilder()
+        conn.inputStream.bufferedReader().use { reader ->
+            val buffer = CharArray(4096)
+            while (true) {
+                val n = reader.read(buffer)
+                if (n < 0) break
+                if (body.length + n > cap) {
+                    Log.w(TAG, "manifest larger than $cap bytes")
+                    return null
+                }
+                body.append(buffer, 0, n)
+            }
+        }
+        return body.toString()
+    }
 
     /**
      * The landing page is a SPA: unknown paths return index.html with a 200.

@@ -9,7 +9,9 @@ import android.os.Build
 import android.provider.Settings
 import android.util.Log
 import androidx.core.content.FileProvider
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.net.HttpURLConnection
@@ -46,11 +48,15 @@ object ApkUpdater {
         val out = apkFile(context)
         out.parentFile?.mkdirs()
         for (url in info.apkUrls) {
+            ensureActive()
             try {
                 if (fetch(url, out, info, onProgress) && isInstallable(context, out)) {
                     return@withContext out
                 }
                 Log.w(TAG, "rejected $url")
+            } catch (e: CancellationException) {
+                File(out.parentFile, "update.apk.part").delete()
+                throw e
             } catch (t: Throwable) {
                 Log.w(TAG, "failed $url: ${t.javaClass.simpleName}")
             }
@@ -85,9 +91,14 @@ object ApkUpdater {
                     while (true) {
                         val n = input.read(buffer)
                         if (n < 0) break
+                        read += n
+                        if (info.sizeBytes > 0 && read > info.sizeBytes) {
+                            Log.w(TAG, "body exceeds declared size for $url")
+                            tmp.delete()
+                            return false
+                        }
                         output.write(buffer, 0, n)
                         digest.update(buffer, 0, n)
-                        read += n
                         if (total > 0) {
                             val percent = (read * 100 / total).toInt()
                             if (percent != lastPercent && percent % 2 == 0) {
@@ -145,32 +156,33 @@ object ApkUpdater {
         }
     }
 
-    private fun signerFlags(): Int =
-        if (Build.VERSION.SDK_INT >= 28) {
-            PackageManager.GET_SIGNING_CERTIFICATES
+    /**
+     * Android 9/10 only collect certificates for an *archive* when GET_SIGNATURES
+     * is set: with GET_SIGNING_CERTIFICATES alone getPackageArchiveInfo() returns a
+     * PackageInfo whose signingInfo is null, which made every download fail the
+     * signer check on those releases. Ask for both and read whichever is filled.
+     */
+    private fun signerFlags(): Int {
+        @Suppress("DEPRECATION")
+        val legacy = PackageManager.GET_SIGNATURES
+        return if (Build.VERSION.SDK_INT >= 28) {
+            legacy or PackageManager.GET_SIGNING_CERTIFICATES
         } else {
-            @Suppress("DEPRECATION")
-            PackageManager.GET_SIGNATURES
+            legacy
         }
+    }
 
     private fun signerDigest(context: Context, apk: File?): ByteArray? {
         val pm = context.packageManager
         val info = if (apk == null) {
-            if (Build.VERSION.SDK_INT >= 28) {
-                pm.getPackageInfo(context.packageName, PackageManager.GET_SIGNING_CERTIFICATES)
-            } else {
-                @Suppress("DEPRECATION")
-                pm.getPackageInfo(context.packageName, PackageManager.GET_SIGNATURES)
-            }
+            pm.getPackageInfo(context.packageName, signerFlags())
         } else {
             pm.getPackageArchiveInfo(apk.absolutePath, signerFlags()) ?: return null
         }
-        val signer = if (Build.VERSION.SDK_INT >= 28) {
-            info.signingInfo?.apkContentsSigners?.singleOrNull()
-        } else {
-            @Suppress("DEPRECATION")
-            info.signatures?.singleOrNull()
-        } ?: return null
+        @Suppress("DEPRECATION")
+        val signer = info.signingInfo?.apkContentsSigners?.singleOrNull()
+            ?: info.signatures?.singleOrNull()
+            ?: return null
         return MessageDigest.getInstance("SHA-256").digest(signer.toByteArray())
     }
 
@@ -178,27 +190,35 @@ object ApkUpdater {
     fun canInstall(context: Context): Boolean =
         Build.VERSION.SDK_INT < 26 || context.packageManager.canRequestPackageInstalls()
 
-    fun requestInstallPermission(activity: Activity) {
-        if (Build.VERSION.SDK_INT < 26) return
-        activity.startActivity(
-            Intent(
-                Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                Uri.parse("package:${activity.packageName}")
+    fun requestInstallPermission(activity: Activity): Boolean {
+        if (Build.VERSION.SDK_INT < 26) return false
+        return runCatching {
+            activity.startActivity(
+                Intent(
+                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:${activity.packageName}")
+                )
             )
-        )
+        }.onFailure { Log.w(TAG, "no unknown-sources settings activity", it) }.isSuccess
     }
 
     /**
      * Hands the APK to the system installer. The app process is killed once the
      * install completes, so callers must not run this while a model is generating.
      */
-    fun install(activity: Activity, apk: File) {
-        val uri = FileProvider.getUriForFile(activity, "${activity.packageName}.fileprovider", apk)
-        activity.startActivity(
-            Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, "application/vnd.android.package-archive")
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
-        )
+    fun install(activity: Activity, apk: File): Boolean {
+        if (!apk.exists()) {
+            Log.w(TAG, "cached APK is gone: $apk")
+            return false
+        }
+        return runCatching {
+            val uri = FileProvider.getUriForFile(activity, "${activity.packageName}.fileprovider", apk)
+            activity.startActivity(
+                Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, "application/vnd.android.package-archive")
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+            )
+        }.onFailure { Log.w(TAG, "no package installer available", it) }.isSuccess
     }
 }
