@@ -3395,8 +3395,20 @@ static bool ggml_backend_hexagon_upload_moe_expert(ggml_tensor * tensor, int32_t
     return true;
 }
 
+// Arch accessor for the Android app: it decides between the full and the
+// reduced (low-vmem) MoE layout from the DSP version, so it must be queryable
+// without opening a session. Kept as a get_proc_address export because the
+// backend is loaded as a shared library.
+static int ggml_backend_hexagon_get_arch(ggml_backend_reg_t reg) {
+    GGML_UNUSED(reg);
+    return opt_arch;
+}
+
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_hexagon_get_arch") == 0) {
+        return (void *) ggml_backend_hexagon_get_arch;
+    }
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
         return (void *) ggml_backend_hexagon_split_buffer_type;
     }
