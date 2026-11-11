@@ -321,3 +321,9 @@ add_executable(test-moe-io-admission test-moe-io-admission.cpp)
 target_link_libraries(test-moe-io-admission PRIVATE Threads::Threads)
 llama_test(test-moe-io-admission)
 set_tests_properties(test-moe-io-admission PROPERTIES TIMEOUT 30)
+
+# `LLAMA_MOE_LIVE_UNION` 的准入决策（纯函数）：不需要模型、后端或线程。
+add_executable(test-moe-live-union test-moe-live-union.cpp)
+target_include_directories(test-moe-live-union PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-moe-live-union)
+set_tests_properties(test-moe-live-union PROPERTIES TIMEOUT 30)

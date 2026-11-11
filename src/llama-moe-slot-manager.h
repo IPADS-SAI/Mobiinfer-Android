@@ -40,6 +40,14 @@ public:
         bool probation_victim = false;
     };
     struct probation_counters { uint64_t promotions = 0, demand_victims = 0; };
+    /// `LLAMA_MOE_LIVE_UNION` 的准入视图。只读，不改任何状态；调用方必须持层锁。
+    /// 语义见 llama-moe-live-union.h：capacity 之外的三项对应 avail/evictable 的分母。
+    struct occupancy {
+        int32_t resident  = 0;   // 常驻（含受保护、含本批要用的）
+        int32_t loading   = 0;   // 在途写者占住的槽（不可淘汰、不可复用）
+        int32_t pinned    = 0;   // 常驻但受保护（pin/lease/persistent）且不属于本批
+        int32_t evictable = 0;   // 常驻、不属于本批、可被 LRU 淘汰
+    };
 
 private:
     struct entry {
@@ -216,6 +224,26 @@ public:
         prefetch_limit = limit;
     }
     uint32_t pins() const { return pin_count; }
+    /// 供 live-union 准入统计用：`requested` 是本批并集位图（可为 null）。
+    /// 只数状态，不移动任何堆/槽 —— 判定的后果仍由 acquire() 的 LRU 淘汰执行。
+    occupancy occupancy_of(const uint8_t * requested) const {
+        occupancy o;
+        o.loading = (int32_t) loading_count;
+        for (size_t i = 0; i < slots.size(); ++i) {
+            const auto & s = slots[i];
+            // owner 必须真的指向这一格：陈旧 owner（若出现过）不能被重复计数。
+            if (!s.owner || s.owner.slot != (int32_t) i) continue;
+            const auto & e = entries[s.owner.expert];
+            if (e.value.state != phase::resident) continue;   // loading/queued 不占"常驻"
+            ++o.resident;
+            const bool used  = requested && requested[(size_t) s.owner.expert] != 0;
+            const bool fixed = e.pins != 0 || e.persistent;
+            if (used) continue;                               // 本批要用 -> 既不算保护也不算可淘汰
+            if (fixed) ++o.pinned;
+            else       ++o.evictable;
+        }
+        return o;
+    }
     const int32_t * selected_ids() const { return selected.data(); }
     size_t selected_size() const { return selected_count; }
     observation lookup(int32_t expert) const { check_expert(expert); return entries[expert].value; }

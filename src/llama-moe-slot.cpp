@@ -1,5 +1,6 @@
 #include "llama-moe-slot.h"
 #include "llama-moe-slot-manager.h"
+#include "llama-moe-live-union.h"
 #include "llama-moe-io-admission.h"
 #include "llama-moe-prefetch-schedule.h"
 
@@ -78,6 +79,27 @@ static bool pf_probation_enabled() {
         if (!value || std::strcmp(value, "0") == 0) return false;
         if (std::strcmp(value, "1") != 0) throw std::runtime_error("LLAMA_MOE_PF_PROBATION must be 0 or 1");
         return true;
+    }();
+    return enabled;
+}
+
+// 准入容量必须按**物理宽度**（decode 窗口 + 预取预留）计算，而不是只按 decode 窗口。
+//
+// 背景：4 行 verify 的最坏专家并集是 rows×top_k（4×8=32），而统一 LRU 的物理宽度是
+// `decode_window + prefetch_slots`（W24 时 24+8=32，W80 时 88）。旧代码用
+// `layer_width - prefetch_slots` 与 32 比较，W24/W28 被判"装不下"→ 整批落到 bank 路径
+// → decode 从 ~15 t/s 掉到 7.8 t/s（同会话 A/B 见 exps/admission-capacity-20261111）。
+//
+// 本实现：
+//   init：按物理宽度夹批宽（resolve_live_union_rows），保证「最坏并集 + pins <= 物理宽度」；
+//   运行期：每层按本批**实际并集**复核（live_union_admit）；不够时先建议淘汰 LRU 常驻，
+//         仍不够则让投机预读让位（drain）后重判，不会静默读错权重。
+//
+// `LLAMA_MOE_LIVE_UNION=0` 可退回旧行为（仅用于对照/回退）。
+static bool moe_live_union_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("LLAMA_MOE_LIVE_UNION");
+        return !(value && *value && std::strcmp(value, "0") == 0);
     }();
     return enabled;
 }
@@ -1704,6 +1726,8 @@ struct llama_moe_slot_runtime::impl {
         }
         sweep_init();
         prewarm_init();
+        // 必须在 prewarm_init() 之后：pins 会影响「最坏并集还装不装得下」。
+        resolve_live_union_rows();
         try { init_slot_managers(); init_io_admission(); init_h1_front(); init_prefetch_refresh(); }
         catch (...) { lookahead.stop(); if (io_budget) io_budget->close(); throw; }
     }
@@ -1727,9 +1751,15 @@ struct llama_moe_slot_runtime::impl {
                 window_max_rows * (int32_t) model.hparams.n_expert_used);
             // Keep the existing K writer reserve even for a unified window.
             // Strict permanent pins cannot consume the demand safety margin.
-            if (persistent + worst_selected > cache) {
-                throw std::runtime_error(format("slot-manager: permanent pin budget %d plus worst selected %d exceeds cache %d; reduce prewarm pins",
-                    persistent, worst_selected, cache));
+            //
+            // **live-union 例外**：它已经把批宽夹到「最坏并集 + pins <= 物理宽度」，
+            // 并且在运行期会先淘汰 LRU、再让预读让位；此时 demand 合法地可以使用
+            // 预读暂存区那 K 格（统一 LRU），所以闸门要用 demand_capacity 而不是 c。
+            // 闸门本身保留 —— 它防的是 pin 预算把 demand 挤死（那是真会抛的）。
+            const int32_t cap = live_union_active && prefetch_unified ? demand_capacity(st) : cache;
+            if (persistent + worst_selected > cap) {
+                throw std::runtime_error(format("slot-manager: permanent pin budget %d plus worst selected %d exceeds %s %d; reduce prewarm pins",
+                    persistent, worst_selected, live_union_active && prefetch_unified ? "live-union capacity" : "cache", cap));
             }
             st.manager.reset(new llama_moe::slot_manager(st.mutex, n_expert, st.window_width,
                 st.window_width - prefetch_slots, prefetch_unified, prefetch_slots, pf_probation));
@@ -1831,6 +1861,99 @@ struct llama_moe_slot_runtime::impl {
 
     int32_t cached_slot(layer_state & st, int32_t expert, bool window) {
         return window && st.manager ? st.manager->resident_slot(expert) : st.expert_to_slot[(size_t) expert];
+    }
+
+    // ── live-union 准入（`LLAMA_MOE_LIVE_UNION`，见 docs/live-union.md）────────────
+    //
+    // 准入是**纯判定**：只读计数、不动物理槽位。真正的淘汰仍由既有分配器按 LRU
+    // 完成（managed: slot_manager 的 choose()；legacy: process() 的两轮挑选），
+    // 所以这里没有"淘汰到一半"的中间态，也就不可能半发布。
+    //
+    // 语义（与 src/llama-moe-live-union.h 的 decide_admission 一一对应）：
+    //   capacity  = 本批可用的槽数（= process() 的 alloc_hi - alloc_lo）
+    //   inflight  = 在途写者占住的槽（预读认领 / 等待中的 demand）—— 不可淘汰
+    //   hold      = 常驻、受保护、且不属于本批的槽（pin/lease/persistent）—— 不可淘汰
+    //   evictable = 常驻、不属于本批、可被 LRU 淘汰的槽
+    //   avail     = capacity - inflight - hold - evictable
+    //             = 空槽 + 「已经驻留着本批成员」的槽
+    //   于是 avail + evictable = 本层最多能同时容纳多少个不同专家。
+    struct admission_view {
+        int32_t capacity = 0, inflight = 0, hold = 0, evictable = 0;
+        int32_t avail() const { return std::max<int32_t>(0, capacity - inflight - hold - evictable); }
+    };
+
+    /// 必须在持有该层 mutex 时调用（manager 的计数只能锁内读）。
+    admission_view live_union_view(const layer_state & st, const std::vector<uint8_t> & requested) const {
+        admission_view v;
+        v.capacity = demand_capacity(st);
+        if (st.manager) {
+            const auto o = st.manager->occupancy_of(requested.data());
+            v.inflight  = o.loading;
+            v.hold      = o.pinned;
+            // 常驻但既不受保护、也不属于本批的，就是可淘汰池。manager 里 loading 的
+            // 槽 owner 仍存在但状态不是 resident，已被 occupancy_of 排除。
+            v.evictable = o.evictable;
+            return v;
+        }
+        const int32_t hi = std::min<int32_t>(st.window_start + v.capacity, (int32_t) st.slot_to_expert.size());
+        for (int32_t k = st.window_start; k < hi; ++k) {
+            const int32_t e = st.slot_to_expert[(size_t) k];
+            if (e == kSlotPending) { ++v.inflight; continue; }   // 预读 worker 已认领、内容未写完
+            if (e == kSlotFree)   { continue; }
+            if (e < 0 || e >= n_expert) { continue; }
+            if (requested[(size_t) e]) { continue; }             // 本批要用：计入 avail
+            if (st.pinned_experts[(size_t) e] || st.protected_experts[(size_t) e]) ++v.hold;
+            else ++v.evictable;
+        }
+        return v;
+    }
+
+    /// 让**投机**的预读先让位：它可丢，demand 不可丢。
+    /// 必须在层锁**外**等 —— worker 发布时会取目标层 mutex，持锁等待就是锁序反转。
+    void yield_prefetch(moe_handoff_lock_scope & scope) {
+        scope.release();
+        lookahead.reset();
+        lookahead.drain();
+        scope.acquire();
+    }
+
+    /// 返回最终判定，并按需打一行 `live-union: ...`。不改任何槽状态。
+    llama_moe::admission_decision live_union_admit(const layer_state & st, int layer, int32_t n_rows,
+                                                   int32_t union_size, const std::vector<uint8_t> & requested,
+                                                   moe_handoff_lock_scope & scope) {
+        using decision = llama_moe::admission_decision;
+        admission_view v = live_union_view(st, requested);
+        decision d = llama_moe::decide_admission(union_size, v.avail(), v.evictable);
+        int32_t yielded = -1;
+        if (d.v == decision::verdict::bank) {
+            // 装不下：先让在途预读收工（in_flight -> 0），再判一次。
+            // 这条路径只在「并集贴边 + 预读还在飞」时才会走到，属于合理的让位。
+            yielded = v.inflight;
+            yield_prefetch(scope);
+            v = live_union_view(st, requested);
+            d = llama_moe::decide_admission(union_size, v.avail(), v.evictable);
+        }
+        lu_decisions.fetch_add(1, std::memory_order_relaxed);
+        if (yielded >= 0) lu_yield.fetch_add(1, std::memory_order_relaxed);
+        if (d.v == decision::verdict::window) lu_window.fetch_add(1, std::memory_order_relaxed);
+        else if (d.v == decision::verdict::evict) lu_evict.fetch_add(1, std::memory_order_relaxed);
+        else lu_bank.fetch_add(1, std::memory_order_relaxed);
+        // 日志：默认（未开 env）一行都不打。开了以后前 8 条全打，之后只打非常规
+        // 判定（evict/bank）且最多到 64 条，避免 4 行 verify 每步 40 层刷屏。
+        static std::atomic<int> logged{0};
+        const int idx = logged.fetch_add(1, std::memory_order_relaxed);
+        const bool unusual = d.v != decision::verdict::window || yielded >= 0;
+        if (idx < 8 || (unusual && idx < 64)) {
+            const std::string verdict = d.v == decision::verdict::window ? "window" :
+                d.v == decision::verdict::evict ? format("evict=%d", (int) d.evict) : "bank";
+            moe_log("live-union: layer=%d rows=%d union=%d avail=%d -> %s%s",
+                    layer, (int) n_rows, (int) union_size, (int) v.avail(), verdict.c_str(),
+                    idx == 63 ? "（后续同类日志已节流）" : "");
+            if (yielded > 0) {
+                moe_log("live-union: layer=%d 预读让位 in_flight=%d -> %d", layer, (int) yielded, (int) v.inflight);
+            }
+        }
+        return d;
     }
 
     void trace_managed_claim(layer_state & st, const llama_moe::slot_manager::result & r, moe_handoff_context context) {
@@ -2537,6 +2660,8 @@ struct llama_moe_slot_runtime::impl {
             while (rows > 1 && cache_min < std::min(rows * n_used, n_expert)) {
                 rows--;
             }
+            // 图侧硬约束：批宽必须 < 32，否则 mul_mat_id 寻址不到每层 `.dec` 视图。
+            rows = std::min(rows, llama_moe::kWindowMaxRowsGraphLimit);
             window_max_rows = rows;
 
             if (rows != rows_want) {
@@ -2571,6 +2696,83 @@ struct llama_moe_slot_runtime::impl {
                 (int) decode_window, (int) prefetch_slots, (int) n_moe_layers, total,
                 (double) total * (double) layers[0].pack_bytes / 1024.0 / 1024.0,
                 (int) n_slots);
+    }
+
+    /// 本批 demand 能用的槽数 —— 与 process() 里 `alloc_hi - alloc_lo` **同一条公式**：
+    /// 统一 LRU 用整层窗口 (c+K)，分区模式只有缓存区 c。
+    /// （在 process() 里它就是 capacity；这里只是给 init 的静态夹紧复用同一份定义。）
+    int32_t demand_capacity(const layer_state & st) const {
+        const int32_t w = st.window_width > 0 ? st.window_width : decode_window + prefetch_slots;
+        return prefetch_unified ? w : std::max<int32_t>(0, w - prefetch_slots);
+    }
+
+    /// `LLAMA_MOE_LIVE_UNION=1` 的 init 段：把窗口批宽放宽到「最坏并集仍装得进
+    /// **物理**窗口」的最大值。
+    ///
+    /// 旧夹紧（resolve_decode_window 里那个 while）用的是缓存区 `c = 窗口 - K`，
+    /// 等于把预读暂存 K 当成**静态预留**扣掉。但 K 只是**在途上限**：实际在途的
+    /// 预读写者通常 0~2 个，而且运行期可以让它们让位（见 live_union_admit）。
+    /// W24/K8 下旧夹紧把 4 行判成 3 行（4×8=32 > 24），4 行 verify 整批掉到 bank
+    /// （实测 8.0 t/s vs 16.1@W32）；按物理 32 算则 4 行成立，且最坏并集 32 ≤ 32。
+    ///
+    /// 必须满足的不变量（docs/live-union.md 里也写了）：
+    ///   min(rows_want, R) × top_k（再与 n_expert 取小）+ pins_max
+    ///       <= min over enabled layers of (demand_capacity(il) - pins(il))
+    /// 于是每层 |U| + pins <= capacity 恒成立（|U| 只会比最坏并集小），
+    /// 所以窗口批次上「装不下」不可达 —— 这也正是**不允许**在运行期临时改槽空间的
+    /// 原因：图已经按每层 `.dec` 张量建好了，改槽段就会读错专家权重。
+    void resolve_live_union_rows() {
+        // 只在 **managed 路径**（slot manager + 无 MATMUL_SPLIT）下放宽。
+        // legacy 路径的 deferred 分配不按专家去重（同一专家跨行会各占一个槽，见 process()
+        // 的 kSlotPending 分支），准入若用去重并集 |U| 会低估真实物理占用 —— 例如
+        // W24/K8=32、4 行 top8、split4：|U|=20 但实际分配 16+4*4=32 槽。
+        // 因此 legacy 保持旧的保守夹紧（rows × top_k 原始位置数）。
+        if (!moe_live_union_enabled() || !slot_manager_enabled() ||
+            decode_window <= 0 || matmul_split > 0) {
+            return;
+        }
+        const char * rows_env = std::getenv("LLAMA_MOE_WINDOW_MAX_ROWS");
+        const int32_t rows_want = std::max(1, rows_env && *rows_env ? std::atoi(rows_env) : 1);
+        const int32_t n_used = (int32_t) model.hparams.n_expert_used;
+
+        int32_t cap_min = INT32_MAX, pins_max = 0;
+        bool any_layer = false;
+        for (size_t il = 0; il < layers.size() && il < layer_width.size(); ++il) {
+            const auto & st = layers[il];
+            if (!st.enabled || layer_width[il] <= 0) {
+                continue;
+            }
+            any_layer = true;
+            // 常驻 pin（PREWARM）永远不淘汰，必须先扣掉它们才谈得上最坏并集。
+            const int32_t pins = (int32_t) std::count(st.pinned_experts.begin(), st.pinned_experts.end(), (uint8_t) 1);
+            cap_min  = std::min(cap_min, demand_capacity(st) - pins);
+            pins_max = std::max(pins_max, pins);
+        }
+        if (!any_layer || cap_min <= 0) {
+            moe_log("live-union: off（没有可用的窗口容量：min=%d, pins=%d）",
+                    any_layer ? (int) cap_min : 0, (int) pins_max);
+            return;
+        }
+
+        // 纯函数（src/llama-moe-live-union.h）：最坏并集仍装得进 cap_min 的最大批宽。
+        const int32_t rows = llama_moe::live_union_max_rows(rows_want, n_used, n_expert, cap_min);
+        const int32_t prev = window_max_rows;
+        if (rows <= prev) {
+            moe_log("live-union: off（物理容量 min=%d − pins=%d 只够 %d 行（最坏并集 %d），"
+                    "不比旧夹紧 %d 宽；保持原样）",
+                    (int) cap_min + (int) pins_max, (int) pins_max, (int) rows,
+                    (int) std::min(rows * n_used, n_expert), (int) prev);
+            return;
+        }
+        window_max_rows = rows;
+        live_union_active = true;
+        // 注意日志顺序：`decode-cache: 窗口覆盖批宽 1..N` 是**夹紧后、放宽前**打的
+        // （那时 pins 还不知道），所以这里必须明确说"覆盖上面那行"，否则读者会
+        // 以为 4 行仍然走 bank。
+        moe_log("live-union: on 窗口批宽 1..%d（覆盖上面 decode-cache 的 1..%d；"
+                "物理宽度 min=%d，pins=%d，最坏并集 %d；运行期按本批实际并集复核）",
+                (int) window_max_rows, (int) prev, (int) cap_min + (int) pins_max, (int) pins_max,
+                (int) std::min(rows * n_used, n_expert));
     }
 
     ~impl() {
@@ -2650,6 +2852,12 @@ struct llama_moe_slot_runtime::impl {
                 (unsigned long long) manager_demand_reads.load(), (unsigned long long) manager_retry_reads.load(),
                 (unsigned long long) manager_prefetch_reads.load(), (unsigned long long) manager_prewarm_reads.load(),
                 (unsigned long long) manager_quota_skipped.load(), (unsigned long long) manager_capacity_skipped.load());
+        if (live_union_active) {
+            moe_log("live-union-summary: decisions=%llu window=%llu evict=%llu yield=%llu bank=%llu",
+                    (unsigned long long) lu_decisions.load(), (unsigned long long) lu_window.load(),
+                    (unsigned long long) lu_evict.load(), (unsigned long long) lu_yield.load(),
+                    (unsigned long long) lu_bank.load());
+        }
         handoff_trace.flush();
         if (g_n_horizon_clamped.load()) {
             moe_log("horizon-clamp-summary: 本 runtime 累计夹紧 %llu 次（可见日志条数≠实际次数）",
@@ -3585,6 +3793,13 @@ struct llama_moe_slot_runtime::impl {
     /// 不是降级。上限另外受「批宽 < 32」约束：再大就走 mul_mat_id 路径，寻址不到
     /// 每层的 `.dec` 视图。
     int32_t window_max_rows = 1;
+    /// `LLAMA_MOE_LIVE_UNION` 是否**真的**放宽了批宽（= 静态不变量成立，
+    /// 见 resolve_live_union_rows）。false 时运行期复核一律跳过，
+    /// 行为与未开该 env 时完全一致（包括没有任何 live-union 日志）。
+    bool live_union_active = false;
+    /// live-union 诊断计数（只在开关**生效**时累加；默认全 0，不打日志）。
+    /// 为什么要它：日志会节流，跑 bench 时光看开头几行判断不出"到底淘汰了多少次"。
+    std::atomic<uint64_t> lu_decisions{0}, lu_window{0}, lu_evict{0}, lu_yield{0}, lu_bank{0};
     /// 每层**预读暂存区**的 slot 数（= 预读深度 K）。
     ///
     /// 为什么单列一块：预读的条目是「下一步可能用到」，与「跨 token 复用」是两种
@@ -4263,6 +4478,33 @@ void llama_moe_slot_runtime::process(
             }
         }
         requested[experts[i]] = 1;
+    }
+
+    // ── live-union 准入（默认开启；`LLAMA_MOE_LIVE_UNION=0` 可回退旧行为）──
+    //
+    // 放在这里的原因：位置在「并集已知」之后、`pin_selected`/任何槽位变更之前 ——
+    // 所以判定失败时**还没有发布任何槽**，不存在半发布。
+    //
+    // 单 token decode 也要判：init 放宽后 persistent pins 可以占用原本给预读预留的容量
+    // （见 init_slot_managers 的 demand_capacity 闸门），"top_k <= 物理宽度" 不再单独
+    // 构成保证 —— 在途预读写者 + pins 可能把可用格压到 top_k 以下。判一次只是扫
+    // <= top_k 个 bit，相对一层 FFN 的开销可以忽略；判完需要时照常让位/淘汰。
+    if (pimpl->live_union_active && window_mode) {
+        const int32_t union_size = (int32_t) std::count(requested.begin(), requested.end(), (uint8_t) 1);
+        const auto decision = pimpl->live_union_admit(state, layer, n_rows, union_size, requested, process_lock);
+        if (decision.v == llama_moe::admission_decision::verdict::bank) {
+            // **按静态不变量不可达**：resolve_live_union_rows() 保证
+            //   min(window_max_rows × top_k, n_expert) + pins <= 每层物理容量，
+            // 而 |U| <= min(rows × top_k, n_expert)、在途预读也已经在上面让位了。
+            // 真到了这里说明不变量被破坏（例如运行期改了窗口宽度/预读深度）。
+            // 此时**不能**退到 bank：图已经按每层 `.dec` 张量建好，改槽段会静默
+            // 读错专家权重。宁可在这里干净地停下 —— 位置在发布之前，没有半发布。
+            throw std::runtime_error(format(
+                "live-union: layer %d rows %d union %d cannot fit the window (%d slots); "
+                "the graph was built with per-layer decode tensors, so falling back to the bank "
+                "would read the wrong expert weights. Reduce LLAMA_MOE_WINDOW_MAX_ROWS or pins.",
+                layer, (int) n_rows, (int) union_size, (int) pimpl->demand_capacity(state)));
+        }
     }
 
     if (managed) {
