@@ -26,6 +26,16 @@ android {
         versionCode = 10
         versionName = "0.4.4"
 
+        // Where UpdateChecker looks for the update manifest. Kept out of the
+        // Kotlin source so the endpoint can move without editing code:
+        //   ./gradlew assembleRelease -PupdateManifestUrl=https://example/update.json
+        resValue(
+            "string",
+            "update_manifest_url",
+            providers.gradleProperty("updateManifestUrl")
+                .getOrElse("https://mobiinfer.yiguzhaojin.cn/update.json"),
+        )
+
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         ndk {
@@ -87,6 +97,12 @@ android {
             enableV2Signing = true
             enableV3Signing = true
         }
+    }
+
+    // Required for resValue(...) in defaultConfig: the update manifest endpoint
+    // is injected as a string resource instead of being hardcoded in Kotlin.
+    buildFeatures {
+        resValues = true
     }
 
     buildTypes {

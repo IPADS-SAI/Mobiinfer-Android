@@ -46,7 +46,6 @@ sealed interface UpdateCheck {
  */
 object UpdateChecker {
     private const val TAG = "UpdateChecker"
-    private const val MANIFEST_URL = "https://mobiinfer.yiguzhaojin.cn/update.json"
     private const val PREFS = "updater"
     private const val CHECK_INTERVAL_MS = 24L * 60 * 60 * 1000
     private const val MAX_MANIFEST_BYTES = 64 * 1024
@@ -80,7 +79,7 @@ object UpdateChecker {
 
             var conn: HttpURLConnection? = null
             try {
-                conn = (URL(MANIFEST_URL).openConnection() as HttpURLConnection).apply {
+                conn = (URL(manifestUrl(context)).openConnection() as HttpURLConnection).apply {
                     connectTimeout = 8000
                     readTimeout = 8000
                     instanceFollowRedirects = true
@@ -122,6 +121,10 @@ object UpdateChecker {
                 conn?.disconnect()
             }
         }
+
+    /** Configured in app/build.gradle.kts via the `updateManifestUrl` property. */
+    private fun manifestUrl(context: Context): String =
+        context.getString(R.string.update_manifest_url)
 
     private fun readCapped(conn: HttpURLConnection, cap: Int): String? {
         if (conn.contentLengthLong > cap) {
