@@ -23,8 +23,8 @@ android {
         // to the WebP icons in mipmap-{m,h,xh,xxh,xxxh}dpi/.
         minSdk = 24
         targetSdk = 36
-        versionCode = 10
-        versionName = "0.4.4"
+        versionCode = 11
+        versionName = "0.4.5"
 
         // Where UpdateChecker looks for the update manifest. Kept out of the
         // Kotlin source so the endpoint can move without editing code:
