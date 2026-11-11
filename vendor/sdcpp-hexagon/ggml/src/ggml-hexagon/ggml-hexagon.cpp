@@ -5072,7 +5072,10 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
     char session_uri[256];
     {
         char htp_uri[256];
-        snprintf(htp_uri, sizeof(htp_uri), "file:///libggml-htp-v%u.so?htp_iface_skel_handle_invoke&_modver=1.0", opt_arch);
+        // Distinct name: the app ships two skel families (see app/build.gradle.kts).
+        // This vendored backend has its own op set, so it must not load the
+        // libggml-htp-v<arch>.so built from the main ggml tree.
+        snprintf(htp_uri, sizeof(htp_uri), "file:///libggml-htp-img-v%u.so?htp_iface_skel_handle_invoke&_modver=1.0", opt_arch);
 
         struct remote_rpc_get_uri u = {};
         u.session_id      = this->session_id;

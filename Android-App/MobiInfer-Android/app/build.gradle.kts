@@ -261,7 +261,7 @@ tasks.register("buildGgmlCpu_v86") {
 
 val htpSkels: List<String> =
     (project.findProperty("htpSkels") as String?)?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }
-        ?: listOf("v73", "v75", "v79", "v81")
+        ?: listOf("v73", "v75", "v79", "v81", "v85")
 
 tasks.register("buildHtpSkels") {
     group = "native"
@@ -337,8 +337,26 @@ tasks.register("buildHtpSkels") {
 //
 // Requires HEXAGON_SDK_ROOT / HEXAGON_TOOLS_ROOT (same as the llama hexagon
 // build). Skels are built for the DSP versions we ship (v79 = SM8750, v81 =
-// SM8850); the runtime picks the matching one via GGML_HEXAGON_ARCH.
+// SM8850, v85 = 下一代 SoC); the runtime picks the matching one via
+// GGML_HEXAGON_ARCH (libggml-htp-v<arch>.so).
+//
+// Note: vendor/sdcpp-hexagon is a separate ggml tree (its own HTP op set) and
+// still only knows DSP v73..v81. Its skels are staged as
+// libggml-htp-img-v<arch>.so, so the two families never collide:
+//   libggml-htp-v<arch>.so      <- buildHtpSkels (our ggml: llama + MoE)
+//   libggml-htp-img-v<arch>.so  <- buildImageGen (vendored ggml: text-to-image)
+// v85 therefore ships for the llama path only.
+//
+// -PskipImageGen=1 skips this task (and its vendored ggml build) entirely:
+// it is the slowest part of assembleDebug and MoE work does not need it.
+// Default is off, i.e. imagegen is built normally.
 // ---------------------------------------------------------------------------
+val skipImageGen: Boolean =
+    (project.findProperty("skipImageGen") as String?)
+        ?.lowercase()
+        ?.let { it == "1" || it == "true" || it == "yes" || it == "on" }
+        ?: false
+
 val buildImageGen = tasks.register("buildImageGen") {
     group = "native"
     description = "Build sdcpp-hexagon + imagegen shared libs for arm64-v8a"
@@ -347,17 +365,39 @@ val buildImageGen = tasks.register("buildImageGen") {
     val repoRoot = file("../../..").absoluteFile
     val srcDir = File(repoRoot, "tools/imagegen")
     val sdSrcDir = File(repoRoot, "vendor/sdcpp-hexagon")
-    outputs.dir(destDir)
+    // imagegen builds its own skels from the vendored ggml; they are staged
+    // under libggml-htp-img-v<arch>.so (see the note in doLast).
+    val imageGenTargets = listOf("imagegen", "htp-v79", "htp-v81")
+
+    val hexagonSdk = System.getenv("HEXAGON_SDK_ROOT")
+        ?: error("Set HEXAGON_SDK_ROOT to the Hexagon SDK installation directory")
+    val hexagonTools = System.getenv("HEXAGON_TOOLS_ROOT")
+        ?: "$hexagonSdk/tools/HEXAGON_Tools/21.0.04"
+
+    // Incremental: re-run only when the vendored sources, the wrapper or the
+    // toolchain identity change. Outputs are this task's own files only --
+    // libggml-htp-v*.so (the llama/MoE skels) belong to buildHtpSkels, so they
+    // are deliberately not part of this task's output snapshot.
+    if (srcDir.isDirectory) inputs.dir(srcDir)
+    if (sdSrcDir.isDirectory) inputs.dir(sdSrcDir)
+    inputs.property("imageGenTargets", imageGenTargets)
+    inputs.property("hexagonSdk", File(hexagonSdk).canonicalPath)
+    inputs.property("hexagonTools", File(hexagonTools).canonicalPath)
+    inputs.property("ndkToolchain", "$sdkRoot/ndk/27.0.12077973")
+    outputs.files(listOf(
+        destDir.resolve("libimagegen.so"),
+        destDir.resolve("libstable-diffusion.so"),
+        destDir.resolve("libggml-htp-img-v79.so"),
+        destDir.resolve("libggml-htp-img-v81.so"),
+    ))
+
+    onlyIf { !skipImageGen }
 
     doLast {
         if (!File(sdSrcDir, "CMakeLists.txt").exists()) {
             logger.lifecycle("Skipping buildImageGen: vendor/sdcpp-hexagon not present")
             return@doLast
         }
-        val hexagonSdk = System.getenv("HEXAGON_SDK_ROOT")
-            ?: error("Set HEXAGON_SDK_ROOT to the Hexagon SDK installation directory")
-        val hexagonTools = System.getenv("HEXAGON_TOOLS_ROOT")
-            ?: "$hexagonSdk/tools/HEXAGON_Tools/21.0.04"
 
         val cmake = "$sdkRoot/cmake/4.1.2/bin/cmake"
         val toolchain = "$sdkRoot/ndk/27.0.12077973/build/cmake/android.toolchain.cmake"
@@ -385,7 +425,7 @@ val buildImageGen = tasks.register("buildImageGen") {
         // memory-heavy (each clang peak ~0.8-1.5 GiB) and OOM a 16 GiB host
         // when several run at once. Override with IMAGEGEN_JOBS if desired.
         val jobs = System.getenv("IMAGEGEN_JOBS") ?: "1"
-        runCmd(cmake, "--build", bd.absolutePath, "--target", "imagegen", "htp-v79", "htp-v81", "-j", jobs)
+        runCmd(cmake, "--build", bd.absolutePath, "--target", *imageGenTargets.toTypedArray(), "-j", jobs)
 
         destDir.mkdirs()
         val soNames = listOf("libimagegen.so", "libstable-diffusion.so")
@@ -395,25 +435,26 @@ val buildImageGen = tasks.register("buildImageGen") {
             f.copyTo(File(destDir, name), overwrite = true)
             logger.lifecycle("Copied $name -> ${File(destDir, name).absolutePath}")
         }
-        // HTP skels. CMakeLists declares four (build_htp_skel v73/v75/v79/v81).
-        // v79/v81 must build. v73/v75 are attempted as optional targets: the
-        // Hexagon 21.0.04 linker intermittently aborts on them ("unable to
-        // execute command: Aborted (core dumped)" from hexagon-link, same
-        // sources and flags that link cleanly on another run), so a skel that
-        // does happen to exist is packaged and its absence is not an error.
-        for (name in listOf("libggml-htp-v79.so", "libggml-htp-v81.so")) {
-            val f = fileTree(bd).matching { include("**/ggml-hexagon/$name") }.files.firstOrNull()
-                ?: error("buildImageGen: missing skel $name under ${bd.absolutePath}")
-            f.copyTo(File(destDir, name), overwrite = true)
-            logger.lifecycle("Copied $name -> ${File(destDir, name).absolutePath}")
+        // imagegen ships its OWN skels under a distinct name. vendor/sdcpp-hexagon
+        // carries a separate (older) ggml tree whose HTP op set differs from ours
+        // (conv2dhmx / group-norm / rope-apply vs conv2d / dsv4-hc / glu /
+        // top-k-mask), and its ggml-hexagon.cpp is patched to load
+        // libggml-htp-img-v<arch>.so. The llama/MoE backend keeps loading
+        // libggml-htp-v<arch>.so, which buildHtpSkels stages from our ggml.
+        for (name in listOf("v79", "v81")) {
+            val f = fileTree(bd).matching { include("**/ggml-hexagon/libggml-htp-$name.so") }.files.firstOrNull()
+                ?: error("buildImageGen: missing skel libggml-htp-$name.so under ${bd.absolutePath}")
+            f.copyTo(File(destDir, "libggml-htp-img-$name.so"), overwrite = true)
+            logger.lifecycle("Copied imagegen skel libggml-htp-img-$name.so (${f.length() / 1024}K)")
         }
-        for (name in listOf("libggml-htp-v73.so", "libggml-htp-v75.so")) {
-            val f = fileTree(bd).matching { include("**/ggml-hexagon/$name") }.files.firstOrNull()
+        // v73/v75 are optional: the Hexagon 21.0.04 linker intermittently aborts
+        // on them ("unable to execute command: Aborted"), so a skel that happens
+        // to exist is staged and its absence is not an error.
+        for (name in listOf("v73", "v75")) {
+            val f = fileTree(bd).matching { include("**/ggml-hexagon/libggml-htp-$name.so") }.files.firstOrNull()
             if (f != null) {
-                f.copyTo(File(destDir, name), overwrite = true)
-                logger.lifecycle("Copied $name -> ${File(destDir, name).absolutePath}")
-            } else {
-                logger.lifecycle("Skipping $name: not produced by this toolchain run")
+                f.copyTo(File(destDir, "libggml-htp-img-$name.so"), overwrite = true)
+                logger.lifecycle("Copied imagegen skel libggml-htp-img-$name.so (${f.length() / 1024}K)")
             }
         }
         // Runtime dep: OpenMP (libstable-diffusion.so NEEDED). The wrapper and
