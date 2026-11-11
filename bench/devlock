@@ -1,0 +1,84 @@
+#!/data/data/com.termux/files/usr/bin/bash
+#
+# devlock - exclusive device lock wrapper for on-device HTP/MoE experiments.
+#
+# Usage:
+#   ./devlock [options] <command> [args...]
+#
+# Options:
+#   -w SECONDS   max seconds to wait for the lock (default: wait forever)
+#   -n           non-blocking: fail immediately if the lock is held
+#   -q           quiet: do not print lock status
+#   -h           show this help
+#
+# The lock is an exclusive kernel flock(2) on .device.lock in this directory.
+# It is released automatically when the wrapped command exits or is killed
+# (even SIGKILL), because the kernel drops flocks when the last fd closes.
+# Only one HTP consumer at a time: always wrap DSP runs with this.
+#
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOCKFILE="${DEVICE_LOCK_FILE:-$HERE/.device.lock}"
+
+wait_secs=""
+nonblock=0
+quiet=0
+
+while getopts ":w:nqh" opt; do
+  case "$opt" in
+    w) wait_secs="$OPTARG" ;;
+    n) nonblock=1 ;;
+    q) quiet=1 ;;
+    h) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    :) echo "devlock: option -$OPTARG requires an argument" >&2; exit 2 ;;
+    \?) echo "devlock: unknown option -$OPTARG" >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+if [ "$#" -eq 0 ]; then
+  echo "devlock: no command given (use -h for help)" >&2
+  exit 2
+fi
+
+# Keep the lock on a high fd so the command is unlikely to clobber it.
+LOCKFD=9
+exec 9>"$LOCKFILE"
+
+flock_opts=(-x)
+[ "$nonblock" -eq 1 ] && flock_opts+=(-n)
+[ -n "$wait_secs" ]   && flock_opts+=(-w "$wait_secs")
+
+# Non-blocking probe first, so we can (a) fail fast with a clear message and
+# (b) print who holds the lock. This is only diagnostic; the authoritative
+# acquire is the flock below. Always probe with -n so it never blocks here.
+if ! flock -x -n "$LOCKFD" 2>/dev/null; then
+  holder="$(sed -n '1p' "$LOCKFILE" 2>/dev/null || true)"
+  if [ "$nonblock" -eq 1 ]; then
+    [ "$quiet" -eq 0 ] && { echo "devlock: device busy (non-blocking); holder: ${holder:-unknown}" >&2; }
+    exit 75
+  fi
+  [ "$quiet" -eq 0 ] && {
+    if [ -n "$holder" ]; then
+      echo "devlock: device busy, waiting; holder: $holder" >&2
+    else
+      echo "devlock: device busy, waiting for lock" >&2
+    fi
+  }
+  # Block (optionally with timeout) until acquired.
+  flock "${flock_opts[@]}" "$LOCKFD" || {
+    echo "devlock: timed out waiting for device lock" >&2
+    exit 75
+  }
+fi
+
+# Record holder info for diagnostics.
+info="pid=$$ host=$(hostname 2>/dev/null || echo phone) since=$(date '+%Y-%m-%dT%H:%M:%S') cmd=$*"
+printf '%s\n' "$info" >"$LOCKFILE"
+
+# Run the command while holding fd 9. The kernel releases the flock when this
+# script exits (or is killed), so no manual cleanup is ever needed.
+"$@"
+rc=$?
+exit "$rc"
