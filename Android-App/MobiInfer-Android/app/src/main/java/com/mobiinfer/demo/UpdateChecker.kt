@@ -1,6 +1,7 @@
 package com.mobiinfer.demo
 
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import android.os.Build
 import android.util.Log
 import kotlinx.coroutines.CancellationException
@@ -148,7 +149,12 @@ object UpdateChecker {
      * Anything that is not the expected JSON shape is treated as "no manifest".
      */
     private fun parse(context: Context, body: String): UpdateInfo? = runCatching {
-        val o = JSONObject(body)
+        val root = JSONObject(body)
+        // Debug builds ship from their own channel; the signature check would
+        // reject a release APK anyway, so pick the block instead of downloading
+        // 30 MB that can never install.
+        val debugBuild = (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+        val o = if (debugBuild) root.optJSONObject("debug") ?: root else root
         val urls = o.optJSONArray("apkUrls")
             ?.let { array -> List(array.length()) { array.getString(it) } }
             ?.filter { it.startsWith("https://") }
