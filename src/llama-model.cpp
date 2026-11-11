@@ -2125,13 +2125,20 @@ int32_t llama_model::moe_decode_window() const {
     if (!pimpl->moe_experts) {
         return 0;
     }
-    const char * s = std::getenv("LLAMA_MOE_DECODE_WINDOW");
-    if (!s || !*s) {
-        return 0;                       // 未设置 = 关闭
-    }
     const int32_t n_moe = pimpl->moe_experts->layer_count();
     if (n_moe <= 0) {
         return 0;
+    }
+    const char * s = std::getenv("LLAMA_MOE_DECODE_WINDOW");
+    if (!s || !*s) {
+        // **默认 80**（2026-11-05 起）：实测最优，见
+        // exps/pipe-in-layer-20261105/README.md §3.22/§3.23。
+        //
+        // 代价要写清楚：每层窗口 = (W + 预读暂存 K) 个槽 × 每专家约 1.29 MB，
+        // 40 层的 MoE 在 W=80/K=8 时约 4.5 GB。这是**拿内存换解码速度**的开关，
+        // 内存不够的机器请显式设 LLAMA_MOE_DECODE_WINDOW=0（关闭，退回整块 bank）
+        // 或一个更小的值（如 52）。
+        return 80;
     }
 
     int32_t want;

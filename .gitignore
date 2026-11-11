@@ -177,3 +177,6 @@ tools/omni/**/pt/
 
 # Per-machine release settings (mirror repo, host, cert fingerprint)
 scripts/release.local.env
+
+# bench/app 的原始采样（截图 / UI dump / benchmark.jsonl）不进 git
+bench/app/runs/

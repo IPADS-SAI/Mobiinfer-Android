@@ -1,4 +1,8 @@
 #include "llama-moe-slot.h"
+#include "llama-moe-slot-manager.h"
+#include "llama-moe-live-union.h"
+#include "llama-moe-io-admission.h"
+#include "llama-moe-prefetch-schedule.h"
 
 #include "ggml-backend.h"
 #include "llama-impl.h"
@@ -16,7 +20,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <functional>
+#include <memory>
+#include <new>
+#include <map>
 #include <mutex>
 #include <set>
 #include <stdexcept>
@@ -32,6 +40,10 @@
 #include <fcntl.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <sys/mman.h>
+#endif
 #endif
 
 namespace {
@@ -53,6 +65,141 @@ static int moe_ssd_io_threads() {
     return n;
 }
 
+static bool slot_manager_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("LLAMA_MOE_EXPERT_READY");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+static bool pf_probation_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("LLAMA_MOE_PF_PROBATION");
+        if (!value || std::strcmp(value, "0") == 0) return false;
+        if (std::strcmp(value, "1") != 0) throw std::runtime_error("LLAMA_MOE_PF_PROBATION must be 0 or 1");
+        return true;
+    }();
+    return enabled;
+}
+
+// 准入容量必须按**物理宽度**（decode 窗口 + 预取预留）计算，而不是只按 decode 窗口。
+//
+// 背景：4 行 verify 的最坏专家并集是 rows×top_k（4×8=32），而统一 LRU 的物理宽度是
+// `decode_window + prefetch_slots`（W24 时 24+8=32，W80 时 88）。旧代码用
+// `layer_width - prefetch_slots` 与 32 比较，W24/W28 被判"装不下"→ 整批落到 bank 路径
+// → decode 从 ~15 t/s 掉到 7.8 t/s（同会话 A/B 见 exps/admission-capacity-20261111）。
+//
+// 本实现：
+//   init：按物理宽度夹批宽（resolve_live_union_rows），保证「最坏并集 + pins <= 物理宽度」；
+//   运行期：每层按本批**实际并集**复核（live_union_admit）；不够时先建议淘汰 LRU 常驻，
+//         仍不够则让投机预读让位（drain）后重判，不会静默读错权重。
+//
+// `LLAMA_MOE_LIVE_UNION=0` 可退回旧行为（仅用于对照/回退）。
+static bool moe_live_union_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("LLAMA_MOE_LIVE_UNION");
+        return !(value && *value && std::strcmp(value, "0") == 0);
+    }();
+    return enabled;
+}
+
+static bool h1_front_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("LLAMA_MOE_PREFETCH_H1_FRONT");
+        if (!value || !*value || std::strcmp(value, "0") == 0) return false;
+        if (std::strcmp(value, "1") != 0) throw std::runtime_error("LLAMA_MOE_PREFETCH_H1_FRONT must be 0 or 1");
+        return true;
+    }();
+    return enabled;
+}
+
+static bool prefetch_refresh_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("LLAMA_MOE_PREFETCH_REFRESH");
+        if (!value || !*value || std::strcmp(value, "0") == 0) return false;
+        if (std::strcmp(value, "1") != 0) throw std::runtime_error("LLAMA_MOE_PREFETCH_REFRESH must be 0 or 1");
+        return true;
+    }();
+    return enabled;
+}
+
+// Parse once, before any candidate IO is submitted. Disabled creates no gate.
+static uint32_t expert_io_budget() {
+    static const uint32_t value = []() -> uint32_t {
+        const char * text = std::getenv("LLAMA_MOE_EXPERT_IO_BUDGET");
+        if (!text || !*text) return 0;
+        if (*text < '0' || *text > '9') throw std::runtime_error("LLAMA_MOE_EXPERT_IO_BUDGET must be an integer in 0..64");
+        char * end = nullptr; errno = 0;
+        const unsigned long parsed = std::strtoul(text, &end, 10);
+        if (errno || *end || parsed > 64) throw std::runtime_error("LLAMA_MOE_EXPERT_IO_BUDGET must be an integer in 0..64");
+        return (uint32_t) parsed;
+    }();
+    return value;
+}
+
+// O_DIRECT：同一个文件、同样 1.5 MiB 随机专家，缓冲读 1.9 GiB/s、O_DIRECT 3.6 GiB/s
+// （tools/moe/bench/expert_read_bench.c，见 exps/roofline-saturate-20261105 §4.45）。
+// 差 1.87× 的原因是缓冲路径的 readahead 把物理字节放大了 1.88×（phys_read 72192 vs 38400 KiB）。
+// 生产路径的 iovec 指向 slot 张量里 gate|up|down 三段，base 不保证 4 KiB 对齐，
+// 所以走「对齐 scratch + memcpy」：多一次 1.5 MiB 拷贝，换设备少读 40% 的字节。
+// CPU 占用只有 26%（6 核里 1.6 个），这次拷贝是免费的。
+static std::atomic<bool> g_o_direct_ok{false};
+
+/// LLAMA_MOE_O_DIRECT 的两种取值：
+///   未设 / "0"  → 全程缓冲读（旧行为）
+///   "1"         → 全程 O_DIRECT（实测最好，见 exps/roofline §4.48）
+///
+/// 历史上有过第三档 `:auto`（按阶段切读法：prefill 走 O_DIRECT、decode 走缓冲），
+/// 它需要两套 fd 表 + 一个"当前阶段"的全局量，而那个全局量只在 process() 里更新，
+/// 预读 worker 从第一个图就开始读 → 行为取决于启动顺序，不可复现。
+/// **§3.10 实测 `:auto` 两个阶段都输给全开 O_DIRECT**，所以这一档删掉了：
+/// 不是为了修 bug（它语义本身是对的），而是维护成本不值。
+/// 老脚本里传 "auto" 会被当成 "1" 并打一次警告。
+static int o_direct_mode() {
+    static const int m = [] {
+        const char * v = std::getenv("LLAMA_MOE_O_DIRECT");
+        // 默认**开**：这一步只换读法，不多占一字节内存，且开机先跑一次真实对齐读
+        // 探测（probe_o_direct），探不过就整程退回缓冲读。回退用 LLAMA_MOE_O_DIRECT=0。
+        if (!v || !*v) {
+            return 1;
+        }
+        if (std::strcmp(v, "0") == 0) {
+            return 0;
+        }
+        if (std::strcmp(v, "auto") == 0) {
+            fprintf(stderr, "[moe-ssd] O_DIRECT: \"auto\" 已删除（实测输给全开），按 1 处理\n");
+        }
+        return 1;
+    }();
+    return m;
+}
+
+static bool moe_o_direct_want() {
+    return o_direct_mode() != 0;
+}
+
+static bool moe_o_direct() {
+    return g_o_direct_ok.load(std::memory_order_relaxed) && o_direct_mode() == 1;
+}
+
+
+// 跨层流水的 horizon：一次提交几层的 gate 预测。
+// 1 = 旧行为（只预测下一层）；默认 2；上限 8 —— 再远用 h_il 近似 h_{il+k} 精度会崩，
+// 而且预测本身要读 `layers[il+k].ffn_gate_inp` 的全部权重（d_model × 256，很小）。
+static int moe_lookahead_horizon() {
+    static const int h = []() {
+        const char * v = std::getenv("LLAMA_MOE_LOOKAHEAD_HORIZON");
+        // **默认 2**：同一份二进制、只改本 env 的对照里 h2 优于 h1 与 h4
+        // （数值与命令见 exps/pipe-in-layer-20261105/README.md §3.33；
+        //  这里不复制具体 t/s，避免与文档里的口径漂移）。
+        // 注意尾部若干层凑不满 horizon 块（il+k 越界），运行期会按实际块数夹紧并计数。
+        const int n = v ? std::atoi(v) : 2;
+        return std::max(1, std::min(n, 8));
+    }();
+    return h;
+}
+
 
 // Optional persistent helpers avoid pthread creation for every MoE layer.
 // Each caller owns a pool; prefetch never competes with main-path jobs here.
@@ -64,6 +211,7 @@ class moe_io_pool {
     uint64_t generation = 0;
     int active = 0, remaining = 0;
     bool quit = false;
+    bool unavailable = false;
 
     void stop() {
         { std::lock_guard<std::mutex> lock(mutex); quit = true; }
@@ -76,6 +224,7 @@ public:
         const char * enabled = std::getenv("LLAMA_MOE_IO_POOL");
         if (!enabled || *enabled != '1') return false;
         std::lock_guard<std::mutex> caller(call_mutex);
+        if (unavailable) return false;
         if (threads.empty()) {
             try {
                 for (int id = 0; id < moe_ssd_io_threads(); ++id) {
@@ -95,7 +244,7 @@ public:
                         }
                     });
                 }
-            } catch (...) { stop(); throw; }
+            } catch (...) { stop(); threads.clear(); unavailable = true; return false; }
         }
         std::unique_lock<std::mutex> lock(mutex);
         active = remaining = count;
@@ -123,8 +272,12 @@ constexpr int32_t kSlotPending = -2;
 constexpr int kMoeSsdIoChunk = 256;
 
 static int64_t now_ns() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
+#ifndef _WIN32
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t) ts.tv_sec * 1000000000LL + ts.tv_nsec;
+#else
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+#endif
 }
 
 // Xcode 能抓住 stderr（和 [MBMtmd] 一样）。llama-cli 的 callback 会吞掉纯 LLAMA_LOG_INFO。
@@ -137,6 +290,260 @@ static void moe_log(const char * fmt, ...) {
     fprintf(stderr, "[moe-ssd] %s\n", buf);
     fflush(stderr);
     LLAMA_LOG_INFO("[moe-ssd] %s\n", buf);
+}
+
+struct moe_handoff_context {
+    uint64_t job_id;
+    uint64_t epoch;
+    int32_t layer;
+    int32_t rows;
+    const char * source;
+    uint64_t generation = 0;
+    const char * domain = "unknown";
+    uint64_t binding = 0;
+    uint64_t io_id = 0; // diagnostic identity; independent of request generations
+};
+
+struct moe_handoff_detail {
+    const char * reason = "none";
+    int32_t related_expert = -1, related_slot = -1;
+    uint64_t related_generation = 0;
+    int32_t scanned = 0, capacity_slots = 0, free_slots = 0, loading_slots = 0;
+    int32_t protected_slots = 0, pinned_slots = 0, eligible_slots = 0;
+    uint64_t file_offset = 0, requested_pages = 0;
+    int64_t resident_pages = -1, probe_begin_ns = 0, probe_end_ns = 0;
+    int32_t probe_errno = 0;
+    uint64_t admit_seq = 0;
+    const char * admit_class = "none";
+    uint32_t admit_active = 0, admit_waiters = 0, admit_capacity = 0;
+};
+
+static moe_handoff_context handoff_request(moe_handoff_context context, llama_moe::slot_manager::ticket ticket) {
+    context.generation = ticket.generation;
+    context.binding = ticket.binding;
+    return context;
+}
+
+// Diagnostic only: each caller owns its buffer. Producers reserve distinct POD
+// entries; the caller flushes only after its prefetch worker has been joined.
+class moe_handoff_trace {
+    struct event {
+        int64_t ns;
+        uint64_t tid;
+        const char * name;
+        moe_handoff_context context;
+        moe_handoff_context active;
+        int32_t expert;
+        int32_t slot;
+        int32_t result;
+        uint64_t bytes;
+        moe_handoff_detail detail;
+    };
+    static constexpr uint64_t default_capacity = 262144;
+    uint64_t capacity = default_capacity;
+    std::unique_ptr<event[]> events;
+    std::atomic<uint64_t> next{0}, next_io{0};
+    std::atomic<uint64_t> lost{0};
+    FILE * file = nullptr;
+    std::string path;
+
+public:
+    moe_handoff_trace() {
+        const char * value = std::getenv("LLAMA_MOE_HANDOFF_TRACE");
+        if (!value || !*value) return;
+        if (const char * count = std::getenv("LLAMA_MOE_HANDOFF_TRACE_CAPACITY")) {
+            char * end = nullptr;
+            const unsigned long long requested = std::strtoull(count, &end, 10);
+            if (*count && end && !*end && requested >= 1024 && requested <= 1048576) capacity = requested;
+            else moe_log("handoff-trace: invalid capacity %s; using %llu", count, (unsigned long long) capacity);
+        }
+        path = value;
+        file = std::fopen(path.c_str(), "wx");
+        if (!file && errno == EEXIST) {
+            // Multiple MoE callers must never share a live buffer or overwrite
+            // each other's trace. Keep the requested path for the first caller.
+            path += "." + std::to_string((uintptr_t) this) + ".jsonl";
+            file = std::fopen(path.c_str(), "wx");
+        }
+        if (!file) {
+            moe_log("handoff-trace: cannot create %s: %s", path.c_str(), std::strerror(errno));
+            return;
+        }
+        events.reset(new (std::nothrow) event[capacity]);
+        if (!events) {
+            moe_log("handoff-trace: allocation failed for %s", path.c_str());
+            std::fclose(file);
+            file = nullptr;
+            return;
+        }
+        moe_log("handoff-trace: path=%s capacity=%llu", path.c_str(), (unsigned long long) capacity);
+    }
+
+    ~moe_handoff_trace() {
+        if (file) std::fclose(file);
+    }
+
+    bool enabled() const { return events != nullptr; }
+    uint64_t new_io_id() { return events ? next_io.fetch_add(1, std::memory_order_relaxed) + 1 : 0; }
+
+    void emit(const char * name, moe_handoff_context context, int32_t expert = -1,
+              int32_t slot = -1, int32_t result = 0, uint64_t bytes = 0,
+              moe_handoff_context active = {0, 0, -1, 0, "none"}, moe_handoff_detail detail = {}) {
+        if (!events) return;
+        const uint64_t index = next.fetch_add(1, std::memory_order_relaxed);
+        if (index >= capacity) {
+            lost.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+#if defined(__linux__)
+        static thread_local const uint64_t tid = (uint64_t) syscall(SYS_gettid);
+#else
+        static thread_local const uint64_t tid = (uint64_t) std::hash<std::thread::id>{}(std::this_thread::get_id());
+#endif
+        events[index] = {now_ns(), tid, name, context, active, expert, slot, result, bytes, detail};
+    }
+
+    // No producer may still be running when this is called.
+    void flush() {
+        if (!file) return;
+        const uint64_t attempted = next.load(std::memory_order_relaxed);
+        const uint64_t written = std::min(attempted, capacity);
+        std::fprintf(file, "{\"schema\":\"llama.moe.handoff.v2\",\"clock\":\"CLOCK_MONOTONIC\","
+                          "\"unit\":\"ns\",\"capacity\":%llu,\"entry_bytes\":%llu,\"buffer_bytes\":%llu,"
+                          "\"attempted\":%llu,\"written\":%llu,\"lost\":%llu}\n",
+                     (unsigned long long) capacity, (unsigned long long) sizeof(event),
+                     (unsigned long long) (capacity * sizeof(event)), (unsigned long long) attempted,
+                     (unsigned long long) written, (unsigned long long) lost.load(std::memory_order_relaxed));
+        for (uint64_t i = 0; i < written; ++i) {
+            const auto & e = events[i];
+            std::fprintf(file, "{\"index\":%llu,\"ns\":%lld,\"tid\":%llu,\"event\":\"%s\","
+                              "\"source\":\"%s\",\"job_id\":%llu,\"epoch\":%llu,\"layer\":%d,\"rows\":%d,"
+                              "\"expert\":%d,\"slot\":%d,\"result\":%d,\"bytes\":%llu,"
+                              "\"active_job_id\":%llu,\"active_epoch\":%llu,\"active_layer\":%d,\"active_rows\":%d,"
+                              "\"generation\":%llu,\"domain\":\"%s\",\"binding_generation\":%llu,\"io_id\":%llu,\"reason\":\"%s\","
+                              "\"related_expert\":%d,\"related_slot\":%d,\"related_generation\":%llu,"
+                              "\"scanned\":%d,\"capacity_slots\":%d,\"free_slots\":%d,\"loading_slots\":%d,"
+                              "\"protected_slots\":%d,\"pinned_slots\":%d,\"eligible_slots\":%d,"
+                              "\"file_offset\":%llu,\"requested_pages\":%llu,\"resident_pages\":%lld,"
+                              "\"probe_begin_ns\":%lld,\"probe_end_ns\":%lld,\"probe_errno\":%d,"
+                              "\"admit_seq\":%llu,\"admit_class\":\"%s\",\"admit_active\":%u,"
+                              "\"admit_waiters\":%u,\"admit_capacity\":%u}\n",
+                         (unsigned long long) i, (long long) e.ns, (unsigned long long) e.tid, e.name,
+                         e.context.source, (unsigned long long) e.context.job_id,
+                         (unsigned long long) e.context.epoch, e.context.layer, e.context.rows, e.expert, e.slot, e.result,
+                         (unsigned long long) e.bytes, (unsigned long long) e.active.job_id,
+                         (unsigned long long) e.active.epoch, e.active.layer, e.active.rows,
+                         (unsigned long long) e.context.generation, e.context.domain, (unsigned long long) e.context.binding, (unsigned long long) e.context.io_id, e.detail.reason,
+                         e.detail.related_expert, e.detail.related_slot, (unsigned long long) e.detail.related_generation,
+                         e.detail.scanned, e.detail.capacity_slots, e.detail.free_slots, e.detail.loading_slots,
+                         e.detail.protected_slots, e.detail.pinned_slots, e.detail.eligible_slots,
+                         (unsigned long long) e.detail.file_offset, (unsigned long long) e.detail.requested_pages,
+                         (long long) e.detail.resident_pages, (long long) e.detail.probe_begin_ns,
+                         (long long) e.detail.probe_end_ns, e.detail.probe_errno,
+                         (unsigned long long) e.detail.admit_seq, e.detail.admit_class, e.detail.admit_active,
+                         e.detail.admit_waiters, e.detail.admit_capacity);
+        }
+        const bool failed = std::ferror(file) != 0;
+        const int close_result = std::fclose(file);
+        file = nullptr;
+        moe_log("handoff-trace: complete path=%s events=%llu lost=%llu write_error=%d",
+                path.c_str(), (unsigned long long) written,
+                (unsigned long long) lost.load(std::memory_order_relaxed), (int) (failed || close_result != 0));
+    }
+};
+
+struct moe_handoff_thread_context {
+    moe_handoff_trace * trace;
+    moe_handoff_context context;
+    int32_t expert;
+    int32_t slot;
+};
+static thread_local moe_handoff_thread_context handoff_thread = {nullptr, {0, 0, -1, 0, "other"}, -1, -1};
+
+struct moe_handoff_scope {
+    moe_handoff_thread_context previous;
+    moe_handoff_scope(moe_handoff_trace * trace, moe_handoff_context context, int32_t expert = -1, int32_t slot = -1) :
+        previous(handoff_thread) {
+        handoff_thread = {trace, context, expert, slot};
+    }
+    ~moe_handoff_scope() { handoff_thread = previous; }
+};
+
+struct moe_handoff_span {
+    moe_handoff_trace & trace;
+    const char * end;
+    moe_handoff_context context;
+    int32_t expert;
+    int32_t slot;
+    uint64_t bytes;
+    int32_t result = -1;
+    moe_handoff_span(moe_handoff_trace & trace, const char * begin, const char * end,
+                     moe_handoff_context context, int32_t expert = -1, int32_t slot = -1, uint64_t bytes = 0) :
+        trace(trace), end(end), context(context), expert(expert), slot(slot), bytes(bytes) {
+        trace.emit(begin, context, expert, slot, 0, bytes);
+    }
+    ~moe_handoff_span() { trace.emit(end, context, expert, slot, result, bytes); }
+    void complete() { result = 0; }
+};
+
+// Track each held segment separately. IO and condition-variable waits happen
+// after release(), so they are never reported as time holding the layer mutex.
+struct moe_handoff_lock_scope {
+    moe_handoff_trace & trace;
+    std::unique_lock<std::mutex> & guard;
+    moe_handoff_context context;
+    bool success = false;
+    moe_handoff_lock_scope(moe_handoff_trace & trace, std::unique_lock<std::mutex> & guard,
+                           moe_handoff_context context) : trace(trace), guard(guard), context(context) {
+        trace.emit("PROCESS_LOCKED", context);
+    }
+    ~moe_handoff_lock_scope() {
+        if (guard.owns_lock()) trace.emit("PROCESS_LOCK_RELEASING", context, -1, -1, success ? 0 : -1);
+    }
+    void release() {
+        trace.emit("PROCESS_LOCK_RELEASING", context);
+        guard.unlock();
+    }
+    void acquire() {
+        if (guard.owns_lock()) return;
+        trace.emit("PROCESS_LOCK_WAIT", context);
+        guard.lock();
+        trace.emit("PROCESS_LOCKED", context);
+    }
+    void complete() { success = true; }
+};
+
+
+/// O_DIRECT 能不能用，用一次真实的对齐读来判定（不是靠猜）。
+/// 判不过就整程退回缓冲读 —— 半路 EINVAL 会让 worker 抛异常，宁可保守。
+static bool probe_o_direct(const std::string & path) {
+#ifdef O_DIRECT
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+    if (fd < 0) {
+        moe_log("O_DIRECT: off（open %s 失败: %s）", path.c_str(), std::strerror(errno));
+        return false;
+    }
+    void * buf = nullptr;
+    if (posix_memalign(&buf, 4096, 4096) != 0) {
+        close(fd);
+        return false;
+    }
+    const ssize_t n = pread(fd, buf, 4096, 0);
+    const int saved = errno;
+    free(buf);
+    close(fd);
+    if (n != 4096) {
+        moe_log("O_DIRECT: off（4 KiB 对齐探测 rc=%zd errno=%s）",
+                n, n < 0 ? std::strerror(saved) : "short");
+        return false;
+    }
+    moe_log("O_DIRECT: on（对齐探测通过；读进 4 KiB 对齐 scratch 再 memcpy 到 slot）");
+    return true;
+#else
+    GGML_UNUSED(path);
+    moe_log("O_DIRECT: off（平台没有 O_DIRECT）");
+    return false;
+#endif
 }
 
 static bool park_window_enabled() {
@@ -206,29 +613,71 @@ struct lookahead_expert_prefetch {
     int32_t slot_floor() const { return n_slots - 2 * depth; }
     int32_t bank_base(int k) const { return slot_floor() + depth * (k & 1); }
 
-    std::thread th;
-    std::mutex mtx;
-    std::condition_variable cv_go;
-    std::condition_variable cv_done;
-    bool quit = false;
-    bool job_pending = false;
-    bool job_running = false;
-    int32_t job_layer = -1;
-    int32_t job_bank = -1;
-    int32_t job_n = 0;
-    uint64_t job_epoch = 0;
-    int32_t job_rows = 0;
-    int64_t job_arm_ns = 0;
-    int32_t job_expert[kMaxDepth] = {};
+    /// 一个待读的专家。**跨层流水的最小调度单位**。
+    /// 老实现是「一层一个 job，job 之间互斥」：上一个 job 没跑完时 arm() 直接丢掉
+    /// （`n_arm_skipped++`），端到端实测丢掉了 83% 的 arm 机会 —— 被丢掉的那一层只能让
+    /// 主路径同步读，IO 全暴露在关键路径上（§4.46 的 75% late_jobs 就是这么来的）。
+    /// 现在拆成「每专家一个 task」进 FIFO，由一组常驻线程并行消费：
+    ///   - 顺序天然是层号升序（先要的层先读），所以提前 K 层提交的预测会真的排在前面；
+    ///   - 并发度 = io_threads 个常驻线程，不再每个 job 现开线程（省 30–50 µs × 任务数）；
+    ///   - 只有队列满（默认 4 个 job 的等价深度）才丢，丢了也计数。
+    struct task {
+        int32_t  layer  = -1;
+        int32_t  slot   = -1;    // 乒乓区里的格号（to_window=false 时用）
+        /// **读进去要写到哪**：true = 目标层自己的窗口（由窗口 LRU 认领），false = 乒乓区 slot。
+        /// 这个语义在 arm() 时**一次性固化**，worker 不再读 lookahead 的全局标志 ——
+        /// 全局量在 arm 与真正读盘之间有可能被改（set_depth / resolve_decode_window），
+        /// 一旦翻转，乒乓格号就会被当成窗口内偏移写进别的专家的位置（静默读错专家）。
+        bool     to_window = true;
+        int32_t  expert = -1;
+        uint64_t job    = 0;
+        int64_t  arm_ns = 0;
+        uint64_t epoch = 0;
+        int32_t rows = 0;
+        llama_moe::slot_manager::ticket request;
+    };
+    struct job_meta {
+        int32_t  layer     = -1;
+        int32_t  n         = 0;
+        int32_t  remaining = 0;
+        bool     to_window = true;   // 与 task 同语义，只用于 trace/日志
+        int64_t  arm_ns    = 0;
+        int32_t  expert[kMaxDepth] = {};
+        uint64_t epoch = 0;
+        int32_t rows = 0;
+    };
+
+    std::mutex              mtx;
+    std::condition_variable cv_go;     // 兼容旧名字（worker 唤醒）
+    std::condition_variable cv_done;   // job/队列全部完成
+    bool                    quit = false;
+    std::deque<task>        queue;
+    std::map<uint64_t, job_meta> jobs;
+    uint64_t                next_job    = 1;
+    int32_t                 pending_jobs = 0;   // 已入队、未完成的 job 数（队列深度按它算）
+    int32_t                 queue_cap    = 4;   // 队列里最多同时存在几个 job
+    int32_t                 n_worker     = 8;   // 常驻读线程数（默认 = io_threads）
+    std::vector<std::thread> workers;
+
     int32_t arm_layer = -1;
     int32_t arm_bank = -1;
     int32_t arm_n = 0;
     int32_t arm_expert[kMaxDepth] = {};
 
-    std::function<read_result(int, int, int)> read_fn;
-    // 窗口模式下 slot 由窗口 LRU 决定，不由乒乓区算出来 —— 此时传给 read_fn 的
-    // slot 用 -1 作哨兵（表示「你按窗口自己挑」）。见 impl 的那个 lambda。
+    /// 读一个专家。(layer, expert, slot, to_window)：to_window=true 表示写进目标层窗口，
+    /// 此时 slot 无意义；false 表示写进乒乓区里的 slot 格。
+    std::function<read_result(int, int, int, bool, llama_moe::slot_manager::ticket)> read_fn;
+    std::function<llama_moe::slot_manager::result(int, int, uint64_t, uint64_t, int)> enqueue_fn;
+    std::function<bool(int, llama_moe::slot_manager::ticket)> cancel_fn;
+    moe_handoff_trace * handoff = nullptr;
+    /// 是否让预读写进窗口。**只在 init 的 resolve_decode_window() 里确定**；
+    /// 传给 worker 的是 arm 时固化的 task::to_window，而不是这个字段。
     bool window_mode = false;
+    bool refresh = false;
+    llama_moe::prefetch_schedule refresh_schedule;
+    uint64_t refresh_plans = 0, refresh_near_updates = 0;
+    uint64_t refresh_far_created = 0, refresh_near_created = 0;
+    uint64_t refresh_cancelled = 0, refresh_expired = 0, refresh_reprioritized = 0;
     std::atomic<uint64_t> n_hits{0};
     std::atomic<uint64_t> n_armed{0};
     // 诊断：预读到底有没有在工作。见 arm()/take()。
@@ -251,11 +700,17 @@ struct lookahead_expert_prefetch {
     bool ready = false;
     moe_io_pool io_pool;
 
+    ~lookahead_expert_prefetch() { stop(); }
+
     void init(int32_t slots, int32_t experts, int32_t last_moe,
-              std::function<read_result(int, int, int)> fn) {
+              std::function<read_result(int, int, int, bool, llama_moe::slot_manager::ticket)> fn, moe_handoff_trace * trace_sink) {
+        handoff = trace_sink;
         n_slots = slots;
         n_expert = experts;
         last_moe_layer = last_moe;
+        refresh = prefetch_refresh_enabled();
+        refresh_schedule.resize((size_t) last_moe + 1);
+        static_assert(kMaxDepth == llama_moe::prefetch_schedule::max_reads, "prefetch budget width changed");
         read_fn = std::move(fn);
         const char * profile = std::getenv("LLAMA_MOE_PREFETCH_TIMING");
         timing_enabled = profile && *profile && *profile != '0';
@@ -284,6 +739,18 @@ struct lookahead_expert_prefetch {
             const char * rs = std::getenv("LLAMA_MOE_PREFETCH_READ");
             read_n = rs ? std::atoi(rs) : -1;   // -1 = 跟随 depth
         }
+        // 跨层流水：队列里允许多少个 job 同时在飞、多少个常驻读线程。
+        {
+            const char * q = std::getenv("LLAMA_MOE_PREFETCH_QUEUE");
+            const int v = q ? std::atoi(q) : 0;
+            queue_cap = (v > 0 && v <= 64) ? v : 4;
+            // 预读线程数可以**独立于**主路径的 io_threads 调。
+            // 动机：设备是单一串行资源，预读线程越多，主路径的同步读排得越靠后
+            // （§4.46 的 75% late_jobs 就是这么来的）。调小它能把时间还给主路径。
+            const char * w = std::getenv("LLAMA_MOE_PREFETCH_WORKERS");
+            const int vw = w ? std::atoi(w) : 0;
+            n_worker = (vw > 0 && vw <= 64) ? vw : moe_ssd_io_threads();
+        }
         set_depth(want);
         if (read_n < 0 || read_n > depth) {
             read_n = depth;                     // 默认与 depth 一致（旧行为）
@@ -300,16 +767,13 @@ struct lookahead_expert_prefetch {
             moe_log("lookahead-prefetch: off, bank %d too small for depth %d", (int) n_slots, (int) configured);
         }
         const int32_t cur = enabled ? depth : 0;
-        if (want == cur && (want == 0 || th.joinable())) {
+        if (want == cur && (want == 0 || !workers.empty())) {
             return;
         }
 
         {
             std::unique_lock<std::mutex> lk(mtx);
-            if (job_running) {
-                cv_done.wait(lk, [this]() { return !job_running; });
-            }
-            job_pending = false;
+            cv_done.wait(lk, [this]() { return !queue.empty() ? false : jobs.empty(); });
             arm_layer = -1;
             arm_n = 0;
             if (want > 0) {
@@ -320,13 +784,18 @@ struct lookahead_expert_prefetch {
             }
         }
 
-        if (enabled && !th.joinable()) {
+        if (enabled && workers.empty()) {
             quit = false;
-            th = std::thread([this]() { worker(); });
+            const int32_t n = std::max(1, n_worker);
+            try {
+                for (int32_t i = 0; i < n; ++i) workers.emplace_back([this]() { worker_loop(); });
+            } catch (...) { stop(); throw; }
         }
 
         if (enabled) {
-            moe_log("lookahead-prefetch: on depth=%d reserved=[%d,%d)", (int) depth, (int) slot_floor(), (int) n_slots);
+            moe_log("lookahead-prefetch: on depth=%d reserved=[%d,%d) workers=%d queue_cap=%d",
+                    (int) depth, (int) slot_floor(), (int) n_slots,
+                    (int) workers.size(), (int) queue_cap);
         } else {
             moe_log("lookahead-prefetch: off (depth=0)");
         }
@@ -338,9 +807,12 @@ struct lookahead_expert_prefetch {
             quit = true;
         }
         cv_go.notify_all();
-        if (th.joinable()) {
-            th.join();
+        for (auto & t : workers) {
+            if (t.joinable()) {
+                t.join();
+            }
         }
+        workers.clear();
         enabled = false;
     }
 
@@ -349,7 +821,7 @@ struct lookahead_expert_prefetch {
             return;
         }
         std::unique_lock<std::mutex> lk(mtx);
-        cv_done.wait(lk, [this]() { return !job_running && !job_pending; });
+        cv_done.wait(lk, [this]() { return queue.empty() && jobs.empty(); });
         arm_layer = -1;
         arm_n = 0;
     }
@@ -361,6 +833,17 @@ struct lookahead_expert_prefetch {
         const uint64_t armed = n_armed.load(std::memory_order_relaxed);
         const uint64_t hits = n_hits.load(std::memory_order_relaxed);
         const uint64_t preds = armed * (uint64_t) depth;
+        if (window_mode) {
+            // 窗口模式下命中由窗口 LRU 负责统计（cache-summary 的 window_hit），
+            // `n_hits` 在这里**结构性恒为 0**（老实现也如此）。打「0.0%」会误导，
+            // 所以明确写 n/a 并指向真正的计数器。
+            moe_log("lookahead-prefetch: armed=%llu hits=n/a（窗口模式，命中看 cache-summary 的 window_hit）"
+                    " read=%llu published=%llu",
+                (unsigned long long) armed,
+                (unsigned long long) n_pred_read.load(),
+                (unsigned long long) n_pred_published.load());
+            return;
+        }
         moe_log("lookahead-prefetch: armed=%llu hits=%llu (%.1f%% of predictions)",
             (unsigned long long) armed,
             (unsigned long long) hits,
@@ -374,25 +857,39 @@ struct lookahead_expert_prefetch {
     }
 
     void observe_demand(int layer, uint64_t epoch, int rows) {
+        if (refresh) cancel_refresh_tasks([&](const task & t) {
+            return llama_moe::prefetch_schedule::due(t.epoch, t.layer, epoch, layer);
+        }, true);
         if (!timing_enabled || layer < 0 || layer >= (int) timings.size()) return;
         const int64_t demand_ns = now_ns();
         std::lock_guard<std::mutex> lk(mtx);
         auto & t = timings[(size_t) layer];
         if (t.arm_ns > 0 && t.epoch == epoch) {
+            // 本层还有 task 没读完 = 迟到（老的判定是「唯一的那个 job 还在跑」，
+            // 现在队列里可能有多个 job，所以按**本层**是否还有剩余任务判）。
+            bool still_pending = false;
+            for (const auto & kv : jobs) {
+                if (kv.second.layer == layer) { still_pending = true; break; }
+            }
             if (trace_enabled) {
                 moe_log("prefetch-demand: layer=%d epoch=%llu rows=%d window_us=%.3f late=%d",
                         layer, (unsigned long long) epoch, rows, (demand_ns - t.arm_ns) / 1000.0,
-                        (int) ((job_pending || job_running) && job_layer == layer && job_epoch == epoch));
+                        (int) still_pending);
             }
             t.overlap_ns += std::max<int64_t>(0, demand_ns - t.arm_ns);
             t.overlap_n++;
-            if ((job_pending || job_running) && job_layer == layer && job_epoch == epoch) t.late_n++;
+            if (still_pending) t.late_n++;
             t.arm_ns = 0;
         }
     }
 
     // Call only after stop(): the final in-flight job must be included.
     void report_completed() const {
+        moe_log("prefetch-refresh-summary: enabled=%d plans=%llu near_updates=%llu far_created=%llu near_created=%llu cancelled=%llu expired=%llu queued_reprioritized=%llu",
+                (int) refresh, (unsigned long long) refresh_plans, (unsigned long long) refresh_near_updates,
+                (unsigned long long) refresh_far_created, (unsigned long long) refresh_near_created,
+                (unsigned long long) refresh_cancelled, (unsigned long long) refresh_expired,
+                (unsigned long long) refresh_reprioritized);
         moe_log("prefetch-summary: read=%llu published=%llu discarded=%llu skipped=%llu errors=%llu",
                 (unsigned long long) n_pred_read.load(),
                 (unsigned long long) n_pred_published.load(),
@@ -403,8 +900,13 @@ struct lookahead_expert_prefetch {
         for (size_t layer = 0; layer < timings.size(); ++layer) {
             const auto & t = timings[layer];
             if (!t.jobs && !t.overlap_n) continue;
+            // 口径（老版本没写清，容易被误读）：
+            //   overlap_samples = 需求观测次数（**per-hop**，一层一次）
+            //   late_demands    = 其中「需求到达时本层还有 task 没读完」的次数（per-hop，
+            //                     老实现叫 late_jobs，是 per-job，口径已变）
+            //   jobs            = 完成的任务组数（per-job）  read_experts = 实际读的专家数（per-task）
             moe_log("prefetch-timing: layer=%zu overlap_samples=%llu overlap_mean_us=%.3f "
-                    "late_jobs=%llu read_jobs=%llu read_experts=%llu batch_wall_per_expert_us=%.3f",
+                    "late_demands=%llu read_jobs=%llu read_experts=%llu read_us_per_expert=%.3f",
                     layer, (unsigned long long) t.overlap_n,
                     t.overlap_n ? t.overlap_ns / (1000.0 * t.overlap_n) : 0.0,
                     (unsigned long long) t.late_n, (unsigned long long) t.jobs,
@@ -446,7 +948,7 @@ struct lookahead_expert_prefetch {
         // —— 比整步还长，直接把预读的收益吃光。
         // 现在改成：**只接受已经完成、且正是本层**的预读结果；没好的就跳过，
         // 主路径按未命中正常读（本来也要读）。
-        if (job_running) {
+        if (!jobs.empty()) {
             // 结果还没好。arm_layer 仍是上一次的值，下面的一致性检查会拦住它。
             return;
         }
@@ -463,8 +965,251 @@ struct lookahead_expert_prefetch {
         arm_n = 0;
     }
 
+    // Queue bookkeeping never calls the layer authority while mtx is held.
+    // A removed task remains in remaining until its exact queued ticket has
+    // been cancelled, just as a popped worker remains counted until return.
+    void finish_refresh_task_locked(const task & t) {
+        auto it = jobs.find(t.job);
+        if (it == jobs.end() || it->second.remaining <= 0) throw std::logic_error("unbalanced refreshed prefetch job");
+        if (--it->second.remaining) return;
+        const auto done = it->second;
+        jobs.erase(it); --pending_jobs;
+        if (timing_enabled) ++timings[(size_t) done.layer].jobs;
+        if (handoff) handoff->emit("JOB_DONE", {t.job, done.epoch, done.layer, done.rows, "prefetch", 0, "window"});
+        cv_done.notify_all();
+    }
+
+    template<class Predicate> void cancel_refresh_tasks(Predicate obsolete, bool expired) {
+        std::vector<task> removed;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            if (std::none_of(queue.begin(), queue.end(), [&](const task & t) { return t.request && obsolete(t); })) return;
+            // Reserve before the first erase: allocation failure must not leave
+            // an unowned removed task contributing to job.remaining forever.
+            removed.reserve(queue.size());
+            for (auto it = queue.begin(); it != queue.end();) {
+                if (!it->request || !obsolete(*it)) { ++it; continue; }
+                removed.push_back(*it); it = queue.erase(it);
+            }
+        }
+        std::exception_ptr error;
+        for (const auto & t : removed) {
+            bool cancelled = false;
+            try { cancelled = cancel_fn(t.layer, t.request); }
+            catch (...) { if (!error) error = std::current_exception(); }
+            std::lock_guard<std::mutex> lock(mtx);
+            if (cancelled) {
+                refresh_schedule.refund(t.layer, t.epoch, t.expert);
+                ++refresh_cancelled; if (expired) ++refresh_expired;
+            }
+            auto & job = jobs.at(t.job);
+            for (int k = 0; k < job.n; ++k) if (job.expert[k] == t.expert) {
+                std::move(job.expert + k + 1, job.expert + job.n, job.expert + k);
+                --job.n; break;
+            }
+            if (handoff) handoff->emit(expired ? "REFRESH_EXPIRE" : "REFRESH_CANCEL",
+                handoff_request({t.job, t.epoch, t.layer, t.rows, "prefetch", 0, "window"}, t.request),
+                t.expert, t.request.slot, cancelled ? 0 : -1);
+            finish_refresh_task_locked(t);
+        }
+        if (error) std::rethrow_exception(error);
+    }
+
+    std::vector<int32_t> refreshed_predictions(int32_t layer, uint64_t epoch) {
+        std::lock_guard<std::mutex> lock(mtx);
+        const auto * p = refresh_schedule.find(layer, epoch);
+        return p ? std::vector<int32_t>(p->experts.begin(), p->experts.begin() + p->spent) : std::vector<int32_t>{};
+    }
+
+    bool arm_refreshed(int32_t layer, const std::vector<int32_t> & pred, uint64_t epoch, int rows, bool near) {
+        auto context = moe_handoff_context{0, epoch, layer, rows, "prefetch", 0, "window"};
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            if (near) {
+                if (!refresh_schedule.refine(layer, epoch)) return false;
+                ++refresh_near_updates;
+            } else {
+                if (!refresh_schedule.begin(layer, epoch, read_n)) return false;
+                ++refresh_plans;
+            }
+            if (handoff) handoff->emit(near ? "REFRESH_NEAR" : "REFRESH_PLAN", context, -1, -1,
+                refresh_schedule.allowance(layer, epoch, near));
+        }
+        if (near) cancel_refresh_tasks([&](const task & t) {
+            return t.epoch == epoch && t.layer == layer && std::find(pred.begin(), pred.end(), t.expert) == pred.end();
+        }, false);
+
+        std::unique_lock<std::mutex> lock(mtx);
+        const int32_t limit = refresh_schedule.allowance(layer, epoch, near);
+        if (!enabled || quit || !limit || pred.empty()) return true;
+        if (handoff) handoff->emit("ARM_ATTEMPT", context);
+        auto existing = std::find_if(jobs.begin(), jobs.end(), [&](const auto & entry) {
+            return entry.second.to_window && entry.second.layer == layer && entry.second.epoch == epoch;
+        });
+        const bool new_job = existing == jobs.end();
+        if (new_job && pending_jobs >= std::max(1, queue_cap)) {
+            ++n_arm_skipped;
+            if (handoff) handoff->emit("ARM_SKIP", context, -1, -1, pending_jobs);
+            return true;
+        }
+        const uint64_t id = new_job ? next_job++ : existing->first;
+        context.job_id = id;
+        const int64_t submitted_ns = timing_enabled || handoff ? now_ns() : 0;
+        if (new_job) {
+            job_meta job; job.layer = layer; job.epoch = epoch; job.rows = rows;
+            job.arm_ns = submitted_ns; job.to_window = true;
+            jobs.emplace(id, job); ++pending_jobs;
+            // In refresh mode these two markers carry the admission upper
+            // bound, not a byte/task count. REFRESH_ENQUEUE is the actual ledger.
+            if (handoff) {
+                handoff->emit("ARM_ACCEPT", context, -1, -1, limit);
+                handoff->emit("JOB_BEGIN", context, -1, -1, limit);
+            }
+        }
+        // This submission guard prevents a far worker from erasing a job while
+        // near registration temporarily releases mtx to enter the layer mutex.
+        ++jobs.at(id).remaining;
+        const auto * plan = refresh_schedule.find(layer, epoch);
+        const auto prior = *plan;
+        lock.unlock();
+
+        std::array<task, kMaxDepth> tasks;
+        int32_t count = 0;
+        try {
+            std::array<int32_t, kMaxDepth> seen{};
+            int32_t seen_count = 0;
+            for (int32_t expert : pred) {
+                if (count >= limit) break;
+                if (expert < 0 || expert >= n_expert ||
+                    std::find(prior.experts.begin(), prior.experts.begin() + prior.spent, expert) != prior.experts.begin() + prior.spent) continue;
+                // The prediction is already deduplicated by the caller; retain
+                // this bounded check for direct callers without heap allocation.
+                if (std::find(seen.begin(), seen.begin() + seen_count, expert) != seen.begin() + seen_count) continue;
+                const auto registered = enqueue_fn(layer, expert, epoch, id, rows);
+                if (registered.action != llama_moe::slot_manager::outcome::created) continue;
+                seen[(size_t) seen_count++] = expert;
+                tasks[(size_t) count++] = task{layer, -1, true, expert, id, submitted_ns, epoch, rows, registered.request};
+            }
+            lock.lock();
+            if (quit) throw std::runtime_error("MoE prefetch stopped during refresh");
+            auto & job = jobs.at(id);
+            if (job.n + count > kMaxDepth) throw std::logic_error("refreshed prefetch job exceeds its read budget");
+            size_t pushed = 0;
+            try {
+                for (int i = 0; i < count; ++i) { queue.push_back(tasks[(size_t) i]); ++pushed; }
+            } catch (...) {
+                while (pushed) { queue.pop_back(); --pushed; }
+                throw;
+            }
+            for (int i = 0; i < count; ++i) {
+                const auto & t = tasks[(size_t) i];
+                refresh_schedule.created(layer, epoch, t.expert);
+                job.expert[job.n++] = t.expert;
+                if (handoff) handoff->emit("REFRESH_ENQUEUE", handoff_request(context, t.request),
+                    t.expert, t.request.slot, near ? 1 : 0);
+            }
+            job.remaining += count;
+            if (near) refresh_near_created += count; else refresh_far_created += count;
+            if (timing_enabled) { timings[(size_t) layer].epoch = epoch; timings[(size_t) layer].arm_ns = submitted_ns; }
+            ++n_armed;
+            finish_refresh_task_locked(task{layer, -1, true, -1, id, submitted_ns, epoch, rows, {}});
+            lock.unlock(); cv_go.notify_all();
+        } catch (...) {
+            const auto error = std::current_exception();
+            if (lock.owns_lock()) lock.unlock();
+            for (int i = 0; i < count; ++i) {
+                try { cancel_fn(layer, tasks[(size_t) i].request); } catch (...) {}
+            }
+            lock.lock();
+            if (handoff) handoff->emit("REFRESH_SUBMIT_FAILED", context, -1, -1, -1);
+            finish_refresh_task_locked(task{layer, -1, true, -1, id, submitted_ns, epoch, rows, {}});
+            lock.unlock(); cv_done.notify_all();
+            std::rethrow_exception(error);
+        }
+        return true;
+    }
+
+    void arm_managed(int32_t layer, const std::vector<int32_t> & pred, uint64_t epoch, int rows) {
+        moe_handoff_context context = {0, epoch, layer, rows, "prefetch", 0, "window"};
+        if (!enabled || layer < 1 || layer > last_moe_layer || pred.empty()) {
+            if (handoff) handoff->emit("ARM_SKIP_INVALID", context);
+            return;
+        }
+        if (read_n <= 0) {
+            ++n_predict_only;
+            if (handoff) handoff->emit("ARM_SKIP_PREDICT_ONLY", context);
+            return;
+        }
+        job_meta job;
+        std::unique_lock<std::mutex> lock(mtx);
+        if (pending_jobs >= std::max(1, queue_cap)) {
+            ++n_arm_skipped;
+            if (handoff) handoff->emit("ARM_SKIP", context, -1, -1, pending_jobs);
+            return;
+        }
+        std::vector<uint8_t> seen((size_t) n_expert, 0);
+        for (int32_t expert : pred) {
+            if (job.n >= read_n) break;
+            if (expert < 0 || expert >= n_expert || seen[(size_t) expert]) continue;
+            seen[(size_t) expert] = 1; job.expert[job.n++] = expert;
+        }
+        if (!job.n) return;
+        for (int k = job.n; k < kMaxDepth; ++k) job.expert[k] = -1;
+        job.layer = layer; job.epoch = epoch; job.rows = rows; job.to_window = true;
+        job.arm_ns = timing_enabled || handoff ? now_ns() : 0;
+        const uint64_t id = next_job++;
+        context.job_id = id;
+        jobs.emplace(id, job); ++pending_jobs;
+        if (handoff) { handoff->emit("ARM_ACCEPT", context, -1, -1, job.n); handoff->emit("JOB_BEGIN", context, -1, -1, job.n); }
+        lock.unlock();
+
+        std::array<task, kMaxDepth> tasks;
+        int count = 0;
+        try {
+            // No queue mutex is held while the layer authority registers or
+            // coalesces requests. Queued entries reserve no physical memory.
+            for (int k = 0; k < job.n; ++k) {
+                const auto registered = enqueue_fn(layer, job.expert[k], epoch, id, rows);
+                if (registered.action != llama_moe::slot_manager::outcome::created) continue;
+                tasks[(size_t) count++] = task{layer, -1, true, job.expert[k], id, job.arm_ns, epoch, rows, registered.request};
+            }
+            lock.lock();
+            if (quit) throw std::runtime_error("MoE prefetch stopped during submission");
+            size_t pushed = 0;
+            try {
+                for (int i = 0; i < count; ++i) { queue.push_back(tasks[(size_t) i]); ++pushed; }
+            } catch (...) {
+                while (pushed) { queue.pop_back(); --pushed; }
+                throw;
+            }
+            jobs.at(id).remaining = count;
+            if (!count) {
+                jobs.erase(id); --pending_jobs;
+                if (handoff) handoff->emit("JOB_DONE", context);
+                cv_done.notify_all();
+            }
+            if (timing_enabled) { timings[(size_t) layer].epoch = epoch; timings[(size_t) layer].arm_ns = job.arm_ns; }
+            ++n_armed;
+            lock.unlock(); cv_go.notify_all();
+        } catch (...) {
+            if (lock.owns_lock()) lock.unlock();
+            for (int i = 0; i < count; ++i) cancel_fn(layer, tasks[(size_t) i].request);
+            lock.lock();
+            if (jobs.erase(id)) --pending_jobs;
+            if (handoff) handoff->emit("JOB_CANCEL", context, -1, -1, -1);
+            lock.unlock(); cv_done.notify_all();
+            throw;
+        }
+    }
+
     void arm(int32_t layer_next, const std::vector<int32_t> & pred, uint64_t epoch, int rows) {
+        const moe_handoff_context context = {0, epoch, layer_next, rows, "prefetch", 0, window_mode ? "window" : "bank"};
+        if (handoff) handoff->emit("ARM_ATTEMPT", context);
+        if (enqueue_fn && window_mode) { arm_managed(layer_next, pred, epoch, rows); return; }
+        // rows 只用于日志；队列化之后 job 里不再记它（完成时按层聚合）。
+        GGML_UNUSED(rows);
         if (!enabled || layer_next < 1 || layer_next > last_moe_layer || pred.empty()) {
+            if (handoff) handoff->emit("ARM_SKIP_INVALID", context);
             return;
         }
 
@@ -472,145 +1217,146 @@ struct lookahead_expert_prefetch {
         // 预测本身由调用方（impl::process）存下来供淘汰参考。
         if (read_n <= 0) {
             n_predict_only.fetch_add(1, std::memory_order_relaxed);
+            if (handoff) handoff->emit("ARM_SKIP_PREDICT_ONLY", context);
             return;
         }
 
-        std::lock_guard<std::mutex> lk(mtx);
-        if (job_pending || job_running) {
-            // 上一次预读还没跑完 -> 这次直接放弃。读比算慢时这里会大量命中，
-            // 预读的收益就基本归零了。量出来才知道它是不是瓶颈。
+        job_meta job;
+        std::unique_lock<std::mutex> lk(mtx);
+        // 队列深度按**job 数**算：窗口模式下允许多层同时在飞（跨层流水的前提），
+        // 乒乓模式下只能有 1 个（slot 是 [base, base+depth) 的固定区，两层同奇偶会撞）。
+        const int32_t cap = window_mode ? std::max(1, queue_cap) : 1;
+        if (pending_jobs >= cap) {
+            // 队列满 = 读真的跟不上算。这个计数就是「流水不够深」的直接度量。
             n_arm_skipped.fetch_add(1, std::memory_order_relaxed);
+            if (handoff) handoff->emit("ARM_SKIP", context, -1, -1, pending_jobs);
             return;
         }
-        job_layer = layer_next;
-        job_bank = layer_next & 1;
-        job_n = 0;
         std::vector<uint8_t> seen((size_t) n_expert, 0);
         for (int32_t e : pred) {
-            if (job_n >= read_n) {   // 只读 read_n 个（<= depth）；read_n==0 已在上面返回
+            if (job.n >= read_n) {   // 只读 read_n 个（<= depth）；read_n==0 已在上面返回
                 break;
             }
             if (e < 0 || e >= n_expert || seen[(size_t) e]) {
                 continue;
             }
             seen[(size_t) e] = 1;
-            job_expert[job_n++] = e;
+            job.expert[job.n++] = e;
         }
-        if (job_n <= 0) {
+        if (job.n <= 0) {
             return;
         }
-        for (int k = job_n; k < kMaxDepth; ++k) {
-            job_expert[k] = -1;
+        for (int k = job.n; k < kMaxDepth; ++k) {
+            job.expert[k] = -1;
         }
-        job_pending = true;
-        job_epoch = epoch;
-        job_rows = rows;
-        job_arm_ns = timing_enabled ? now_ns() : 0;
+        job.layer     = layer_next;
+        job.remaining = job.n;
+        job.to_window = window_mode;
+        job.arm_ns    = timing_enabled || handoff ? now_ns() : 0;
+        job.epoch = epoch; job.rows = rows;
+        const uint64_t id = next_job++;
+        jobs.emplace(id, job);
+        pending_jobs++;
+        if (handoff) { auto c = context; c.job_id = id; handoff->emit("ARM_ACCEPT", c, -1, -1, job.n); handoff->emit("JOB_BEGIN", c, -1, -1, job.n); }
+
+        // 语义在这里固化：worker 只认 task::to_window，不再回头看全局的 window_mode。
+        const int32_t base = bank_base(layer_next & 1);
+        for (int k = 0; k < job.n; ++k) {
+            queue.push_back(task{ layer_next, base + k, window_mode, job.expert[k], id, job.arm_ns, epoch, rows, {} });
+        }
         if (timing_enabled) {
             auto & t = timings[(size_t) layer_next];
             t.epoch = epoch;
-            t.arm_ns = job_arm_ns;
+            t.arm_ns = job.arm_ns;
         }
         n_armed.fetch_add(1, std::memory_order_relaxed);
-        cv_go.notify_one();
+        lk.unlock();
+        cv_go.notify_all();
     }
 
-    void worker() {
+    /// 常驻读线程：从 FIFO 取一个 (层, 专家)，读进目标层窗口并发布。
+    /// 并发度由线程数决定（默认 = LLAMA_MOE_IO_THREADS），不再是「每 job 现开 n 个线程」。
+    void worker_loop() {
         for (;;) {
-            int32_t layer = -1;
-            int32_t bank = -1;
-            int32_t n = 0;
-            int32_t ex[kMaxDepth];
-            uint64_t epoch = 0;
-            int rows = 0;
-            int64_t arm_ns = 0;
+            task t;
             {
                 std::unique_lock<std::mutex> lk(mtx);
-                cv_go.wait(lk, [this]() { return quit || job_pending; });
-                if (quit) {
+                cv_go.wait(lk, [this]() { return quit || !queue.empty(); });
+                if (quit && queue.empty()) {
                     return;
                 }
-                job_pending = false;
-                job_running = true;
-                layer = job_layer;
-                bank = job_bank;
-                n = job_n;
-                epoch = job_epoch;
-                rows = job_rows;
-                arm_ns = job_arm_ns;
-                memcpy(ex, job_expert, sizeof(ex));
-            }
-            const int32_t base = bank_base(bank);
-            const int64_t read_start_ns = timing_enabled ? now_ns() : 0;
-            std::atomic<uint64_t> completed_reads{0};
-            const int n_th = std::max(1, std::min(moe_ssd_io_threads(), n));
-            std::atomic<int> next{0};
-            auto read_one = [&]() {
-                for (;;) {
-                    const int k = next.fetch_add(1, std::memory_order_relaxed);
-                    if (k >= n) {
-                        break;
-                    }
-                    if (ex[k] < 0) {
-                        continue;
-                    }
-                    try {
-                        // 窗口模式传 -1：让 impl 按目标层的窗口 LRU 挑 slot。
-                        // 预读写进**目标层自己的窗口**，而不是尾部乒乓区 ——
-                        // 这样预读成果直接变成那层的缓存命中，不需要再搬一次。
-                        const auto result = read_fn(layer, ex[k], window_mode ? -1 : (base + k));
-                        if (result == read_result::skipped) {
-                            n_pred_skipped.fetch_add(1, std::memory_order_relaxed);
-                        } else {
-                            completed_reads.fetch_add(1, std::memory_order_relaxed);
-                            n_pred_read.fetch_add(1, std::memory_order_relaxed);
-                            if (result == read_result::published) {
-                                n_pred_published.fetch_add(1, std::memory_order_relaxed);
-                            } else {
-                                n_pred_discarded.fetch_add(1, std::memory_order_relaxed);
-                            }
-                        }
-                    } catch (...) {
-                        n_pred_errors.fetch_add(1, std::memory_order_relaxed);
-                        ex[k] = -1;
-                    }
-                }
-            };
-            if (n_th == 1) {
-                read_one();
-            } else if (io_pool.run(n_th, read_one)) {
-                // All reads completed on persistent workers.
-            } else {
-                std::vector<std::thread> helpers;
-                helpers.reserve((size_t) n_th);
-                for (int t = 0; t < n_th; ++t) {
-                    helpers.emplace_back(read_one);
-                }
-                for (auto & h : helpers) {
-                    h.join();
+                if (refresh) {
+                    const auto next = std::min_element(queue.begin(), queue.end(), [](const task & a, const task & b) {
+                        return llama_moe::prefetch_schedule::earlier(a.epoch, a.layer, b.epoch, b.layer);
+                    });
+                    if (next != queue.begin()) ++refresh_reprioritized;
+                    t = *next; queue.erase(next);
+                } else {
+                    t = queue.front(); queue.pop_front();
                 }
             }
+
+            const moe_handoff_context task_context = handoff_request({t.job, t.epoch, t.layer, t.rows, "prefetch", 0, t.to_window ? "window" : "bank"}, t.request);
+            moe_handoff_scope task_scope(handoff, task_context, t.expert, t.slot);
+            if (handoff) handoff->emit("TASK_BEGIN", task_context, t.expert, t.slot);
+            const int64_t start_ns = timing_enabled ? now_ns() : 0;
+            try {
+                // to_window=true：让 impl 按**目标层**的窗口 LRU 认领并发布 ——
+                // 预读成果直接变成那层的缓存命中，不需要再搬一次。
+                const auto result = read_fn(t.layer, t.expert, t.slot, t.to_window, t.request);
+                if (handoff) handoff->emit("PF_RESULT", task_context, t.expert, t.slot, (int32_t) result);
+                if (result == read_result::skipped) {
+                    n_pred_skipped.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    n_pred_read.fetch_add(1, std::memory_order_relaxed);
+                    if (result == read_result::published) {
+                        n_pred_published.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        n_pred_discarded.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            } catch (...) {
+                if (handoff) handoff->emit("PF_ERROR", task_context, t.expert, t.slot, -1);
+                n_pred_errors.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (handoff) handoff->emit("TASK_DONE", task_context, t.expert, t.slot);
+
+            job_meta done_job;
+            bool finished = false;
             {
                 std::lock_guard<std::mutex> lk(mtx);
-                const uint64_t reads = completed_reads.load(std::memory_order_relaxed);
-                if (trace_enabled) {
-                    moe_log("prefetch-job: layer=%d epoch=%llu rows=%d requested=%d reads=%llu queue_us=%.3f wall_us=%.3f",
-                            layer, (unsigned long long) epoch, rows, n, (unsigned long long) reads,
-                            (read_start_ns - arm_ns) / 1000.0, (now_ns() - read_start_ns) / 1000.0);
+                if (timing_enabled) {
+                    auto & tm = timings[(size_t) t.layer];
+                    tm.read_wall_ns += now_ns() - start_ns;
+                    tm.reads++;
+                    tm.overlap_ns += std::max<int64_t>(0, start_ns - t.arm_ns);
+                    tm.overlap_n++;
                 }
-                if (timing_enabled && reads > 0) {
-                    auto & t = timings[(size_t) layer];
-                    t.read_wall_ns += now_ns() - read_start_ns;
-                    t.reads += reads;
-                    t.jobs++;
+                auto it = jobs.find(t.job);
+                if (it != jobs.end() && --it->second.remaining == 0) {
+                    done_job = it->second;
+                    jobs.erase(it);
+                    pending_jobs--;
+                    finished = true;
                 }
-                arm_layer = layer;
-                arm_bank = bank;
-                arm_n = n;
-                memcpy(arm_expert, ex, sizeof(arm_expert));
-                job_running = false;
             }
-            cv_done.notify_all();
+            if (finished) {
+                std::lock_guard<std::mutex> lk(mtx);
+                if (trace_enabled) {
+                    moe_log("prefetch-job: layer=%d n=%d", done_job.layer, done_job.n);
+                }
+                if (timing_enabled) {
+                    timings[(size_t) done_job.layer].jobs++;
+                }
+                arm_layer = done_job.layer;
+                arm_bank = done_job.layer & 1;
+                arm_n = done_job.n;
+                memcpy(arm_expert, done_job.expert, sizeof(arm_expert));
+                // notify 在锁内，与老实现一致：drain()/set_depth() 的等待方醒来时
+                // 已经能看到 arm_* 全部落定。
+                if (handoff) handoff->emit("JOB_DONE", {t.job, done_job.epoch, done_job.layer, done_job.rows, "prefetch", 0, done_job.to_window ? "window" : "bank"});
+                cv_done.notify_all();
+            }
         }
     }
 };
@@ -670,6 +1416,8 @@ struct llama_moe_slot_runtime::impl {
         std::vector<uint8_t> pinned_experts;
         uint64_t age = 0;
         std::mutex mutex;
+        std::unique_ptr<llama_moe::slot_manager> manager;
+        std::vector<llama_moe::slot_manager::result> requests;
     };
     struct map_userdata {
         llama_moe_slot_runtime * runtime = nullptr;
@@ -679,6 +1427,9 @@ struct llama_moe_slot_runtime::impl {
     struct pending_install {
         int32_t expert = -1;
         int32_t slot = -1;
+        llama_moe::slot_manager::ticket request;
+        uint64_t io_id = 0;
+        bool retry = false;
     };
 
     moe_io_pool io_pool;
@@ -726,11 +1477,28 @@ struct llama_moe_slot_runtime::impl {
 
     /// 每层「下一步预测会用到的专家」列表，由上一层 arm() 写入、本层 process() 消费。
     /// 用途是**零 I/O 成本**地改进淘汰：预测会用的条目不该被换出去。
+    /// 每层**被 arm 的那份预测**（保护集，见 process() 的写入处注释）
     std::vector<std::vector<int32_t>> predicted;
+    /// 每层紧邻上一层给出的预测（recall 更高，只作额外淘汰提示）
+    std::vector<std::vector<int32_t>> pred_hint;
+    /// pred_hist[L] = 给层 L 的所有预测，元素是 (提交它的层号, 专家列表)。
+    /// 因为 horizon>1 时同一层会被 K 个不同来源各预测一次（层 L-1 猜它、L-2 也猜它…），
+    /// 只留最新那份就没法算 recall(k) —— 所以这里保留全部，到层 L 执行时逐条结算。
+    std::vector<std::vector<std::pair<int32_t, std::vector<int32_t>>>> pred_hist;
+    uint64_t recall_hit[9]  = {};
+    uint64_t recall_pred[9] = {};
     std::mutex pred_mtx;
 
     // 整个进程的完整 I/O 计量（主路径 + 预读），见 readv_span。
     std::atomic<uint64_t> io_bytes_all{0};
+    /// 预读 publish 时 slot 已不属于本专家的次数（应为 0；非 0 = slot 空间混用）
+    std::atomic<uint64_t> n_slot_collision{0};
+    /// horizon 被按实际块数夹紧的**本 runtime 实例累计次数**（不是全进程；全进程共享的
+    /// 只有下面日志限流用的 static clamp_logs 那 16 条额度）。收尾打 horizon-clamp-summary。
+    std::atomic<uint64_t> g_n_horizon_clamped{0};
+    /// LLAMA_MOE_VERIFY_SLOT 的自检计数
+    std::atomic<uint64_t> n_verify_ok{0};
+    std::atomic<uint64_t> n_verify_bad{0};
     std::atomic<uint64_t> io_calls_all{0};
     uint64_t last_io_bytes = 0;
     uint64_t last_io_calls = 0;
@@ -780,6 +1548,7 @@ struct llama_moe_slot_runtime::impl {
         n_slots(model.moe_slot_bank_size()),
         layers(model.layers.size()),
         predicted(model.layers.size()),
+        pred_hint(model.layers.size()),
         deferred(model.layers.size()),
         miss_per_layer(model.layers.size(), 0),
         userdata(model.layers.size()) {
@@ -858,15 +1627,31 @@ struct llama_moe_slot_runtime::impl {
             (int) n_expert, moe_ssd_io_threads(), stride0,
             park_window_enabled() ? "on" : "off");
 
+        // recall(k) 的预测历史：按层存「谁在哪层提交的预测」，到该层执行时逐条结算。
+        // 在 init() 里定容，避免塞进 ctor 的初始化列表（那边字段顺序很挤，加一项会触发 -Wreorder-ctor）。
+        pred_hist.assign(layers.size(), {});
+
+        if (moe_o_direct_want()) {
+            std::string probe_path;
+            for (const auto & st : layers) {
+                if (!st.enabled) continue;
+                probe_path = !st.dec_pack_path.empty() ? st.dec_pack_path : st.pack_path;
+                if (!probe_path.empty()) break;
+            }
+            if (!probe_path.empty() && probe_o_direct(probe_path)) {
+                g_o_direct_ok.store(true, std::memory_order_relaxed);
+            }
+        }
+
         lookahead.init((int32_t) n_slots, n_expert, last_moe_layer,
-            [this](int layer, int expert, int slot) {
-                if (slot < 0) {
+            [this](int layer, int expert, int slot, bool to_window, llama_moe::slot_manager::ticket request) {
+                if (to_window && layers[(size_t) layer].manager) return install_managed_prefetch(layer, expert, request);
+                if (to_window) {
                     return install_prefetch_into_window(layer, expert);
-                } else {
-                    read_expert_directv(layers[(size_t) layer], expert, slot);
-                    return lookahead_expert_prefetch::read_result::published;
                 }
-            });
+                read_expert_directv(layers[(size_t) layer], expert, slot);
+                return lookahead_expert_prefetch::read_result::published;
+            }, handoff_trace.enabled() ? &handoff_trace : nullptr);
         resolve_decode_window();
         {
             const char * e = std::getenv("LLAMA_MOE_MATMUL_SPLIT");
@@ -941,6 +1726,309 @@ struct llama_moe_slot_runtime::impl {
         }
         sweep_init();
         prewarm_init();
+        // 必须在 prewarm_init() 之后：pins 会影响「最坏并集还装不装得下」。
+        resolve_live_union_rows();
+        try { init_slot_managers(); init_io_admission(); init_h1_front(); init_prefetch_refresh(); }
+        catch (...) { lookahead.stop(); if (io_budget) io_budget->close(); throw; }
+    }
+
+    bool managers_active() const {
+        return first_moe_layer >= 0 && layers[(size_t) first_moe_layer].manager != nullptr;
+    }
+
+    void init_slot_managers() {
+        pf_probation = pf_probation_enabled();
+        if (pf_probation && (!slot_manager_enabled() || decode_window <= 0 || matmul_split > 0 || first_moe_layer < 0)) {
+            throw std::runtime_error("LLAMA_MOE_PF_PROBATION requires LLAMA_MOE_EXPERT_READY=1, decode window and matmul_split=0");
+        }
+        if (!slot_manager_enabled() || decode_window <= 0 || matmul_split > 0) return;
+        for (auto & st : layers) {
+            if (!st.enabled) continue;
+            if (st.window_start != 0) throw std::runtime_error("managed MoE requires layer-local window indices");
+            const int32_t persistent = (int32_t) std::count(st.pinned_experts.begin(), st.pinned_experts.end(), (uint8_t) 1);
+            const int32_t cache = st.window_width - prefetch_slots;
+            const int32_t worst_selected = std::min(n_expert - persistent,
+                window_max_rows * (int32_t) model.hparams.n_expert_used);
+            // Keep the existing K writer reserve even for a unified window.
+            // Strict permanent pins cannot consume the demand safety margin.
+            //
+            // **live-union 例外**：它已经把批宽夹到「最坏并集 + pins <= 物理宽度」，
+            // 并且在运行期会先淘汰 LRU、再让预读让位；此时 demand 合法地可以使用
+            // 预读暂存区那 K 格（统一 LRU），所以闸门要用 demand_capacity 而不是 c。
+            // 闸门本身保留 —— 它防的是 pin 预算把 demand 挤死（那是真会抛的）。
+            const int32_t cap = live_union_active && prefetch_unified ? demand_capacity(st) : cache;
+            if (persistent + worst_selected > cap) {
+                throw std::runtime_error(format("slot-manager: permanent pin budget %d plus worst selected %d exceeds %s %d; reduce prewarm pins",
+                    persistent, worst_selected, live_union_active && prefetch_unified ? "live-union capacity" : "cache", cap));
+            }
+            st.manager.reset(new llama_moe::slot_manager(st.mutex, n_expert, st.window_width,
+                st.window_width - prefetch_slots, prefetch_unified, prefetch_slots, pf_probation));
+            st.requests.resize((size_t) n_expert);
+            for (int32_t e = 0; e < n_expert; ++e) st.manager->set_persistent(e, st.pinned_experts[(size_t) e] != 0);
+        }
+        lookahead.enqueue_fn = [this](int layer, int expert, uint64_t epoch, uint64_t job, int rows) {
+            auto & st = layers[(size_t) layer];
+            std::lock_guard<std::mutex> lock(st.mutex);
+            const auto r = st.manager->enqueue(expert, {epoch, job});
+            const auto context = handoff_request({job, epoch, layer, rows, "prefetch", 0, "window"}, r.request);
+            handoff_trace.emit(r.action == llama_moe::slot_manager::outcome::created ? "REQUEST_ENQUEUED" :
+                               r.action == llama_moe::slot_manager::outcome::coalesced ? "ENQUEUE_COALESCE" : "ENQUEUE_SELECTED_SKIP",
+                               context, expert, r.request.slot, (int32_t) r.action);
+            if (r.action == llama_moe::slot_manager::outcome::coalesced) ++manager_coalesced;
+            return r;
+        };
+        lookahead.cancel_fn = [this](int layer, llama_moe::slot_manager::ticket request) {
+            auto & st = layers[(size_t) layer];
+            std::lock_guard<std::mutex> lock(st.mutex);
+            const bool cancelled = st.manager->cancel_queued(request);
+            if (cancelled) handoff_trace.emit("REQUEST_CANCELLED",
+                handoff_request({0, 0, layer, 0, "control", 0, "window"}, request), request.expert, request.slot);
+            return cancelled;
+        };
+    }
+
+    struct io_trace_payload {
+        moe_handoff_context context;
+        int32_t slot = -1, needed_count = 0;
+    };
+
+    static void observe_io_admission(void * data, const llama_moe::io_admission::observation & event) noexcept {
+        auto & owner = *static_cast<impl *>(data);
+        const auto & payload = *static_cast<const io_trace_payload *>(event.payload);
+        auto context = payload.context;
+        if (event.request.expert >= 0) {
+            context.layer = event.request.layer; context.binding = event.request.binding; context.generation = event.request.generation;
+        }
+        using action = llama_moe::io_admission::action;
+        const char * name = event.event == action::wait ? "IO_ADMIT_WAIT" : event.event == action::grant ? "IO_ADMIT_GRANT" :
+            event.event == action::release ? "IO_ADMIT_RELEASE" : event.event == action::cancel ? "IO_ADMIT_CANCEL" :
+            event.event == action::boost ? "IO_ADMIT_BOOST" : event.event == action::needed_begin ? "IO_NEEDED_SCOPE_BEGIN" : "IO_NEEDED_SCOPE_END";
+        moe_handoff_detail detail;
+        detail.admit_seq = event.sequence;
+        detail.admit_class = event.category == llama_moe::io_admission::priority::background ? "background" :
+            event.category == llama_moe::io_admission::priority::needed_prefetch ? "needed_prefetch" : "demand";
+        detail.admit_active = event.active; detail.admit_waiters = event.waiting; detail.admit_capacity = event.capacity;
+        owner.handoff_trace.emit(name, context, event.request.expert, payload.slot, payload.needed_count, 0, {}, detail);
+    }
+
+    void init_io_admission() {
+        const uint32_t limit = expert_io_budget();
+        if (!limit) return;
+        if (!managers_active() || matmul_split > 0) {
+            throw std::runtime_error("LLAMA_MOE_EXPERT_IO_BUDGET requires LLAMA_MOE_EXPERT_READY=1, decode window and matmul_split=0");
+        }
+        io_needed_snapshot.resize((size_t) n_expert);
+        io_budget.reset(new llama_moe::io_admission(limit, (size_t) n_expert,
+            handoff_trace.enabled() ? observe_io_admission : nullptr, this));
+        moe_log("io-budget: enabled=1 limit=%u scope=ready-window", limit);
+    }
+
+    void init_h1_front() {
+        h1_front = h1_front_enabled();
+        if (!h1_front) return;
+        if (!managers_active() || matmul_split > 0 || !lookahead.enabled || !lookahead.window_mode || lookahead.read_n <= 0 || io_budget) {
+            throw std::runtime_error("LLAMA_MOE_PREFETCH_H1_FRONT requires Ready window, split=0, active prefetch/read>0 and IO budget=0");
+        }
+        moe_log("h1-front: enabled=1 first_moe_layer=%d (adds H1 only when actual horizon>1)", first_moe_layer);
+    }
+
+    void init_prefetch_refresh() {
+        if (!lookahead.refresh) return;
+        if (!managers_active() || matmul_split > 0 || !lookahead.enabled || !lookahead.window_mode ||
+            lookahead.read_n <= 0 || moe_lookahead_horizon() <= 1 || io_budget || h1_front) {
+            throw std::runtime_error("LLAMA_MOE_PREFETCH_REFRESH requires Ready window, split=0, horizon>1, prefetch/read>0 and IO budget/H1 front=0");
+        }
+        moe_log("prefetch-refresh: enabled=1 reserve=%d read=%d deadline=epoch-layer", std::min(2, lookahead.read_n), lookahead.read_n);
+    }
+
+    int64_t read_managed_expert(layer_state & state, llama_moe::slot_manager::ticket request,
+                               llama_moe::io_admission::origin origin, bool retry = false) {
+        // Policy uses explicit immutable owner/key values even when tracing is
+        // disabled. The trace payload is diagnostic only and outlives the lease.
+        auto read = [&]() {
+            ++manager_reads;
+            if (origin == llama_moe::io_admission::origin::demand) ++manager_demand_reads; else ++manager_prefetch_reads;
+            if (retry) ++manager_retry_reads;
+            return read_expert_directv(state, request.expert, request.slot, true);
+        };
+        if (!io_budget) return read();
+        const io_trace_payload payload{handoff_thread.context, request.slot, 0};
+        auto permit = io_budget->acquire({(int32_t) (&state - layers.data()), request.expert,
+            request.binding, request.generation}, origin, &payload);
+        // permit unwinds before callers take the layer mutex to publish/fail.
+        return read();
+    }
+
+    int32_t cached_slot(layer_state & st, int32_t expert, bool window) {
+        return window && st.manager ? st.manager->resident_slot(expert) : st.expert_to_slot[(size_t) expert];
+    }
+
+    // ── live-union 准入（`LLAMA_MOE_LIVE_UNION`，见 docs/live-union.md）────────────
+    //
+    // 准入是**纯判定**：只读计数、不动物理槽位。真正的淘汰仍由既有分配器按 LRU
+    // 完成（managed: slot_manager 的 choose()；legacy: process() 的两轮挑选），
+    // 所以这里没有"淘汰到一半"的中间态，也就不可能半发布。
+    //
+    // 语义（与 src/llama-moe-live-union.h 的 decide_admission 一一对应）：
+    //   capacity  = 本批可用的槽数（= process() 的 alloc_hi - alloc_lo）
+    //   inflight  = 在途写者占住的槽（预读认领 / 等待中的 demand）—— 不可淘汰
+    //   hold      = 常驻、受保护、且不属于本批的槽（pin/lease/persistent）—— 不可淘汰
+    //   evictable = 常驻、不属于本批、可被 LRU 淘汰的槽
+    //   avail     = capacity - inflight - hold - evictable
+    //             = 空槽 + 「已经驻留着本批成员」的槽
+    //   于是 avail + evictable = 本层最多能同时容纳多少个不同专家。
+    struct admission_view {
+        int32_t capacity = 0, inflight = 0, hold = 0, evictable = 0;
+        int32_t avail() const { return std::max<int32_t>(0, capacity - inflight - hold - evictable); }
+    };
+
+    /// 必须在持有该层 mutex 时调用（manager 的计数只能锁内读）。
+    admission_view live_union_view(const layer_state & st, const std::vector<uint8_t> & requested) const {
+        admission_view v;
+        v.capacity = demand_capacity(st);
+        if (st.manager) {
+            const auto o = st.manager->occupancy_of(requested.data());
+            v.inflight  = o.loading;
+            v.hold      = o.pinned;
+            // 常驻但既不受保护、也不属于本批的，就是可淘汰池。manager 里 loading 的
+            // 槽 owner 仍存在但状态不是 resident，已被 occupancy_of 排除。
+            v.evictable = o.evictable;
+            return v;
+        }
+        const int32_t hi = std::min<int32_t>(st.window_start + v.capacity, (int32_t) st.slot_to_expert.size());
+        for (int32_t k = st.window_start; k < hi; ++k) {
+            const int32_t e = st.slot_to_expert[(size_t) k];
+            if (e == kSlotPending) { ++v.inflight; continue; }   // 预读 worker 已认领、内容未写完
+            if (e == kSlotFree)   { continue; }
+            if (e < 0 || e >= n_expert) { continue; }
+            if (requested[(size_t) e]) { continue; }             // 本批要用：计入 avail
+            if (st.pinned_experts[(size_t) e] || st.protected_experts[(size_t) e]) ++v.hold;
+            else ++v.evictable;
+        }
+        return v;
+    }
+
+    /// 让**投机**的预读先让位：它可丢，demand 不可丢。
+    /// 必须在层锁**外**等 —— worker 发布时会取目标层 mutex，持锁等待就是锁序反转。
+    void yield_prefetch(moe_handoff_lock_scope & scope) {
+        scope.release();
+        lookahead.reset();
+        lookahead.drain();
+        scope.acquire();
+    }
+
+    /// 返回最终判定，并按需打一行 `live-union: ...`。不改任何槽状态。
+    llama_moe::admission_decision live_union_admit(const layer_state & st, int layer, int32_t n_rows,
+                                                   int32_t union_size, const std::vector<uint8_t> & requested,
+                                                   moe_handoff_lock_scope & scope) {
+        using decision = llama_moe::admission_decision;
+        admission_view v = live_union_view(st, requested);
+        decision d = llama_moe::decide_admission(union_size, v.avail(), v.evictable);
+        int32_t yielded = -1;
+        if (d.v == decision::verdict::bank) {
+            // 装不下：先让在途预读收工（in_flight -> 0），再判一次。
+            // 这条路径只在「并集贴边 + 预读还在飞」时才会走到，属于合理的让位。
+            yielded = v.inflight;
+            yield_prefetch(scope);
+            v = live_union_view(st, requested);
+            d = llama_moe::decide_admission(union_size, v.avail(), v.evictable);
+        }
+        lu_decisions.fetch_add(1, std::memory_order_relaxed);
+        if (yielded >= 0) lu_yield.fetch_add(1, std::memory_order_relaxed);
+        if (d.v == decision::verdict::window) lu_window.fetch_add(1, std::memory_order_relaxed);
+        else if (d.v == decision::verdict::evict) lu_evict.fetch_add(1, std::memory_order_relaxed);
+        else lu_bank.fetch_add(1, std::memory_order_relaxed);
+        // 日志：默认（未开 env）一行都不打。开了以后前 8 条全打，之后只打非常规
+        // 判定（evict/bank）且最多到 64 条，避免 4 行 verify 每步 40 层刷屏。
+        static std::atomic<int> logged{0};
+        const int idx = logged.fetch_add(1, std::memory_order_relaxed);
+        const bool unusual = d.v != decision::verdict::window || yielded >= 0;
+        if (idx < 8 || (unusual && idx < 64)) {
+            const std::string verdict = d.v == decision::verdict::window ? "window" :
+                d.v == decision::verdict::evict ? format("evict=%d", (int) d.evict) : "bank";
+            moe_log("live-union: layer=%d rows=%d union=%d avail=%d -> %s%s",
+                    layer, (int) n_rows, (int) union_size, (int) v.avail(), verdict.c_str(),
+                    idx == 63 ? "（后续同类日志已节流）" : "");
+            if (yielded > 0) {
+                moe_log("live-union: layer=%d 预读让位 in_flight=%d -> %d", layer, (int) yielded, (int) v.inflight);
+            }
+        }
+        return d;
+    }
+
+    void trace_managed_claim(layer_state & st, const llama_moe::slot_manager::result & r, moe_handoff_context context) {
+        if (r.victim) {
+            ++manager_evicted;
+            handoff_trace.emit("SLOT_EVICT", handoff_request(context, r.victim), r.victim.expert, r.victim.slot);
+            if (r.probation_victim) {
+                moe_handoff_detail detail; detail.reason = "unused_prefetch";
+                handoff_trace.emit("PF_PROBATION_VICTIM", handoff_request(context, r.victim), r.victim.expert, r.victim.slot, 0, 0, {}, detail);
+            }
+        }
+        if (r.action == llama_moe::slot_manager::outcome::promoted) {
+            ++manager_promoted;
+            moe_handoff_detail detail; detail.related_generation = r.previous.generation;
+            handoff_trace.emit("QUEUED_PROMOTION", handoff_request(context, r.request), r.request.expert, r.request.slot, 0, 0, {}, detail);
+        }
+        if (r.owner) {
+            handoff_trace.emit("SLOT_CLAIM", handoff_request(context, r.request), r.request.expert, r.request.slot);
+        }
+        GGML_UNUSED(st);
+    }
+
+    bool finish_managed(layer_state & st, llama_moe::slot_manager::ticket request,
+                        moe_handoff_context context, bool success, std::exception_ptr error = {}) {
+        const bool accepted = success ? st.manager->complete(request) : st.manager->fail(request, error);
+        handoff_trace.emit(success ? "SLOT_READY" : "SLOT_FAILED", handoff_request(context, request),
+                           request.expert, request.slot, accepted ? 0 : -1);
+        if (!success && accepted) ++manager_failed;
+        if (success && !accepted) ++n_slot_collision;
+        return accepted;
+    }
+
+    lookahead_expert_prefetch::read_result install_managed_prefetch(int layer, int32_t expert, llama_moe::slot_manager::ticket request) {
+        auto & st = layers[(size_t) layer];
+        auto context = handoff_request(handoff_thread.context, request);
+        handoff_trace.emit("PF_CLAIM_WAIT", context, expert);
+        llama_moe::slot_manager::result r;
+        {
+            std::lock_guard<std::mutex> lock(st.mutex);
+            handoff_trace.emit("PF_CLAIM_LOCKED", context, expert);
+            r = st.manager->start_queued(request);
+            context = handoff_request(context, r.request ? r.request : request);
+            handoff_trace.emit("PF_CLAIM_RESULT", context, expert, r.request.slot, (int32_t) r.action);
+            if (r.owner) trace_managed_claim(st, r, context);
+        }
+        if (!r.owner) {
+            if (r.action == llama_moe::slot_manager::outcome::stale) {
+                ++manager_stale; handoff_trace.emit("CANCELLED_STALE_TASK", context, expert);
+            } else {
+                moe_handoff_detail detail;
+                const bool quota = r.action == llama_moe::slot_manager::outcome::writer_limit;
+                detail.reason = quota ? "writer_limit" : "capacity";
+                if (quota) ++manager_quota_skipped; else ++manager_capacity_skipped;
+                handoff_trace.emit("REQUEST_CANCELLED", context, expert, -1, (int32_t) r.action, 0, {}, detail);
+            }
+            return lookahead_expert_prefetch::read_result::skipped;
+        }
+        context.io_id = handoff_trace.new_io_id();
+        moe_handoff_scope scope(handoff_trace.enabled() ? &handoff_trace : nullptr, context, expert, r.request.slot);
+        handoff_trace.emit("IO_OWNER", context, expert, r.request.slot, (int32_t) llama_moe::slot_manager::origin::prefetch);
+        handoff_trace.emit("PF_READ_SUBMIT", context, expert, r.request.slot);
+        try {
+            read_managed_expert(st, r.request, llama_moe::io_admission::origin::prefetch);
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(st.mutex);
+            finish_managed(st, r.request, context, false, std::current_exception());
+            throw;
+        }
+        handoff_trace.emit("PF_PUBLISH_WAIT", context, expert, r.request.slot);
+        std::lock_guard<std::mutex> lock(st.mutex);
+        handoff_trace.emit("PF_PUBLISH_LOCKED", context, expert, r.request.slot);
+        const bool accepted = finish_managed(st, r.request, context, true);
+        if (accepted) ++st.n_prefetch_published;
+        handoff_trace.emit("PF_PUBLISH_RESULT", context, expert, r.request.slot, accepted ? 1 : 0);
+        return accepted ? lookahead_expert_prefetch::read_result::published : lookahead_expert_prefetch::read_result::discarded;
     }
 
     /// 预读专用：把一个 expert 读进**目标层自己的窗口**（按窗口 LRU 挑 slot）。
@@ -984,7 +2072,8 @@ struct llama_moe_slot_runtime::impl {
     ///   false → 在**预读区**里挑（预读用；统一模式下就是整层窗口）
     ///
     /// 返回 -1 = 该专家已在窗口里，或无处可放。
-    int32_t claim_slot_in_window(layer_state & st, int32_t expert, bool cache_only) {
+    int32_t claim_slot_in_window(layer_state & st, int32_t expert, bool cache_only,
+                                 const moe_handoff_context * trace_context = nullptr) {
         if (decode_window <= 0 || expert < 0 || expert >= n_expert) {
             return -1;
         }
@@ -1025,6 +2114,7 @@ struct llama_moe_slot_runtime::impl {
             return -1;
         }
         const int32_t evicted = st.slot_to_expert[(size_t) slot];
+        if (trace_context && evicted >= 0) handoff_trace.emit("LEGACY_SLOT_EVICT", *trace_context, evicted, slot);
         if (evicted >= 0) {
             st.expert_to_slot[(size_t) evicted] = kSlotFree;
         }
@@ -1038,6 +2128,14 @@ struct llama_moe_slot_runtime::impl {
         // 读盘期间主路径可能已经把同一个专家装好了（它自己读的），那就丢弃这份。
         if (st.expert_to_slot[(size_t) expert] >= 0) {
             st.slot_to_expert[(size_t) slot] = kSlotFree;
+            return false;
+        }
+        // 不变量：publish 的这个 slot 必须仍是**本专家**认领的 kSlotPending。
+        // 如果它变成了别的专家的有效条目（slot 空间混用 / 认领被抢），
+        // 这里强行写就会覆盖别人的数据 —— 计一次碰撞并放弃，宁可不缓存。
+        // 这条检查是评审指出的「乒乓格号被当成窗口偏移」那一类错误的运行时探针。
+        if (st.slot_to_expert[(size_t) slot] != kSlotPending) {
+            n_slot_collision++;
             return false;
         }
         st.slot_to_expert[(size_t) slot] = expert;
@@ -1065,6 +2163,7 @@ struct llama_moe_slot_runtime::impl {
         const int capacity = st.window_width - prefetch_slots;
         const size_t ranks = experts.size() / n_rows;
         if (capacity <= 0 || ranks == 0 || experts.size() != slots.size()) return;
+        if (st.manager && (st.manager->writers() || st.manager->pins())) return;
 
         using pack_fn = size_t (*)(void *, const void *, int, int64_t, int64_t);
         struct family_copy { const binding * src; const binding * dst; size_t bytes; };
@@ -1098,7 +2197,8 @@ struct llama_moe_slot_runtime::impl {
         const int64_t start = now_ns();
         std::vector<uint8_t> seen((size_t) n_expert, 0);
         std::vector<prewarm_place> placed;
-        size_t copied = 0;
+        size_t copied = 0, verified = 0;
+        const bool verify = verify_slot_enabled();
         const char * rank_order = std::getenv("LLAMA_MOE_PREFILL_WARM_RANK_FIRST");
         const bool rank_first = rank_order && *rank_order && *rank_order != '0';
         // Slot selection only: required experts and routing weights are unchanged.
@@ -1111,7 +2211,17 @@ struct llama_moe_slot_runtime::impl {
                 const int expert = experts[index];
                 if (seen[(size_t) expert]) continue;
                 seen[(size_t) expert] = 1;
-                const int dst_slot = (int) placed.size();
+                int dst_slot = (int) placed.size();
+                llama_moe::slot_manager::result managed;
+                auto warm_context = handoff_thread.context; warm_context.source = "prewarm"; warm_context.domain = "window";
+                if (st.manager) {
+                    managed = st.manager->acquire(expert, {graph_epoch, 0}, llama_moe::slot_manager::origin::prewarm, true);
+                    if (!managed.request) continue;
+                    dst_slot = managed.request.slot;
+                    if (!managed.owner) { placed.push_back({layer, expert, dst_slot}); continue; }
+                    trace_managed_claim(st, managed, warm_context);
+                }
+                try {
                 for (const auto & family : families) {
                     if (slots[index] < 0 || slots[index] >= family.src->tensor->ne[2] ||
                         dst_slot >= family.dst->tensor->ne[2]) {
@@ -1122,6 +2232,38 @@ struct llama_moe_slot_runtime::impl {
                                 family.bytes);
                     copied += family.bytes;
                 }
+                if (verify) {
+                    const char * packed_dir = std::getenv("LLAMA_MOE_HTP_PACKED_DIR");
+                    if (!packed_dir || !*packed_dir || !st.dec_pack_ok || st.dec_pack_path.empty() ||
+                        st.dec_pack_order.empty() || st.dec_pack_order.size() > 8 ||
+                        st.dec_pack_order.size() != families.size()) {
+                        throw std::runtime_error("prefill warm verification requires offline tiled experts");
+                    }
+                    struct iovec iov[8];
+                    size_t stride = 0;
+                    for (size_t i = 0; i < st.dec_pack_order.size(); ++i) {
+                        const auto & dst = st.dec_bindings.at(st.dec_pack_order[i]);
+                        const auto family = std::find_if(families.begin(), families.end(),
+                            [&](const family_copy & f) { return f.dst == &dst; });
+                        if (family == families.end()) throw std::runtime_error("prefill warm verification family missing");
+                        iov[i] = { (uint8_t *) dst.tensor->data + dst_slot * family->bytes, family->bytes };
+                        stride += family->bytes;
+                    }
+                    const size_t slash = st.dec_pack_path.find_last_of("/");
+                    const std::string path = std::string(packed_dir) + "/" +
+                        st.dec_pack_path.substr(slash == std::string::npos ? 0 : slash + 1);
+                    if (!verify_slot_bytes(path, (size_t) expert * stride, iov, (int) st.dec_pack_order.size())) {
+                        throw std::runtime_error("prefill warm destination verification failed");
+                    }
+                    verified += stride;
+                }
+                if (st.manager) finish_managed(st, managed.request, warm_context, true);
+                } catch (...) {
+                    if (verify) moe_log("prefill-warm-verify: layer=%d copied=%zu verified=%zu bad=%zu",
+                            layer, copied, verified, copied - verified);
+                    if (st.manager && managed.owner) finish_managed(st, managed.request, warm_context, false, std::current_exception());
+                    throw;
+                }
                 placed.push_back({ layer, expert, dst_slot });
         }
         prewarm_placed.erase(std::remove_if(prewarm_placed.begin(), prewarm_placed.end(),
@@ -1130,6 +2272,8 @@ struct llama_moe_slot_runtime::impl {
         prewarm_ready = !prewarm_placed.empty();
         moe_log("prefill-warm: layer=%d rows=%d rank_first=%d experts=%zu copied=%.1fMiB wall=%.3fms",
                 layer, rows, (int) rank_first, placed.size(), mib_of(copied), ms_of(now_ns() - start));
+        if (verify) moe_log("prefill-warm-verify: layer=%d copied=%zu verified=%zu bad=%zu",
+                layer, copied, verified, copied - verified);
     }
 
     lookahead_expert_prefetch::read_result install_prefetch_into_window(int layer, int32_t expert) {
@@ -1147,22 +2291,33 @@ struct llama_moe_slot_runtime::impl {
         //   预测到的专家已在缓存区 -> 白读（跳过，见下面的检查）
         //   不在缓存区 -> 读进暂存区，本层用时不落关键路径
         // 统一模式下预读可写在整层窗口里（见 prefetch_unified 的说明）。
+        auto context = handoff_thread.context; context.io_id = handoff_trace.new_io_id();
+        handoff_trace.emit("PF_CLAIM_WAIT", context, expert);
         int32_t slot = -1;
         {
             std::lock_guard<std::mutex> lock(st.mutex);
-            slot = claim_slot_in_window(st, expert, /*cache_only=*/false);
+            handoff_trace.emit("PF_CLAIM_LOCKED", context, expert);
+            slot = claim_slot_in_window(st, expert, /*cache_only=*/false, handoff_trace.enabled() ? &context : nullptr);
+            handoff_trace.emit("PF_CLAIM_RESULT", context, expert, slot, slot >= 0 ? 1 : 0);
+            if (slot >= 0) handoff_trace.emit("LEGACY_SLOT_CLAIM", context, expert, slot);
         }
         if (slot < 0) {
             return lookahead_expert_prefetch::read_result::skipped;
         }
 
         // 锁外读盘：这一步不再阻塞主线程。
-        read_expert_directv(st, expert, slot, true);
+        moe_handoff_scope scope(handoff_trace.enabled() ? &handoff_trace : nullptr, context, expert, slot);
+        handoff_trace.emit("IO_OWNER", context, expert, slot, (int32_t) llama_moe::slot_manager::origin::prefetch);
+        try { read_expert_directv(st, expert, slot, true); }
+        catch (...) { handoff_trace.emit("LEGACY_SLOT_FAILED", context, expert, slot, -1); throw; }
 
+        handoff_trace.emit("PF_PUBLISH_WAIT", context, expert, slot);
         std::lock_guard<std::mutex> lock(st.mutex);
-        return publish_slot_in_window(st, expert, slot)
-                ? lookahead_expert_prefetch::read_result::published
-                : lookahead_expert_prefetch::read_result::discarded;
+        handoff_trace.emit("PF_PUBLISH_LOCKED", context, expert, slot);
+        const bool published = publish_slot_in_window(st, expert, slot);
+        handoff_trace.emit("PF_PUBLISH_RESULT", context, expert, slot, published ? 1 : 0);
+        handoff_trace.emit(published ? "LEGACY_SLOT_READY" : "LEGACY_SLOT_DISCARDED", context, expert, slot);
+        return published ? lookahead_expert_prefetch::read_result::published : lookahead_expert_prefetch::read_result::discarded;
     }
 
     /// ── 缓存预热（LLAMA_MOE_PREWARM）───────────────────────────────────
@@ -1184,7 +2339,66 @@ struct llama_moe_slot_runtime::impl {
     ///
     /// `cur_layer` 的锁**已被调用方（process）持有**时传该层号；从公开 API 调用
     /// （此时不持任何层锁）传 -1。`std::mutex` 不可重入，再锁会自死锁。
+    void prewarm_managed(int cur_layer) {
+        if (!prewarm_enabled) return;
+        struct item { int32_t layer; llama_moe::slot_manager::ticket request; std::exception_ptr error; };
+        size_t count = 0;
+        for (const auto & ids : prewarm_table) count += ids.size();
+        std::vector<item> pending; pending.reserve(count);
+        const uint64_t epoch = graph_epoch;
+        for (size_t layer = 0; layer < layers.size() && layer < prewarm_table.size(); ++layer) {
+            auto & st = layers[layer]; if (!st.manager) continue;
+            auto claim = [&]() {
+                for (int32_t expert : prewarm_table[layer]) {
+                    const auto r = st.manager->acquire(expert, {epoch, 0}, llama_moe::slot_manager::origin::prewarm, true);
+                    if (!r.owner) continue;
+                    trace_managed_claim(st, r, {0, epoch, (int32_t) layer, 0, "prewarm", 0, "window"});
+                    pending.push_back({(int32_t) layer, r.request, {}});
+                }
+            };
+            if ((int) layer == cur_layer) claim();
+            else { std::lock_guard<std::mutex> lock(st.mutex); claim(); }
+        }
+        std::atomic<size_t> next{0};
+        auto read = [&]() {
+            for (;;) {
+                const size_t i = next.fetch_add(1, std::memory_order_relaxed); if (i >= pending.size()) return;
+                auto & item = pending[i]; auto & st = layers[(size_t) item.layer];
+                const auto context = handoff_request({0, epoch, item.layer, 0, "prewarm", 0, "window"}, item.request);
+                moe_handoff_scope scope(handoff_trace.enabled() ? &handoff_trace : nullptr, context, item.request.expert, item.request.slot);
+                handoff_trace.emit("IO_OWNER", context, item.request.expert, item.request.slot, (int32_t) llama_moe::slot_manager::origin::prewarm);
+                try { ++manager_reads; ++manager_prewarm_reads; read_expert_directv(st, item.request.expert, item.request.slot, true); }
+                catch (...) { item.error = std::current_exception(); }
+            }
+        };
+        const int threads = std::max(1, std::min(moe_ssd_io_threads(), (int) pending.size()));
+        if (threads == 1) read();
+        else {
+            bool pooled = false;
+            try { pooled = io_pool.run(threads, read); }
+            catch (...) { /* Submission did not start; retain synchronous fallback. */ }
+            if (!pooled) {
+            std::vector<std::thread> helpers;
+            try { helpers.reserve((size_t) threads); for (int i = 0; i < threads; ++i) helpers.emplace_back(read); }
+            catch (...) { read(); }
+            for (auto & helper : helpers) helper.join();
+            }
+        }
+        size_t completed = 0;
+        for (auto & item : pending) {
+            auto & st = layers[(size_t) item.layer];
+            auto finish = [&]() {
+                const auto context = handoff_request({0, epoch, item.layer, 0, "prewarm", 0, "window"}, item.request);
+                if (finish_managed(st, item.request, context, !item.error, item.error) && !item.error) ++completed;
+            };
+            if (item.layer == cur_layer) finish(); else { std::lock_guard<std::mutex> lock(st.mutex); finish(); }
+        }
+        prewarm_ready = true;
+        moe_log("managed-prewarm: requested=%zu own=%zu completed=%zu", count, pending.size(), completed);
+    }
+
     void prewarm_windows(int cur_layer) {
+        if (managers_active()) { prewarm_managed(cur_layer); return; }
         if (!prewarm_enabled || decode_window <= 0) {
             return;
         }
@@ -1298,6 +2512,7 @@ struct llama_moe_slot_runtime::impl {
     /// 数据本身还在（decode 段与 prefill 段物理分离），只是切换时映射表被清了 ——
     /// 所以这里纯整数操作、不读盘。`cur_layer` 的锁已由调用方持有（同 prewarm_windows）。
     void publish_prewarm_placed(int cur_layer) {
+        if (managers_active()) return; // trusted physical Residents already belong to the authority
         for (const auto & p : prewarm_placed) {
             if (p.layer < 0 || p.layer >= (int) layers.size()) {
                 continue;
@@ -1338,6 +2553,7 @@ struct llama_moe_slot_runtime::impl {
         if (!prewarm_enabled) {
             return;
         }
+        if (managers_active()) lookahead.drain();
         prewarm_windows(-1);   // -1 = 不持任何层锁，全部自取
     }
 
@@ -1444,6 +2660,8 @@ struct llama_moe_slot_runtime::impl {
             while (rows > 1 && cache_min < std::min(rows * n_used, n_expert)) {
                 rows--;
             }
+            // 图侧硬约束：批宽必须 < 32，否则 mul_mat_id 寻址不到每层 `.dec` 视图。
+            rows = std::min(rows, llama_moe::kWindowMaxRowsGraphLimit);
             window_max_rows = rows;
 
             if (rows != rows_want) {
@@ -1480,6 +2698,83 @@ struct llama_moe_slot_runtime::impl {
                 (int) n_slots);
     }
 
+    /// 本批 demand 能用的槽数 —— 与 process() 里 `alloc_hi - alloc_lo` **同一条公式**：
+    /// 统一 LRU 用整层窗口 (c+K)，分区模式只有缓存区 c。
+    /// （在 process() 里它就是 capacity；这里只是给 init 的静态夹紧复用同一份定义。）
+    int32_t demand_capacity(const layer_state & st) const {
+        const int32_t w = st.window_width > 0 ? st.window_width : decode_window + prefetch_slots;
+        return prefetch_unified ? w : std::max<int32_t>(0, w - prefetch_slots);
+    }
+
+    /// `LLAMA_MOE_LIVE_UNION=1` 的 init 段：把窗口批宽放宽到「最坏并集仍装得进
+    /// **物理**窗口」的最大值。
+    ///
+    /// 旧夹紧（resolve_decode_window 里那个 while）用的是缓存区 `c = 窗口 - K`，
+    /// 等于把预读暂存 K 当成**静态预留**扣掉。但 K 只是**在途上限**：实际在途的
+    /// 预读写者通常 0~2 个，而且运行期可以让它们让位（见 live_union_admit）。
+    /// W24/K8 下旧夹紧把 4 行判成 3 行（4×8=32 > 24），4 行 verify 整批掉到 bank
+    /// （实测 8.0 t/s vs 16.1@W32）；按物理 32 算则 4 行成立，且最坏并集 32 ≤ 32。
+    ///
+    /// 必须满足的不变量（docs/live-union.md 里也写了）：
+    ///   min(rows_want, R) × top_k（再与 n_expert 取小）+ pins_max
+    ///       <= min over enabled layers of (demand_capacity(il) - pins(il))
+    /// 于是每层 |U| + pins <= capacity 恒成立（|U| 只会比最坏并集小），
+    /// 所以窗口批次上「装不下」不可达 —— 这也正是**不允许**在运行期临时改槽空间的
+    /// 原因：图已经按每层 `.dec` 张量建好了，改槽段就会读错专家权重。
+    void resolve_live_union_rows() {
+        // 只在 **managed 路径**（slot manager + 无 MATMUL_SPLIT）下放宽。
+        // legacy 路径的 deferred 分配不按专家去重（同一专家跨行会各占一个槽，见 process()
+        // 的 kSlotPending 分支），准入若用去重并集 |U| 会低估真实物理占用 —— 例如
+        // W24/K8=32、4 行 top8、split4：|U|=20 但实际分配 16+4*4=32 槽。
+        // 因此 legacy 保持旧的保守夹紧（rows × top_k 原始位置数）。
+        if (!moe_live_union_enabled() || !slot_manager_enabled() ||
+            decode_window <= 0 || matmul_split > 0) {
+            return;
+        }
+        const char * rows_env = std::getenv("LLAMA_MOE_WINDOW_MAX_ROWS");
+        const int32_t rows_want = std::max(1, rows_env && *rows_env ? std::atoi(rows_env) : 1);
+        const int32_t n_used = (int32_t) model.hparams.n_expert_used;
+
+        int32_t cap_min = INT32_MAX, pins_max = 0;
+        bool any_layer = false;
+        for (size_t il = 0; il < layers.size() && il < layer_width.size(); ++il) {
+            const auto & st = layers[il];
+            if (!st.enabled || layer_width[il] <= 0) {
+                continue;
+            }
+            any_layer = true;
+            // 常驻 pin（PREWARM）永远不淘汰，必须先扣掉它们才谈得上最坏并集。
+            const int32_t pins = (int32_t) std::count(st.pinned_experts.begin(), st.pinned_experts.end(), (uint8_t) 1);
+            cap_min  = std::min(cap_min, demand_capacity(st) - pins);
+            pins_max = std::max(pins_max, pins);
+        }
+        if (!any_layer || cap_min <= 0) {
+            moe_log("live-union: off（没有可用的窗口容量：min=%d, pins=%d）",
+                    any_layer ? (int) cap_min : 0, (int) pins_max);
+            return;
+        }
+
+        // 纯函数（src/llama-moe-live-union.h）：最坏并集仍装得进 cap_min 的最大批宽。
+        const int32_t rows = llama_moe::live_union_max_rows(rows_want, n_used, n_expert, cap_min);
+        const int32_t prev = window_max_rows;
+        if (rows <= prev) {
+            moe_log("live-union: off（物理容量 min=%d − pins=%d 只够 %d 行（最坏并集 %d），"
+                    "不比旧夹紧 %d 宽；保持原样）",
+                    (int) cap_min + (int) pins_max, (int) pins_max, (int) rows,
+                    (int) std::min(rows * n_used, n_expert), (int) prev);
+            return;
+        }
+        window_max_rows = rows;
+        live_union_active = true;
+        // 注意日志顺序：`decode-cache: 窗口覆盖批宽 1..N` 是**夹紧后、放宽前**打的
+        // （那时 pins 还不知道），所以这里必须明确说"覆盖上面那行"，否则读者会
+        // 以为 4 行仍然走 bank。
+        moe_log("live-union: on 窗口批宽 1..%d（覆盖上面 decode-cache 的 1..%d；"
+                "物理宽度 min=%d，pins=%d，最坏并集 %d；运行期按本批实际并集复核）",
+                (int) window_max_rows, (int) prev, (int) cap_min + (int) pins_max, (int) pins_max,
+                (int) std::min(rows * n_used, n_expert));
+    }
+
     ~impl() {
         if (cur.n_layers > 0) {
             flush_ubatch(cur.n_tokens <= 1 ? "decode" : "prefill",
@@ -1513,8 +2808,67 @@ struct llama_moe_slot_runtime::impl {
             moe_log("miss/layer (avg over %llu steps): %s",
                     (unsigned long long) miss_per_layer_steps, s.c_str());
         }
+        {
+            std::string s;
+            for (int k = 1; k <= 8; ++k) {
+                if (recall_pred[k] == 0) continue;
+                s += format("k=%d:%.1f%%(%llu/%llu) ", k,
+                            100.0 * (double) recall_hit[k] / (double) recall_pred[k],
+                            (unsigned long long) recall_hit[k],
+                            (unsigned long long) recall_pred[k]);
+            }
+            if (!s.empty()) {
+                moe_log("horizon-recall: %s", s.c_str());
+            }
+        }
         lookahead.stop();
+        if (io_budget) io_budget->close();
+        const auto admission = io_budget ? io_budget->snapshot() : llama_moe::io_admission::statistics{};
+        moe_log("io-budget-summary: enabled=%d limit=%u scope=ready-window peak=%u grants=%llu releases=%llu cancelled=%llu "
+                "boosted=%llu demand_grants=%llu needed_grants=%llu background_grants=%llu active_final=%u waiters_final=%u",
+                (int) (io_budget != nullptr), io_budget ? expert_io_budget() : 0, admission.peak,
+                (unsigned long long) admission.grants, (unsigned long long) admission.releases,
+                (unsigned long long) admission.cancelled, (unsigned long long) admission.boosted,
+                (unsigned long long) admission.demand_grants, (unsigned long long) admission.needed_grants,
+                (unsigned long long) admission.background_grants, admission.active, admission.waiting);
         lookahead.report_completed();
+        llama_moe::slot_manager::probation_counters probation;
+        for (const auto & st : layers) if (st.manager) {
+            const auto counts = st.manager->probation_stats();
+            probation.promotions += counts.promotions; probation.demand_victims += counts.demand_victims;
+        }
+        moe_log("pf-probation-summary: enabled=%d promotions=%llu demand_victims=%llu",
+                (int) pf_probation, (unsigned long long) probation.promotions, (unsigned long long) probation.demand_victims);
+        moe_log("h1-front-summary: enabled=%d eligible=%llu attempted=%llu candidate_ids=%llu",
+                (int) h1_front, (unsigned long long) h1_front_eligible,
+                (unsigned long long) h1_front_attempted, (unsigned long long) h1_front_candidate_ids);
+        moe_log("slot-manager-summary: enabled=%d requested=%d coalesced=%llu promoted=%llu joined=%llu reused=%llu "
+                "reads=%llu evicted=%llu stale_tasks=%llu failed=%llu own_reads=%llu retry_reads=%llu pf_reads=%llu prewarm_reads=%llu quota_skipped=%llu capacity_skipped=%llu",
+                (int) managers_active(), (int) slot_manager_enabled(),
+                (unsigned long long) manager_coalesced.load(), (unsigned long long) manager_promoted.load(),
+                (unsigned long long) manager_joined.load(), (unsigned long long) manager_reused.load(),
+                (unsigned long long) manager_reads.load(), (unsigned long long) manager_evicted.load(),
+                (unsigned long long) manager_stale.load(), (unsigned long long) manager_failed.load(),
+                (unsigned long long) manager_demand_reads.load(), (unsigned long long) manager_retry_reads.load(),
+                (unsigned long long) manager_prefetch_reads.load(), (unsigned long long) manager_prewarm_reads.load(),
+                (unsigned long long) manager_quota_skipped.load(), (unsigned long long) manager_capacity_skipped.load());
+        if (live_union_active) {
+            moe_log("live-union-summary: decisions=%llu window=%llu evict=%llu yield=%llu bank=%llu",
+                    (unsigned long long) lu_decisions.load(), (unsigned long long) lu_window.load(),
+                    (unsigned long long) lu_evict.load(), (unsigned long long) lu_yield.load(),
+                    (unsigned long long) lu_bank.load());
+        }
+        handoff_trace.flush();
+        if (g_n_horizon_clamped.load()) {
+            moe_log("horizon-clamp-summary: 本 runtime 累计夹紧 %llu 次（可见日志条数≠实际次数）",
+                    (unsigned long long) g_n_horizon_clamped.load());
+        }
+        if (n_verify_ok.load() || n_verify_bad.load() || n_slot_collision.load()) {
+            moe_log("verify-slot: ok=%llu bad=%llu slot_collision=%llu",
+                    (unsigned long long) n_verify_ok.load(),
+                    (unsigned long long) n_verify_bad.load(),
+                    (unsigned long long) n_slot_collision.load());
+        }
         moe_log("io-summary: scope=all_graphs_including_initialization_and_prefetch "
                 "requested_bytes=%llu span_requests=%llu",
                 (unsigned long long) io_bytes_all.load(std::memory_order_relaxed),
@@ -1603,64 +2957,26 @@ struct llama_moe_slot_runtime::impl {
         state.pack_bytes = state.pack_stride;
     }
 
-    /// LLAMA_MOE_F_NOCACHE：experts 读是否绕过 page cache。
-    ///   未设 / "0" → 全程不绕（默认）
-    ///   "auto"     → 按阶段（prefill 绕、decode 不绕）
-    ///   "1"        → 全程绕过
-    static int nocache_mode() {
-        static const int m = [] {
-            const char * e = std::getenv("LLAMA_MOE_F_NOCACHE");
-            if (!e || !*e || std::strcmp(e, "0") == 0) {
-                return 0;
-            }
-            return std::strcmp(e, "auto") == 0 ? -1 : 1;
-        }();
-        return m;
-    }
-
-    bool experts_nocache_desired() const {
-        const int m = nocache_mode();
-        return m < 0 ? want_nocache.load(std::memory_order_relaxed) : m != 0;
-    }
-
-    /// 把已打开的 experts fd 的 F_NOCACHE 拨到 `on`。只改缓存行为，不动数据。
-    void apply_experts_nocache(bool on) {
-#ifndef _WIN32
-        std::lock_guard<std::mutex> lock(fd_mutex);
-        for (const auto & kv : fds) {
-#ifdef F_NOCACHE
-            if (fcntl(kv.second, F_NOCACHE, on ? 1 : 0) != 0) {
-                moe_log("F_NOCACHE 切换失败: %s", std::strerror(errno));
-            }
-#else
-            (void) kv;
-#endif
-        }
-#endif
-        // 只在每个方向各打一次，避免长会话刷屏。
-        static bool logged[2] = { false, false };
-        if (!logged[on ? 0 : 1]) {
-            logged[on ? 0 : 1] = true;
-            moe_log("experts 读%s page cache（%s 阶段）", on ? "绕过" : "经过",
-                    on ? "prefill" : "decode");
-        }
-    }
-
+    /// 取 fd（按路径缓存）。O_DIRECT 只能在 open() 时指定、不能用 fcntl 改已打开的 fd，
+    /// 但读法在进程生命周期里是固定的（只有 0/1 两档，没有阶段切换），所以一张表就够。
     int fd_for(const std::string & path) {
         std::lock_guard<std::mutex> lock(fd_mutex);
-        const auto found = fds.find(path);
-        if (found != fds.end()) {
+        const bool direct = moe_o_direct();
+        auto & table = fds;
+        const auto found = table.find(path);
+        if (found != table.end()) {
             return found->second;
         }
 #ifdef _WIN32
         const int fd = _open(path.c_str(), _O_RDONLY | _O_BINARY);
 #else
-        const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-#ifdef F_NOCACHE
-        if (experts_nocache_desired() && fcntl(fd, F_NOCACHE, 1) != 0) {
-            moe_log("F_NOCACHE 设置失败: %s", std::strerror(errno));
+        int open_flags = O_RDONLY | O_CLOEXEC;
+#ifdef O_DIRECT
+        if (direct) {
+            open_flags |= O_DIRECT;
         }
 #endif
+        const int fd = open(path.c_str(), open_flags);
 #endif
         if (fd < 0) {
             throw std::runtime_error(format("failed to open MoE experts file '%s': %s", path.c_str(), std::strerror(errno)));
@@ -1672,12 +2988,126 @@ struct llama_moe_slot_runtime::impl {
             if (advice_error) moe_log("random-read advice failed: %s", std::strerror(advice_error));
         }
 #endif
-        fds.emplace(path, fd);
+        table.emplace(path, fd);
         return fd;
+    }
+
+    /// O_DIRECT 版读：先读进 4096 对齐的 thread-local scratch，再 memcpy 给各 iovec。
+    /// 目的地址和长度都不保证对齐（gate|up|down 三段），所以不能直接 preadv 进去。
+    /// LLAMA_MOE_VERIFY_SLOT=1：每个专家读完就把 slot 里的字节和文件里的字节比一遍。
+    /// 这条检查证明「算出来的文件偏移 → 落到的内存」没错位（评审第 2 条那一类错误的
+    /// 可执行判据；md5 对比反而证明不了这个，因为这套运行时本来就不是 bit-exact）。
+    static bool verify_slot_enabled() {
+        static const bool on = [] {
+            const char * v = std::getenv("LLAMA_MOE_VERIFY_SLOT");
+            return v && *v && *v != '0';
+        }();
+        return on;
+    }
+
+    bool verify_slot_bytes(const std::string & path, size_t offset,
+                           const struct iovec * iov, int niov) {
+        size_t total = 0;
+        for (int i = 0; i < niov; ++i) total += iov[i].iov_len;
+        if (!total) return false;
+        void * buf = nullptr;
+        if (posix_memalign(&buf, 4096, total) != 0) {
+            n_verify_bad.fetch_add(1, std::memory_order_relaxed);
+            moe_log("VERIFY-SLOT: allocation failed %s offset=%zu bytes=%zu", path.c_str(), offset, total);
+            return false;
+        }
+        size_t done = 0;
+        const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            while (done < total) {
+                const ssize_t r = pread(fd, (uint8_t *) buf + done, total - done, (off_t) (offset + done));
+                if (r <= 0) break;
+                done += (size_t) r;
+            }
+            close(fd);
+        }
+        int bad = 0;
+        size_t at = 0;
+        for (int i = 0; i < niov && done == total; ++i) {
+            if (memcmp((const uint8_t *) buf + at, iov[i].iov_base, iov[i].iov_len) != 0) bad++;
+            at += iov[i].iov_len;
+        }
+        if (done != total) bad = -1;
+        if (bad) {
+            n_verify_bad.fetch_add(1, std::memory_order_relaxed);
+            moe_log("VERIFY-SLOT: **不一致** %s offset=%zu bytes=%zu 坏段=%d read=%zu",
+                    path.c_str(), offset, total, bad, done);
+        } else {
+            n_verify_ok.fetch_add(1, std::memory_order_relaxed);
+        }
+        free(buf);
+        return bad == 0;
+    }
+
+    void readv_span_direct(int fd, size_t offset, struct iovec * iov, int niov) {
+        size_t total = 0;
+        for (int i = 0; i < niov; ++i) {
+            total += iov[i].iov_len;
+        }
+        io_bytes_all.fetch_add(total, std::memory_order_relaxed);
+        io_calls_all.fetch_add(1, std::memory_order_relaxed);
+        if (total == 0) {
+            return;
+        }
+        // 长度也得是 512 的倍数才能进 O_DIRECT；不是就退回缓冲读（少见，专家 stride 是 512 的倍数）。
+        if (total % 512 != 0 || offset % 512 != 0) {
+            readv_span(fd, offset, iov, niov);
+            return;
+        }
+        static thread_local uint8_t * scratch = nullptr;
+        static thread_local size_t scratch_cap = 0;
+        const size_t need = (total + 4095) & ~(size_t) 4095;
+        if (scratch_cap < need) {
+            // aligned_alloc() is API 28+ on Android (minSdk 24); posix_memalign() is available
+            // on every supported API level and gives the 4096-byte alignment O_DIRECT needs.
+            // 先分配成功再释放旧 buffer：失败时 scratch/scratch_cap 仍指向原 buffer，
+            // 不会留下悬空指针（否则同线程下一次调用会 double-free）。
+            void * aligned = nullptr;
+            if (posix_memalign(&aligned, 4096, need) != 0 || aligned == nullptr) {
+                throw std::runtime_error("failed to allocate aligned MoE read buffer");
+            }
+            if (scratch) {
+                free(scratch);
+            }
+            scratch = (uint8_t *) aligned;
+            scratch_cap = need;
+        }
+        {
+            moe_handoff_span read_span(handoff_trace, "PREAD_BEGIN", "PREAD_DONE", handoff_thread.context,
+                                   handoff_thread.expert, handoff_thread.slot, total);
+            size_t done = 0;
+            while (done < total) {
+                const ssize_t result = pread(fd, scratch + done, total - done, (off_t) (offset + done));
+                if (result < 0 && errno == EINTR) {
+                    continue;
+                }
+                if (result <= 0) {
+                    throw std::runtime_error(format(
+                        "failed to read MoE experts (O_DIRECT) at offset %zu: %s",
+                        offset + done, result < 0 ? std::strerror(errno) : "short read"));
+                }
+                done += (size_t) result;
+            }
+            read_span.complete();
+        }
+        size_t at = 0;
+        for (int i = 0; i < niov; ++i) {
+            memcpy(iov[i].iov_base, scratch + at, iov[i].iov_len);
+            at += iov[i].iov_len;
+        }
     }
 
     // read one contiguous file span into several disjoint buffers, adjusting the iovecs on partial reads
     void readv_span(int fd, size_t offset, struct iovec * iov, int niov) {
+        if (moe_o_direct()) {
+            readv_span_direct(fd, offset, iov, niov);
+            return;
+        }
         {
             size_t n = 0;
             for (int i = 0; i < niov; ++i) {
@@ -1692,6 +3122,8 @@ struct llama_moe_slot_runtime::impl {
         for (int i = 0; i < niov; ++i) {
             total += iov[i].iov_len;
         }
+        moe_handoff_span pread(handoff_trace, "PREAD_BEGIN", "PREAD_DONE", handoff_thread.context,
+                               handoff_thread.expert, handoff_thread.slot, total);
         size_t done = 0;
         while (done < total) {
             struct iovec cur[8];
@@ -1725,6 +3157,7 @@ struct llama_moe_slot_runtime::impl {
             }
             done += (size_t) result;
         }
+        pread.complete();
     }
 
     // Reads the packed gate|up|down span (one contiguous run in the experts) with a single preadv,
@@ -1732,18 +3165,34 @@ struct llama_moe_slot_runtime::impl {
     // buffer and no second copy into the device buffer.
     int64_t read_expert_directv(const layer_state & state, int32_t expert, int32_t slot,
                                 bool window_mode = false) {
+        const int32_t trace_layer = (int32_t) (&state - layers.data());
+        auto context = handoff_thread.trace == &handoff_trace ? handoff_thread.context
+            : moe_handoff_context{0, 0, trace_layer, 0, "other", 0, window_mode ? "window" : "bank"};
+        if (!context.io_id) context.io_id = handoff_trace.new_io_id();
+        moe_handoff_scope scope(handoff_trace.enabled() ? &handoff_trace : nullptr, context, expert, slot);
+        const bool pf = handoff_trace.enabled() && std::strcmp(context.source, "prefetch") == 0;
+        const bool demand = handoff_trace.enabled() && std::strcmp(context.source, "demand") == 0;
+        moe_handoff_span reader(handoff_trace, pf ? "PF_READ_BEGIN" : demand ? "DEMAND_READ_BEGIN" : "OTHER_READ_BEGIN",
+            pf ? "PF_READ_DONE" : demand ? "DEMAND_READ_DONE" : "OTHER_READ_DONE", context, expert, slot);
         // 诊断：LLAMA_MOE_SKIP_READ=1 时走完所有记账但不真读盘。
         //
-        // 目的是把「CPU 段 + 每层往返」的成本和「真读盘」的成本分开：
-        //   step(真实) - step(空读) = I/O 落在关键路径上的部分
-        //   step(空读) - 常驻基线     = 结构开销（40 次 GPU/CPU 往返 + 调度）
-        // 输出会是错的（专家内容是垃圾），只用来看时间。
-        // 诊断三态，用来把「读」与「写进 GPU 缓冲区」分开：
+        // 这些模式**只用来观察耗时**，不能用 step 之间的差值去做归因：
+        // 它们走的读取路径不同、落点不同、且后两者输出无效（路由与投机接受率都会变）。
+        // 输出是错的（专家内容是垃圾），只看时间。
+        // 诊断三态（**只用于观察耗时，不能互相相减做归因**）：
         //   0（默认）正常：preadv 直接写进 slot 张量（GPU 可见）
-        //   1 dummy   ：preadv 读进一块 scratch —— 同样的 I/O，但不碰 GPU 缓冲区
-        //   2 skip    ：完全不读
-        // 判定：若 0 >> 1 ≈ 2 → 成本在「写 GPU 缓冲区」（缓存行失效）；
-        //       若 0 ≈ 1 >> 2 → 单纯是 I/O 本身。
+        //   1 dummy   ：**诊断模式，不是 IO-only 下界**。它跳过 packed/tiled 正常路径
+        //               （`packed_dir && mode == 0` 不再成立），改走 raw 路径读进**同一个**
+        //               scratch，所有 family 共用一个缓冲区；MoE 图仍然照常计算，
+        //               用的是 slot 里的旧数据 ⇒ **输出无效**。
+        //               所以它的耗时不能当成"只读不算"的地板（曾被这样误用，见
+        //               exps/pipe-in-layer-20261105/README.md §3.34 的更正）。
+        //   2 skip    ：完全不读（图仍然照算、slot 里是旧数据）⇒ **同样输出无效**。
+        //               **不能**当成"有效推理的算力地板"，只能当"不读盘时的诊断耗时"
+        //               （见 exps/pipe-in-layer-20261105/README.md §3.34）。
+        // 三种模式**只用于观察耗时**，不能互相相减来归因"成本在写 GPU 缓冲还是 I/O"：
+        // 它们走的读取路径不同（dummy/skip 跳过 packed/tiled 分支）、落点不同、
+        // 且后两者输出无效、路由与投机接受率都会变 —— 差值没有可比性（§3.34）。
         static const int mode = [] {
             const char * d = std::getenv("LLAMA_MOE_DUMMY_READ");
             if (d && *d && *d != '0') return 1;
@@ -1786,6 +3235,10 @@ struct llama_moe_slot_runtime::impl {
             const int packed_fd = fd_for(packed_path);
             const size_t packed_offset = (size_t) expert * packed_stride;
             readv_span(packed_fd, packed_offset, packed_iov, (int) order.size());
+            if (verify_slot_enabled() &&
+                !verify_slot_bytes(packed_path, packed_offset, packed_iov, (int) order.size())) {
+                throw std::runtime_error("offline tiled expert slot verification failed");
+            }
 #if defined(__linux__)
             // Once retained in a DSP cache slot, the same expert pages need not
             // occupy Linux page cache too. This advice changes no file bytes.
@@ -1799,6 +3252,7 @@ struct llama_moe_slot_runtime::impl {
             stats.pread_ns.fetch_add(elapsed, std::memory_order_relaxed);
             stats.n_bytes.fetch_add(packed_stride, std::memory_order_relaxed);
             stats.n_miss.fetch_add(1, std::memory_order_relaxed);
+            reader.complete();
             return elapsed;
         }
 
@@ -1897,6 +3351,7 @@ struct llama_moe_slot_runtime::impl {
         stats.pread_ns.fetch_add(dt, std::memory_order_relaxed);
         stats.n_bytes.fetch_add(nbytes, std::memory_order_relaxed);
         stats.n_miss.fetch_add(1, std::memory_order_relaxed);
+        reader.complete();
         return dt;
     }
 
@@ -2046,19 +3501,42 @@ struct llama_moe_slot_runtime::impl {
         t.n = n;
         t.pack = true;
         t.bytes = (size_t) n * state.pack_bytes;
-        std::vector<std::string> errs((size_t) n);
+        std::vector<std::exception_ptr> errs((size_t) n);
         std::vector<int64_t> dts((size_t) n, 0);
+        // Snapshot on the submitting thread, before the pool starts. Readers
+        // must never load the caller's mutable graph_epoch themselves.
+        const moe_handoff_context trace_context = {0, graph_epoch, (int32_t) (&state - layers.data()),
+            handoff_thread.trace == &handoff_trace ? handoff_thread.context.rows : 0, "demand", 0, window_mode ? "window" : "bank"};
         auto read_one = [&](int i) {
+            auto request_context = handoff_request(trace_context, pending[(size_t) i].request);
+            request_context.io_id = pending[(size_t) i].io_id;
+            moe_handoff_scope trace_scope(handoff_trace.enabled() ? &handoff_trace : nullptr, request_context);
+            handoff_trace.emit("IO_OWNER", request_context,
+                pending[(size_t) i].expert, pending[(size_t) i].slot, (int32_t) llama_moe::slot_manager::origin::demand);
             try {
-                dts[(size_t) i] = read_expert_directv(
-                    state, pending[(size_t) i].expert, pending[(size_t) i].slot, window_mode);
-            } catch (const std::exception & e) {
-                errs[(size_t) i] = e.what();
+                const auto & item = pending[(size_t) i];
+                dts[(size_t) i] = item.request ? read_managed_expert(state, item.request,
+                    llama_moe::io_admission::origin::demand, item.retry) :
+                    read_expert_directv(state, item.expert, item.slot, window_mode);
+                if (pending[(size_t) i].request) {
+                    std::lock_guard<std::mutex> lock(state.mutex);
+                    if (!finish_managed(state, pending[(size_t) i].request, request_context, true)) {
+                        throw std::runtime_error("demand expert request lost its slot ownership");
+                    }
+                }
+                handoff_trace.emit("DEMAND_READY", request_context, pending[(size_t) i].expert, pending[(size_t) i].slot);
+            } catch (...) {
+                errs[(size_t) i] = std::current_exception();
+                if (pending[(size_t) i].request) {
+                    std::lock_guard<std::mutex> lock(state.mutex);
+                    finish_managed(state, pending[(size_t) i].request, request_context, false, errs[(size_t) i]);
+                }
             }
         };
 
         t.n_th = std::max(1, std::min(moe_ssd_io_threads(), n));
         const int64_t wall0 = now_ns();
+        handoff_trace.emit("DEMAND_WAVE_SUBMIT", trace_context, -1, -1, n, t.bytes);
         // 注意：单线程不能只调 read_one(0) —— 那只会装第一个专家，
         // 其余 N-1 个被静默跳过，slot 里留着上一层/上一个 token 的旧权重，
         // 模型输出会错但不报错。这条路径只在 io_threads==1 时进入，
@@ -2082,19 +3560,59 @@ struct llama_moe_slot_runtime::impl {
             if (!io_pool.run(t.n_th, work)) {
                 std::vector<std::thread> threads;
                 threads.reserve((size_t) t.n_th);
-                for (int th = 0; th < t.n_th; ++th) threads.emplace_back(work);
+                try {
+                    for (int th = 0; th < t.n_th; ++th) threads.emplace_back(work);
+                } catch (...) {
+                    for (auto & th : threads) th.join();
+                    throw;
+                }
                 for (auto & th : threads) th.join();
             }
         }
         t.wall_ns = now_ns() - wall0;
         for (int i = 0; i < n; ++i) {
-            if (!errs[(size_t) i].empty()) {
-                throw std::runtime_error(errs[(size_t) i]);
-            }
+            if (errs[(size_t) i]) std::rethrow_exception(errs[(size_t) i]);
             t.pread_sum_ns += dts[(size_t) i];
             t.pread_max_ns = std::max(t.pread_max_ns, dts[(size_t) i]);
         }
         return t;
+    }
+
+    llama_moe::slot_manager::ticket wait_managed(layer_state & st, llama_moe::slot_manager::ticket request,
+                                                moe_handoff_context context, install_timing & total) {
+        {
+            moe_handoff_span waiting(handoff_trace, "JOIN_BEGIN", "JOIN_DONE", handoff_request(context, request), request.expert, request.slot);
+            try {
+                std::unique_lock<std::mutex> lock(st.mutex);
+                st.manager->wait(request, lock);
+                waiting.complete(); return request;
+            } catch (const llama_moe::io_admission_cancelled &) { throw; }
+            catch (...) { /* A speculative failure gets one demand retry. */ }
+        }
+        std::vector<pending_install> retry(1); // allocate before acquiring ownership
+        llama_moe::slot_manager::result r;
+        {
+            std::lock_guard<std::mutex> lock(st.mutex);
+            r = st.manager->acquire(request.expert, {context.epoch, 0});
+            if (!r.request) throw std::runtime_error("no MoE slot for failed speculative read retry");
+            trace_managed_claim(st, r, context);
+        }
+        if (!r.owner) {
+            std::unique_lock<std::mutex> lock(st.mutex); st.manager->wait(r.request, lock); return r.request;
+        }
+        context = handoff_request(context, r.request);
+        context.io_id = handoff_trace.new_io_id();
+        handoff_trace.emit("DEMAND_READ_SUBMIT", context, r.request.expert, r.request.slot);
+        retry[0] = {r.request.expert, r.request.slot, r.request, context.io_id, true};
+        try {
+            const auto timing = install_pending(st, retry, true);
+            total.n += timing.n; total.n_th = std::max(total.n_th, timing.n_th);
+            total.pread_sum_ns += timing.pread_sum_ns; total.pread_max_ns = std::max(total.pread_max_ns, timing.pread_max_ns);
+            total.bytes += timing.bytes;
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(st.mutex); finish_managed(st, r.request, context, false, std::current_exception()); throw;
+        }
+        return r.request;
     }
 
     static double ms_of(int64_t ns) {
@@ -2275,6 +3793,13 @@ struct llama_moe_slot_runtime::impl {
     /// 不是降级。上限另外受「批宽 < 32」约束：再大就走 mul_mat_id 路径，寻址不到
     /// 每层的 `.dec` 视图。
     int32_t window_max_rows = 1;
+    /// `LLAMA_MOE_LIVE_UNION` 是否**真的**放宽了批宽（= 静态不变量成立，
+    /// 见 resolve_live_union_rows）。false 时运行期复核一律跳过，
+    /// 行为与未开该 env 时完全一致（包括没有任何 live-union 日志）。
+    bool live_union_active = false;
+    /// live-union 诊断计数（只在开关**生效**时累加；默认全 0，不打日志）。
+    /// 为什么要它：日志会节流，跑 bench 时光看开头几行判断不出"到底淘汰了多少次"。
+    std::atomic<uint64_t> lu_decisions{0}, lu_window{0}, lu_evict{0}, lu_yield{0}, lu_bank{0};
     /// 每层**预读暂存区**的 slot 数（= 预读深度 K）。
     ///
     /// 为什么单列一块：预读的条目是「下一步可能用到」，与「跨 token 复用」是两种
@@ -2296,16 +3821,14 @@ struct llama_moe_slot_runtime::impl {
     /// 分区当初是为了防「预读把缓存成批挤出去」，但那个前提已被 arm 时的过滤消掉：
     /// 预读每层每步只新增约 2.4 个（而不是 8 个），不会造成成批淘汰。
     bool prefetch_unified = true;
+    bool pf_probation = false;
     bool was_window = false;
     int protected_layer = -1;
-    /// 仅在 LLAMA_MOE_F_NOCACHE=auto（按阶段）时被翻转：prefill 绕、decode 不绕。
-    /// 必须 atomic：主线程在 process() 里写它时**不持** fd_mutex，而 fd_for() 会被
-    /// 预读 worker 的子线程调用并读它 → 无同步的并发读写。relaxed 够用：
-    /// 只需不撕裂，不依赖可见顺序。
-    std::atomic<bool> want_nocache{false};
     int last_moe_layer = -1;
     int first_moe_layer = -1;
     uint64_t graph_epoch = 0;
+    bool h1_front = false;
+    uint64_t h1_front_eligible = 0, h1_front_attempted = 0, h1_front_candidate_ids = 0;
     uint64_t n_prefill_ubatch = 0;
     uint64_t n_decode_step = 0;
     uint64_t window_unique = 0;
@@ -2316,10 +3839,18 @@ struct llama_moe_slot_runtime::impl {
     run_stats g_runs;   // 整进程累计；process() 只在 ith==0 上跑，单线程，无需原子
     std::vector<layer_state> layers;
     std::vector<map_userdata> userdata;
-    std::unordered_map<std::string, int> fds;
+    std::unordered_map<std::string, int> fds;         // 按路径缓存的 fd（缓冲或 O_DIRECT，全进程一致）
     std::mutex fd_mutex;
     std::mutex io_mutex;
     io_stats stats;
+    moe_handoff_trace handoff_trace;
+    std::atomic<uint64_t> manager_coalesced{0}, manager_promoted{0}, manager_joined{0}, manager_reused{0};
+    std::atomic<uint64_t> manager_reads{0}, manager_evicted{0}, manager_stale{0}, manager_failed{0};
+    std::atomic<uint64_t> manager_demand_reads{0}, manager_prefetch_reads{0}, manager_prewarm_reads{0}, manager_retry_reads{0};
+    std::atomic<uint64_t> manager_quota_skipped{0}, manager_capacity_skipped{0};
+    // Must outlive lookahead workers, including constructor unwinding.
+    std::unique_ptr<llama_moe::io_admission> io_budget;
+    std::vector<llama_moe::io_admission::key> io_needed_snapshot;
     lookahead_expert_prefetch lookahead;
     ggml_tensor * lookahead_pending = nullptr;
 
@@ -2533,9 +4064,16 @@ struct llama_moe_slot_runtime::impl {
         }
         for (auto & st : layers) {
             if (st.enabled) {
+                std::lock_guard<std::mutex> state_lock(st.mutex);
+                if (st.manager) {
+                    st.manager->release_selected(); st.manager->reset_binding();
+                    handoff_trace.emit("BINDING_RESET", {0, graph_epoch, (int32_t) (&st - layers.data()), 0, "control", 0,
+                        "window", st.manager->binding_generation()});
+                }
                 clear_layer_cache(st);
             }
         }
+        protected_layer = -1;
         was_window = false;
         parked.store(true, std::memory_order_release);
         moe_log("park expert memory: %d metal buffer(s)", n_ok);
@@ -2645,6 +4183,23 @@ int llama_moe_slot_runtime::lookahead_prefetch_depth() const {
     return pimpl->lookahead.enabled ? (int) pimpl->lookahead.depth : 0;
 }
 
+/// 跨层流水 horizon：一次性把接下来 horizon 层的 gate 都算出来（都用当前层的
+/// attn_post_norm 当 hidden 的近似），于是读盘可以提前 horizon 层发起。
+/// **默认 2**；1 = 旧行为；上限 8（再多预测精度会崩，见 exps/pipe-in-layer 的 recall(k)）。
+int llama_moe_slot_runtime::lookahead_horizon() const {
+    // 这里**直接给值**，不再看 pimpl->lookahead.enabled。
+    //
+    // 原因（2026-11-05 由独立评审纠正过一次）：**在启用预取且 depth 有效时**，
+    // `enabled` 在构造期就由 init() → set_depth() 置 true（见 `:424` → `:451`），
+    // 建图时早已是 true；env 关掉预取、或 bank 太小导致 depth 归一化为 0 时才是 false。
+    // 而唯一调用方 qwen35moe 外层已经用 `lookahead_prefetch_enabled()`（= 同一个 enabled）
+    // 闸过一遍：它为 false 时**一块预测都不建**。所以原来的 `if (!enabled) return 1;`
+    // 在可达路径上不可达，删掉它是去冗余检查，**不是** bug 修复 —— 曾一度误当成
+    // 「horizon 从未生效」的证据，已更正（exps/pipe-in-layer-20261105/README.md §3.33）。
+    // 保留这条约束的语义：建不建块由调用方判，这里只负责给值。
+    return moe_lookahead_horizon();
+}
+
 // Opt-in: speculative verification can overlap next-layer expert I/O too.
 // Clamp to the established window capacity so prefill stays on its shared bank.
 int llama_moe_slot_runtime::lookahead_prefetch_max_rows() const {
@@ -2690,7 +4245,25 @@ llama_moe_slot_runtime::counters llama_moe_slot_runtime::counters_snapshot() con
 }
 
 void llama_moe_slot_runtime::set_lookahead_prefetch_depth(int depth) {
+    if (pimpl->managers_active()) {
+        if (depth > 0 && (!pimpl->lookahead.window_mode || depth > pimpl->prefetch_slots)) {
+            moe_log("slot-manager: reject depth=%d (reserved=%d window=%d); tensor layout rebuild required",
+                    depth, pimpl->prefetch_slots, (int) pimpl->lookahead.window_mode);
+            return;
+        }
+        // A phase/depth mutation never races an old task writing its binding.
+        pimpl->lookahead.drain();
+        if (depth <= 0) for (auto & state : pimpl->layers) {
+            if (!state.manager) continue;
+            std::lock_guard<std::mutex> lock(state.mutex); state.manager->set_hints({});
+        }
+    }
     pimpl->lookahead.set_depth(depth);
+    if (pimpl->managers_active()) for (auto & state : pimpl->layers) {
+        if (!state.manager) continue;
+        std::lock_guard<std::mutex> lock(state.mutex);
+        state.manager->set_prefetch_limit(pimpl->lookahead.enabled ? pimpl->lookahead.depth : 0);
+    }
 }
 
 void llama_moe_slot_runtime::set_lookahead_pred(ggml_tensor * pred_ids) {
@@ -2735,6 +4308,10 @@ void llama_moe_slot_runtime::process(
     }
 
     if (layer == pimpl->first_moe_layer) pimpl->graph_epoch++;
+    const moe_handoff_context trace_context = {0, pimpl->graph_epoch, layer, (int32_t) expert_ids->ne[1], "demand", 0,
+        pimpl->decode_window > 0 && expert_ids->ne[1] <= pimpl->window_max_rows ? "window" : "bank"};
+    moe_handoff_scope process_scope(pimpl->handoff_trace.enabled() ? &pimpl->handoff_trace : nullptr, trace_context);
+    moe_handoff_span callback(pimpl->handoff_trace, "CALLBACK_BEGIN", "CALLBACK_DONE", trace_context);
     pimpl->lookahead.observe_demand(layer, pimpl->graph_epoch, (int) expert_ids->ne[1]);
 
     // This callback depends on the preceding layer output, so the previous
@@ -2743,7 +4320,16 @@ void llama_moe_slot_runtime::process(
     if (pimpl->protected_layer >= 0) {
         auto & previous = pimpl->layers[(size_t) pimpl->protected_layer];
         std::lock_guard<std::mutex> release(previous.mutex);
-        std::fill(previous.protected_experts.begin(), previous.protected_experts.end(), 0);
+        if (previous.manager) {
+            if (pimpl->handoff_trace.enabled()) {
+                auto c = trace_context; c.layer = pimpl->protected_layer; c.domain = "window";
+                for (size_t i = 0; i < previous.manager->selected_size(); ++i) {
+                    const int32_t e = previous.manager->selected_ids()[i]; const auto resident = previous.manager->lookup(e);
+                    pimpl->handoff_trace.emit("LEASE_RELEASE", handoff_request(c, resident.request), e, resident.request.slot);
+                }
+            }
+            previous.manager->release_selected();
+        } else std::fill(previous.protected_experts.begin(), previous.protected_experts.end(), 0);
         pimpl->protected_layer = -1;
     }
     auto & state = pimpl->layers[layer];
@@ -2758,22 +4344,10 @@ void llama_moe_slot_runtime::process(
     // 上限由 window_max_rows 按缓存区容量夹紧（见 resolve_decode_window），
     // 「并集装不下」的风险在那里就被消掉，不会落到这里的运行期。
     const bool window_mode = pimpl->decode_window > 0 && n_rows <= pimpl->window_max_rows;
+    const bool managed = window_mode && state.manager != nullptr;
     const bool phase_reuse = pimpl->model.moe_phase_reuse();
     const bool lookahead_step = pimpl->lookahead.enabled && n_rows <= lookahead_prefetch_max_rows() &&
                                 (!phase_reuse || window_mode);
-
-    // auto 模式下按阶段切 experts 的缓存策略：prefill 绕过、decode 不绕过。
-    //
-    // 判据用批宽而不是 window_mode —— 后者还要求 decode 窗口开着，而窗口关掉时
-    // decode 阶段照样存在，用它会连 decode 一起绕过缓存。本判据与 llama-context 的
-    // moe_decode_phase 同源。默认（非 auto）下这段不生效。
-    if (llama_moe_slot_runtime::impl::nocache_mode() < 0) {
-        const bool want = n_rows > pimpl->window_max_rows;
-        if (pimpl->want_nocache.load(std::memory_order_relaxed) != want) {
-            pimpl->want_nocache.store(want, std::memory_order_relaxed);
-            pimpl->apply_experts_nocache(want);
-        }
-    }
 
     // **只在窗口模式下**需要在加锁之前等预读收工。
     //
@@ -2783,6 +4357,18 @@ void llama_moe_slot_runtime::process(
     if (lookahead_step && window_mode) {
         std::vector<lookahead_expert_prefetch::hit> ignored;   // 窗口模式不返回 hit
         pimpl->lookahead.take(layer, ignored);
+    }
+
+    if (pimpl->managers_active() && window_mode != pimpl->was_window) {
+        pimpl->lookahead.reset(); pimpl->lookahead.drain();
+        if (phase_reuse) {
+            for (size_t il = 0; il < pimpl->layers.size(); ++il) {
+                auto & old = pimpl->layers[il]; if (!old.manager) continue;
+                std::lock_guard<std::mutex> reset(old.mutex); old.manager->reset_binding();
+                auto c = trace_context; c.layer = (int32_t) il; c.binding = old.manager->binding_generation(); c.domain = "window";
+                pimpl->handoff_trace.emit("BINDING_RESET", c);
+            }
+        }
     }
 
     if (!window_mode && ((pimpl->prefill_warm_enabled && pimpl->prefill_warm_rows() > 0) || phase_reuse) && pimpl->lookahead.enabled) {
@@ -2798,7 +4384,9 @@ void llama_moe_slot_runtime::process(
         pimpl->prewarm_placed.clear();
     }
 
-    std::lock_guard<std::mutex> lock(state.mutex);
+    pimpl->handoff_trace.emit("PROCESS_LOCK_WAIT", trace_context);
+    std::unique_lock<std::mutex> lock(state.mutex);
+    moe_handoff_lock_scope process_lock(pimpl->handoff_trace, lock, trace_context);
 
     // 阶段切换：prefill 用的是整块 bank / prefill 共享视图，与每层窗口在物理上可能
     // 落在同一块内存，所以**进入窗口阶段时**必须把每层的映射整表清空。
@@ -2864,17 +4452,102 @@ void llama_moe_slot_runtime::process(
         pimpl->miss_pos_steps++;
         for (size_t i = 0; i < count && i < 16; ++i) {
             if (experts[i] >= 0 && experts[i] < pimpl->n_expert &&
-                state.expert_to_slot[experts[i]] < 0) {
+                pimpl->cached_slot(state, experts[i], window_mode) < 0) {
                 pimpl->miss_pos[i]++;
             }
         }
     }
 
+    int32_t resident_at_lookup = 0;
     for (size_t i = 0; i < count; ++i) {
         if (experts[i] < 0 || experts[i] >= pimpl->n_expert) {
             throw std::runtime_error("MoE expert id is out of range");
         }
+        if (pimpl->handoff_trace.enabled()) pimpl->handoff_trace.emit("DEMAND_ROUTE", trace_context, experts[i], -1, (int32_t) i);
+        if (!requested[(size_t) experts[i]]) {
+            if (managed) {
+                state.requests[(size_t) experts[i]] = {};
+                resident_at_lookup += state.manager->resident_slot(experts[i]) >= 0 ? 1 : 0;
+            }
+            if (pimpl->handoff_trace.enabled()) {
+                const auto o = managed ? state.manager->lookup(experts[i]) : llama_moe::slot_manager::observation{};
+                const int32_t slot = pimpl->cached_slot(state, experts[i], window_mode);
+                const auto name = slot >= 0 ? "LOOKUP_READY" : managed && o.state == llama_moe::slot_manager::phase::queued ? "LOOKUP_QUEUED" :
+                    managed && o.state == llama_moe::slot_manager::phase::loading ? "LOOKUP_LOADING" : "LOOKUP_MISS";
+                pimpl->handoff_trace.emit(name, handoff_request(trace_context, o.request), experts[i], slot >= 0 ? slot : o.request.slot);
+            }
+        }
         requested[experts[i]] = 1;
+    }
+
+    // ── live-union 准入（默认开启；`LLAMA_MOE_LIVE_UNION=0` 可回退旧行为）──
+    //
+    // 放在这里的原因：位置在「并集已知」之后、`pin_selected`/任何槽位变更之前 ——
+    // 所以判定失败时**还没有发布任何槽**，不存在半发布。
+    //
+    // 单 token decode 也要判：init 放宽后 persistent pins 可以占用原本给预读预留的容量
+    // （见 init_slot_managers 的 demand_capacity 闸门），"top_k <= 物理宽度" 不再单独
+    // 构成保证 —— 在途预读写者 + pins 可能把可用格压到 top_k 以下。判一次只是扫
+    // <= top_k 个 bit，相对一层 FFN 的开销可以忽略；判完需要时照常让位/淘汰。
+    if (pimpl->live_union_active && window_mode) {
+        const int32_t union_size = (int32_t) std::count(requested.begin(), requested.end(), (uint8_t) 1);
+        const auto decision = pimpl->live_union_admit(state, layer, n_rows, union_size, requested, process_lock);
+        if (decision.v == llama_moe::admission_decision::verdict::bank) {
+            // **按静态不变量不可达**：resolve_live_union_rows() 保证
+            //   min(window_max_rows × top_k, n_expert) + pins <= 每层物理容量，
+            // 而 |U| <= min(rows × top_k, n_expert)、在途预读也已经在上面让位了。
+            // 真到了这里说明不变量被破坏（例如运行期改了窗口宽度/预读深度）。
+            // 此时**不能**退到 bank：图已经按每层 `.dec` 张量建好，改槽段会静默
+            // 读错专家权重。宁可在这里干净地停下 —— 位置在发布之前，没有半发布。
+            throw std::runtime_error(format(
+                "live-union: layer %d rows %d union %d cannot fit the window (%d slots); "
+                "the graph was built with per-layer decode tensors, so falling back to the bank "
+                "would read the wrong expert weights. Reduce LLAMA_MOE_WINDOW_MAX_ROWS or pins.",
+                layer, (int) n_rows, (int) union_size, (int) pimpl->demand_capacity(state)));
+        }
+    }
+
+    if (managed) {
+        state.manager->pin_selected(experts.data(), experts.size());
+        pimpl->protected_layer = layer;
+    }
+    struct selected_cleanup {
+        llama_moe_slot_runtime::impl & owner;
+        llama_moe_slot_runtime::impl::layer_state & state;
+        moe_handoff_lock_scope & lock;
+        const std::vector<int32_t> & experts;
+        moe_handoff_context context;
+        bool active, success = false;
+        ~selected_cleanup() {
+            if (!active || success) return;
+            lock.acquire();
+            for (int32_t e : experts) {
+                const auto & r = state.requests[(size_t) e];
+                if (r.owner) owner.finish_managed(state, r.request, context, false, {});
+            }
+            state.manager->release_selected(); owner.protected_layer = -1;
+        }
+    } selected_guard{*pimpl, state, process_lock, experts, trace_context, managed};
+
+    // ── recall(k)：这份预测是提前 k 层提交的，命中了多少 ────────────────
+    // 只有实测才知道 horizon 能推到几层：k 越大，用 h_il 近似 h_{il+k} 越失真。
+    if (pimpl->lookahead.enabled && layer < (int) pimpl->pred_hist.size()) {
+        std::lock_guard<std::mutex> lk(pimpl->pred_mtx);
+        for (const auto & entry : pimpl->pred_hist[(size_t) layer]) {
+            const int32_t k = layer - entry.first;
+            if (k < 1 || k > 8) {
+                continue;
+            }
+            uint64_t hit = 0;
+            for (int32_t e : entry.second) {
+                if (e >= 0 && e < pimpl->n_expert && requested[(size_t) e]) {
+                    hit++;
+                }
+            }
+            pimpl->recall_hit[k]  += hit;
+            pimpl->recall_pred[k] += entry.second.size();
+        }
+        pimpl->pred_hist[(size_t) layer].clear();
     }
 
     if (pimpl->lookahead.enabled && !lookahead_step) {
@@ -2928,12 +4601,18 @@ void llama_moe_slot_runtime::process(
         std::vector<int32_t> pred;
         {
             std::lock_guard<std::mutex> lk(pimpl->pred_mtx);
-            auto & slot = pimpl->predicted[(size_t) layer];
-            if (!slot.empty()) {
-                pred.swap(slot);
+            auto & armed = pimpl->predicted[(size_t) layer];
+            auto & hint  = pimpl->pred_hint[(size_t) layer];
+            if (!armed.empty()) {
+                pred.swap(armed);          // 用完即清（与老实现一致）
+            }
+            if (!hint.empty()) {
+                for (int32_t e : hint) { pred.push_back(e); }
+                hint.clear();              // 用完即清
             }
         }
-        if (!pred.empty()) {
+        if (managed) state.manager->set_hints(pred);
+        if (!managed && !pred.empty()) {
             keep.assign((size_t) pimpl->n_expert, 0);
             for (int32_t e : pred) {
                 if (e >= 0 && e < pimpl->n_expert) {
@@ -2944,7 +4623,7 @@ void llama_moe_slot_runtime::process(
     }
 
     std::vector<llama_moe_slot_runtime::impl::pending_install> pending;
-    pending.reserve((size_t) std::min((int32_t) pimpl->n_slots, pimpl->n_expert));
+    pending.reserve((size_t) std::min(managed ? alloc_hi - alloc_lo : (int32_t) pimpl->n_slots, pimpl->n_expert));
 
     // A2：按**名次**决定「现在读」还是「延后读」。末尾 matmul_split 个**名次**的
     // 缺失专家延后到 phase B —— 实测 miss 高度集中在尾部（名次 7 的 miss 是名次 0
@@ -2967,6 +4646,26 @@ void llama_moe_slot_runtime::process(
 
     for (size_t pos = 0; pos < count; ++pos) {
         const int32_t expert = experts[pos];
+        if (managed) {
+            auto & r = state.requests[(size_t) expert];
+            if (!r.request) {
+                r = state.manager->acquire(expert, {pimpl->graph_epoch, 0});
+                if (!r.request) {
+                    pimpl->handoff_trace.emit("SLOT_CAPACITY_FAIL", trace_context, expert);
+                    throw std::runtime_error("selected MoE experts exceed unpinned managed window capacity");
+                }
+                pimpl->trace_managed_claim(state, r, trace_context);
+                const auto c = handoff_request(trace_context, r.request);
+                if (r.owner) {
+                    auto submitted = c; submitted.io_id = pimpl->handoff_trace.new_io_id();
+                    pending.push_back({expert, r.request.slot, r.request, submitted.io_id});
+                    pimpl->handoff_trace.emit("DEMAND_READ_SUBMIT", submitted, expert, r.request.slot);
+                } else if (r.action == llama_moe::slot_manager::outcome::joined) {
+                    ++pimpl->manager_joined; pimpl->handoff_trace.emit("JOIN_LOADING", c, expert, r.request.slot);
+                } else { ++pimpl->manager_reused; pimpl->handoff_trace.emit("RESIDENT_REUSE", c, expert, r.request.slot); }
+            }
+            slots[pos] = r.request.slot; continue;
+        }
         if (state.expert_to_slot[expert] >= 0) {
             slots[pos] = state.expert_to_slot[expert];   // 已驻留，无需读取
             continue;
@@ -3024,8 +4723,10 @@ void llama_moe_slot_runtime::process(
                 layer, alloc_hi - alloc_lo));
         }
 
+        auto submitted = trace_context; submitted.io_id = pimpl->handoff_trace.new_io_id();
         const int32_t evicted = state.slot_to_expert[slot];
         if (evicted >= 0) {
+            pimpl->handoff_trace.emit("LEGACY_SLOT_EVICT", submitted, evicted, slot);
             state.expert_to_slot[evicted] = kSlotFree;
         }
         state.slot_age[slot] = ++state.age;
@@ -3035,14 +4736,34 @@ void llama_moe_slot_runtime::process(
         if (defer_this) {
             // 延后：槽位标 kSlotPending 占住（别处不会动它），phase B 读完再发布。
             state.slot_to_expert[slot] = kSlotPending;
-            defer_list.push_back({ expert, slot });
+            defer_list.push_back({ expert, slot, {} });
         } else {
             state.slot_to_expert[slot] = expert;
             state.expert_to_slot[expert] = slot;
-            pending.push_back({ expert, slot });
+            pending.push_back({ expert, slot, {}, submitted.io_id });
+            pimpl->handoff_trace.emit("DEMAND_READ_SUBMIT", submitted, expert, slot);
+            pimpl->handoff_trace.emit("LEGACY_MAPPING_VISIBLE", submitted, expert, slot);
         }
     }
 
+    if (managed && pimpl->handoff_trace.enabled()) {
+        for (size_t i = 0; i < state.manager->selected_size(); ++i) {
+            const int32_t expert = state.manager->selected_ids()[i];
+            const auto request = state.requests[(size_t) expert].request;
+            pimpl->handoff_trace.emit("LEASE_ACQUIRE", handoff_request(trace_context, request), expert, request.slot);
+        }
+    }
+    size_t io_needed_count = 0;
+    llama_moe_slot_runtime::impl::io_trace_payload needed_trace{trace_context, -1, 0};
+    if (managed && pimpl->io_budget) {
+        needed_trace.context.binding = state.manager->binding_generation();
+        for (size_t i = 0; i < state.manager->selected_size(); ++i) {
+            const int32_t expert = state.manager->selected_ids()[i]; const auto & r = state.requests[(size_t) expert];
+            if (r.action != llama_moe::slot_manager::outcome::joined) continue;
+            pimpl->io_needed_snapshot[io_needed_count++] = {layer, expert, r.request.binding, r.request.generation};
+        }
+        needed_trace.needed_count = (int32_t) io_needed_count;
+    }
     int n_unique = 0;
     for (int32_t expert = 0; expert < pimpl->n_expert; ++expert) {
         if (requested[expert]) {
@@ -3063,8 +4784,36 @@ void llama_moe_slot_runtime::process(
         });
     }
 
-    const llama_moe_slot_runtime::impl::install_timing timing =
-        pimpl->install_pending(state, pending, window_mode);
+    llama_moe_slot_runtime::impl::install_timing timing;
+    {
+        moe_handoff_span loading(pimpl->handoff_trace, "LOAD_WAIT_BEGIN", "LOAD_WAIT_END", trace_context);
+        const int64_t begin = now_ns();
+        if (managed) {
+            process_lock.release();
+            try {
+                {
+                    auto needed = pimpl->io_budget ? pimpl->io_budget->begin_needed(pimpl->io_needed_snapshot.data(), io_needed_count, &needed_trace) :
+                        llama_moe::io_admission::needed_scope{};
+                    timing = pimpl->install_pending(state, pending, true);
+                    // All own misses are in flight/completed before joining only the
+                    // selected Loading generations; queued PF was stolen above.
+                    for (size_t i = 0; i < state.manager->selected_size(); ++i) {
+                        const int32_t expert = state.manager->selected_ids()[i];
+                        auto & r = state.requests[(size_t) expert];
+                        if (r.action == llama_moe::slot_manager::outcome::joined) r.request = pimpl->wait_managed(state, r.request, trace_context, timing);
+                    }
+                } // Needed scope is cleared before taking L, including exceptions.
+                process_lock.acquire();
+                for (size_t pos = 0; pos < count; ++pos) {
+                    const int32_t expert = experts[pos]; const auto o = state.manager->lookup(expert);
+                    if (o.state != llama_moe::slot_manager::phase::resident) throw std::runtime_error("selected MoE request did not become Resident");
+                    slots[pos] = o.request.slot;
+                }
+            } catch (...) { process_lock.acquire(); throw; }
+            timing.wall_ns = now_ns() - begin;
+        } else timing = pimpl->install_pending(state, pending, window_mode);
+        loading.complete();
+    }
     pimpl->install_ns.fetch_add(timing.wall_ns, std::memory_order_relaxed);
 
     if (!pending.empty()) {
@@ -3075,60 +4824,156 @@ void llama_moe_slot_runtime::process(
     }
 
     if (lookahead_step && lookahead_pred) {
-        std::vector<int32_t> pred;
-        pimpl->read_i32_ids(lookahead_pred, pred);
-        if (lookahead_pred->ne[1] > 1) {
-            // Alternate token rows at each rank, then remove duplicates. The
-            // finite I/O depth serves several candidate tokens before rank 2.
-            std::vector<int32_t> ranked;
-            std::vector<uint8_t> seen((size_t) pimpl->n_expert, 0);
-            ranked.reserve(pred.size());
-            const size_t ranks = (size_t) lookahead_pred->ne[0];
-            const size_t rows = (size_t) lookahead_pred->ne[1];
-            for (size_t rank = 0; rank < ranks; ++rank) {
-                for (size_t row = 0; row < rows; ++row) {
-                    const int32_t expert = pred[row * ranks + rank];
-                    if (expert >= 0 && expert < pimpl->n_expert && !seen[(size_t) expert]) {
-                        seen[(size_t) expert] = 1;
-                        ranked.push_back(expert);
+        // pred 的形状是 [horizon*depth, rows]：ne0 上连着 horizon 个目标层，
+        // 第 kb 块（0 基）= 目标层 `layer + kb + 1`。horizon==1 时与旧行为完全一致。
+        const int32_t ranks_total = (int32_t) lookahead_pred->ne[0];
+        const int32_t rows        = (int32_t) lookahead_pred->ne[1];
+        const int32_t depth       = std::max(1, pimpl->lookahead.depth);
+        const int32_t horizon_env = moe_lookahead_horizon();
+        // 建图侧按 depth 插了 H 块、运行侧按 horizon 切块；两边不一致会**沿 ne0 切错**，
+        // 把第 A 层的分数当成第 B 层的。所以这里以**张量实际宽度**为准夹紧：
+        // ranks_total 必须是 depth 的整数倍，horizon 不能超过实际块数。
+        int32_t horizon = std::max(1, std::min(horizon_env, ranks_total / depth));
+        if (ranks_total % depth != 0) {
+            // 预测张量宽度不是 depth 的整数倍 —— 只能按 1 块处理（防御）。
+            horizon = 1;
+        }
+        if (horizon != horizon_env) {
+            // 出现这种夹紧有**两种正常来源**，不能笼统解释成"尾部层现象"：
+            //   1. qwen35moe 的建图循环 `k <= horizon && il + k < n_layer` —— 靠后的层
+            //      能建出的块数依次是 H-1、H-2……（H=8 时尾部 7…1 块）；
+            //   2. qwen3moe 等只建 1 块预测的路径 —— **每一层**都会退到 1 块。
+            // 日志带 layer，且只打前 16 条；**限流后可见条数不等于实际次数**，
+            // 所以另有 per-runtime 的累计计数 g_n_horizon_clamped，收尾打一行 summary。
+            static std::atomic<int> clamp_logs{0};
+            pimpl->g_n_horizon_clamped.fetch_add(1, std::memory_order_relaxed);
+            const int n_logged = clamp_logs.fetch_add(1, std::memory_order_relaxed);
+            if (n_logged < 16) {   // 量化前 16 条，避免每层每步刷屏
+                moe_log("lookahead-horizon: layer=%d 只建出 %d 块（请求 %d，depth=%d），夹到 %d%s",
+                        (int) layer, (int) (ranks_total / depth), (int) horizon_env, (int) depth,
+                        (int) horizon, n_logged == 15 ? "（后续同类日志已节流）" : "");
+            }
+        }
+
+        std::vector<int32_t> all_ids;
+        {
+            auto c = trace_context; c.source = "prediction";
+            moe_handoff_span get(pimpl->handoff_trace, "PRED_GET_BEGIN", "PRED_GET_DONE", c);
+            pimpl->read_i32_ids(lookahead_pred, all_ids); get.complete();
+        }
+
+        for (int32_t kb = 0; kb < horizon; ++kb) {
+            const int32_t target = layer + kb + 1;
+            if (target > pimpl->last_moe_layer) {
+                break;
+            }
+            const bool extra_h1_front = pimpl->h1_front && layer == pimpl->first_moe_layer && kb == 0 && horizon > 1;
+            if (extra_h1_front) ++pimpl->h1_front_eligible;
+            const int32_t width = ranks_total / horizon;   // 本块的 rank 数（= depth）
+            if (pimpl->handoff_trace.enabled()) {
+                auto c = trace_context; c.layer = target; c.source = "prediction";
+                for (int32_t row = 0; row < rows; ++row) for (int32_t rank = 0; rank < width; ++rank) {
+                    pimpl->handoff_trace.emit("PRED_CANDIDATE", c, all_ids[(size_t) row * ranks_total + kb * width + rank], row, rank);
+                }
+            }
+            std::vector<int32_t> pred;
+            pred.reserve((size_t) width * (size_t) rows);
+            // all_ids 是 [ranks_total, rows] 的列主序：index = row*ranks_total + j。
+            if (rows > 1) {
+                // 多行（投机验证）按 rank 交替，去掉重复，让有限的读深度先服务多个候选 token。
+                std::vector<uint8_t> seen((size_t) pimpl->n_expert, 0);
+                for (int32_t rank = 0; rank < width; ++rank) {
+                    for (int32_t row = 0; row < rows; ++row) {
+                        const int32_t expert = all_ids[(size_t) row * ranks_total + kb * width + rank];
+                        if (expert >= 0 && expert < pimpl->n_expert && !seen[(size_t) expert]) {
+                            seen[(size_t) expert] = 1;
+                            pred.push_back(expert);
+                        }
+                    }
+                }
+            } else {
+                for (int32_t rank = 0; rank < width; ++rank) {
+                    const int32_t expert = all_ids[(size_t) kb * width + rank];
+                    if (expert >= 0 && expert < pimpl->n_expert) {
+                        pred.push_back(expert);
                     }
                 }
             }
-            pred.swap(ranked);
-        }
-        // 「缓存 + 预测」的结合点（零 I/O）：把预测留给**目标层**，
-        // 它下一步淘汰时可以避开这些条目。不是预读 —— 不读任何字节。
-        {
-            std::lock_guard<std::mutex> lk(pimpl->pred_mtx);
-            pimpl->predicted[(size_t) layer + 1] = pred;
-        }
-        // arm 前先去掉**目标层缓存里已有**的预测专家。
-        //
-        // 它们本来就不需要读（worker 也会查表跳过），但会让 arm 的批次看起来更大、
-        // worker 跑得更久 —— 而 arm 在 worker 忙时是**直接丢弃**的（pfskip）。
-        // 实测每 token 约 9 次 arm 因此被丢（40 次里的 22%），等于白扔预测。
-        // 先过滤就只把「真需要读的」交给 worker，批次更小、完成更快、丢得更少。
-        std::vector<int32_t> need_read;
-        need_read.reserve(pred.size());
-        {
-            auto & tgt = pimpl->layers[(size_t) layer + 1];
-            std::lock_guard<std::mutex> lk(tgt.mutex);
-            for (int32_t e : pred) {
-                if (e >= 0 && e < pimpl->n_expert && tgt.expert_to_slot[(size_t) e] < 0) {
-                    need_read.push_back(e);
+            if (pred.empty()) {
+                continue;
+            }
+
+            // 「缓存 + 预测」的结合点（零 I/O）：把预测留给**目标层**，
+            // 它下一步淘汰时可以避开这些条目。不是预读 —— 不读任何字节。
+            //
+            // **两份预测，语义不同，必须分开存**（评审指出过这里曾经混在一起）：
+            //   - `predicted[L]`  = **真正被 arm 的那一份**（来自 L-horizon，recall ≈71.6%）
+            //     → 这是"已经读进缓存、绝不能又被淘汰出去"的集合，保护集必须与它一致；
+            //   - `pred_hint[L]`  = 紧邻上一层给的预测（来自 L-1，recall ≈83%）
+            //     → 精度更高，但不是我们读的那一份，只作为额外的淘汰提示。
+            // 只用一个槽位时，后写覆盖先写（L-1 那份），保护集就和 arm 集分家了
+            // —— 被读进来的专家反而没有保护，这正是白读的来源。
+            {
+                std::lock_guard<std::mutex> lk(pimpl->pred_mtx);
+                if (kb + 1 == horizon) {
+                    pimpl->predicted[(size_t) target] = pred;
+                }
+                if (kb == 0) {
+                    pimpl->pred_hint[(size_t) target] = pred;
+                }
+                pimpl->pred_hist[(size_t) target].emplace_back(layer, pred);
+            }
+            // arm 前先去掉**目标层缓存里已有**的预测专家。
+            // 它们本来就不需要读（worker 也会查表跳过），但会让批次看起来更大、
+            // worker 跑得更久 —— 而队列满时 arm 是直接丢的。
+            std::vector<int32_t> need_read;
+            need_read.reserve(pred.size());
+            {
+                auto & tgt = pimpl->layers[(size_t) target];
+                std::lock_guard<std::mutex> lk(tgt.mutex);
+                for (int32_t e : pred) {
+                    if (e >= 0 && e < pimpl->n_expert && pimpl->cached_slot(tgt, e, true) < 0) {
+                        need_read.push_back(e);
+                    }
                 }
             }
-        }
-        pimpl->lookahead.n_pred_cached.fetch_add(pred.size() - need_read.size(),
-                                                 std::memory_order_relaxed);
-        if (!need_read.empty()) {
-            pimpl->lookahead.arm(layer + 1, need_read, pimpl->graph_epoch, n_rows);
-        }
-        // 记下「给层 layer+1 的预测」，供 layer+1 的扫描记录用。
-        // 注意预测本身是用层 layer 的 hidden 算的（见 qwen35moe.cpp），所以
-        // 层 0 永远拿不到预测 —— 预读覆盖率的结构性上界是 39/40。
-        if (pimpl->sweep_fp && layer + 1 < (int) pimpl->sweep_pred.size()) {
-            pimpl->sweep_pred[layer + 1] = pred;
+            pimpl->lookahead.n_pred_cached.fetch_add(pred.size() - need_read.size(),
+                                                     std::memory_order_relaxed);
+            // **只给最远那一层 arm**。这一条是量出来的关键：
+            //   每个目标层会被 K 个来源各预测一次（层 T-1 猜它=1 层提前、T-2 猜它=2 层…），
+            //   如果每块都 arm，目标层实际读到的是 K 份预测的**并集**，密度远高于单份 →
+            //   总字节上涨（实测 h4q4 比 h1q1 多读 28%），而带宽是瓶颈，于是更慢。
+            //   只 arm 最远那份（k=horizon），每个目标层就只读一份预测，字节数与
+            //   horizon=1 相同，但**发起时刻提前了 horizon 层** —— 这正是流水要的。
+            // Optional first-layer coverage only: the original farthest job
+            // keeps its read budget and still follows H1 in the existing loop.
+            const bool refresh_far = pimpl->lookahead.refresh && horizon > 1 && kb + 1 == horizon && target < pimpl->last_moe_layer;
+            const bool refresh_near = pimpl->lookahead.refresh && horizon > 1 && kb == 0 && target < pimpl->last_moe_layer;
+            if (refresh_far || refresh_near) {
+                // An empty need_read still closes/refines the near stage. The
+                // manager is authoritative for coalesced/Loading/Resident IDs.
+                if (pimpl->lookahead.arm_refreshed(target, pred, pimpl->graph_epoch, n_rows, refresh_near)) {
+                    auto armed = pimpl->lookahead.refreshed_predictions(target, pimpl->graph_epoch);
+                    std::lock_guard<std::mutex> lk(pimpl->pred_mtx);
+                    pimpl->predicted[(size_t) target] = std::move(armed);
+                }
+            } else if ((kb + 1 == horizon || extra_h1_front) && !need_read.empty()) {
+                if (extra_h1_front) {
+                    ++pimpl->h1_front_attempted;
+                    pimpl->h1_front_candidate_ids += need_read.size();
+                    {
+                        std::lock_guard<std::mutex> lk(pimpl->pred_mtx);
+                        pimpl->predicted[(size_t) target] = pred;
+                    }
+                    auto c = trace_context; c.layer = target; c.source = "prefetch";
+                    pimpl->handoff_trace.emit("H1_FRONT_ARM", c, -1, -1, (int32_t) need_read.size());
+                }
+                pimpl->lookahead.arm(target, need_read, pimpl->graph_epoch, n_rows);
+            }
+            // 记下 horizon 内各目标层的预测，供该层做 recall(k) 统计与扫描记录。
+            if (pimpl->sweep_fp && target < (int) pimpl->sweep_pred.size()) {
+                pimpl->sweep_pred[target] = pred;
+            }
         }
     }
 
@@ -3158,7 +5003,7 @@ void llama_moe_slot_runtime::process(
     // Periodic ubatch diagnostics sample batches and cannot establish this rate.
     if (window_mode) {
         pimpl->window_unique += (uint64_t) n_unique;
-        pimpl->window_miss += (uint64_t) n_miss;
+        pimpl->window_miss += (uint64_t) (managed ? n_unique - resident_at_lookup : n_miss);
     } else {
         pimpl->bank_unique += (uint64_t) n_unique;
         pimpl->bank_miss += (uint64_t) n_miss;
@@ -3225,7 +5070,13 @@ void llama_moe_slot_runtime::process(
         if (slots[i] < 0) {
             throw std::runtime_error("MoE expert was not installed");
         }
-        state.slot_age[(size_t) slots[i]] = ++state.age;
+        if (managed) {
+            const bool promoted = state.manager->touch(experts[i]);
+            if (promoted && pimpl->handoff_trace.enabled()) {
+                const auto request = state.manager->lookup(experts[i]).request;
+                pimpl->handoff_trace.emit("PF_PROBATION_PROMOTE", handoff_request(trace_context, request), experts[i], request.slot);
+            }
+        } else state.slot_age[(size_t) slots[i]] = ++state.age;
         // 诊断：这个专家来自预读区吗？预读区每步重填，所以它**用完就没了** ——
         // 下次再需要就得重读。理想情况应该把它升格到缓存区。
         if (window_mode && pimpl->prefetch_slots > 0 &&
@@ -3236,7 +5087,7 @@ void llama_moe_slot_runtime::process(
     }
     {
         const int64_t t0 = now_ns();
-        if (window_mode) {
+        if (window_mode && !managed) {
             state.protected_experts = requested;
             pimpl->protected_layer = layer;
         }
@@ -3246,6 +5097,8 @@ void llama_moe_slot_runtime::process(
     if (!window_mode && pimpl->prefill_warm_enabled && pimpl->prefill_warm_rows() > 0) {
         pimpl->warm_from_prefill(state, layer, experts, slots, n_rows);
     }
+    selected_guard.success = true;
+    process_lock.complete(); callback.complete();
 }
 
 /// A2 的 phase B：把 phase A 里被延后的缺失专家读进来，并发布到窗口。

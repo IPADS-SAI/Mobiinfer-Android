@@ -3398,13 +3398,23 @@ private:
                 batch.logits   + i,
             };
 
-            // Prompt completion is owned here, not inferred from token count or
-            // logits by the expert cache. Mixed-sequence batches skip prewarming.
+            // Warm at prompt completion or just before its checkpoint tail, while
+            // experts can still be in the shared bank. Mixed sequences skip it.
             bool final_prefill = false;
             if (prefill_warm_tail() > 0 && batch_view.n_tokens > 0) {
                 for (const auto & slot : slots) {
-                    if (slot.state != SLOT_STATE_DONE_PROMPT || slot.i_batch < i ||
-                        slot.i_batch >= i + n_tokens) continue;
+                    const bool done_prompt = slot.state == SLOT_STATE_DONE_PROMPT &&
+                        slot.i_batch >= i && slot.i_batch < i + n_tokens;
+                    const bool before_checkpoint_tail = !batch_is_embd &&
+                        slot.state == SLOT_STATE_PROCESSING_PROMPT &&
+                        slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
+                        !slot.prompt.tokens.has_mtmd && params_base.n_ctx_checkpoints > 0 &&
+                        (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                         ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS || n_swa > 0) &&
+                        slot.task->n_tokens() - slot.prompt.n_tokens() ==
+                            std::min(n_batch, std::max(4, prefill_warm_tail())) &&
+                        batch_view.pos[n_tokens - 1] + 1 == slot.prompt.tokens.pos_next();
+                    if (!done_prompt && !before_checkpoint_tail) continue;
                     final_prefill = true;
                     for (int32_t row = 0; row < batch_view.n_tokens; ++row) {
                         if (batch_view.n_seq_id[row] != 1 || batch_view.seq_id[row][0] != slot.id) {

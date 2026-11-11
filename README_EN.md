@@ -22,6 +22,11 @@
 
 ## News
 
+- [2026.11.11] 🚀 **MobiInfer-Android v0.4.5: MiniCPM-V 4.7 MoE decode peaks at 23.3 tok/s**
+  - ⚡ **Cross-layer expert pipeline**: O_DIRECT expert reads, gate predictions submitted two layers ahead (H+2), one FIFO task per expert with resident reader threads — the I/O is hidden under compute. Same device, same prompt: 23.3 tok/s.
+  - 🧵 **Runs alongside other apps**: MoE inference no longer needs exclusive access; generation keeps going while other apps are in the foreground, at 21.3–21.8 tok/s.
+  - 🧩 **Hexagon v85**: skels for v73 / v75 / v79 / v81 / v85 ship in the APK; backend synced to upstream 2026-11-10 (repack, op fusion, long-context FA).
+  - 🐛 Fixed a low-vmem misdetection that forced vision onto the CPU and silently disabled DSpark; fixed exit code 139.
 - [2026.11.02] 🎨 **On-device text-to-image with MOSS-Image**: 9B TE + fp16 5B DiT running on the Hexagon NPU.
 - [2026.10.22] 🔥 Day-0 support for InternScience's latest Sage-A1.5 35B-A3B, with 41 expert layers streamed from an HTP-tiled bundle.
 - [2026.10.19] 🛠️ Added support for Qwen3-30B-A3B / Qwen3.5-MoE-35B-A3B, with MoE experts using external slots and LES.
@@ -90,12 +95,17 @@ Architecture coverage includes `qwen3`/`qwen3moe`/`qwen3next`, `qwen3vl`/`qwen3v
 ## Performance
 
 > 📱 Measured on OnePlus 13 (Snapdragon 8 Elite, HTP0 + HTP1), text-only, 128-token output.
+> 📱 iQOO 15 Ultra (Snapdragon 8 Elite Gen5, Hexagon v81), text-only, 260-token prompt, DSpark draft3.
 
 | Model | Configuration | SoC | Prompt length | Prefill (token/s) | Decode (token/s) |
 |---|---|---|---|---:|---:|
+| MiniCPM-V 4.7 35B-A3B | Q3 tiled, H+2 pipeline + O_DIRECT + DSpark3 | 8 Elite Gen5 | 260 | 38.5 | **23.3** |
+| MiniCPM-V 4.7 35B-A3B | as above, with other apps running | 8 Elite Gen5 | 260 | — | 21.3–21.8 |
 | MiniCPM-V 4.7 35B-A3B | Q3, LES + DSpark | 8 Elite | 41 | 22.02 | 17.98 |
 | MiniCPM-V 4.7 35B-A3B | Q3, LES + DSpark | 8 Elite | 512 | 94.28 | 13.65 |
 | Qwen3-VL-4B-Instruct | Q4_K_M | 8 Elite | 512 | 1013.74 | 18.13 |
+
+> Concurrency figures were re-measured with WeChat, the launcher and system services running (no force-stop); DSpark acceptance 83%.
 
 ---
 

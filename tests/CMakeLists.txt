@@ -308,3 +308,22 @@ if (TARGET gguf-model-data)
     target_link_libraries(export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# Dense request/slot lifecycle; no model or backend is required.
+find_package(Threads REQUIRED)
+add_executable(test-moe-ready test-moe-ready.cpp)
+target_link_libraries(test-moe-ready PRIVATE Threads::Threads)
+llama_test(test-moe-ready)
+set_tests_properties(test-moe-ready PROPERTIES TIMEOUT 30)
+
+# Shared expert IO budget and exact-ticket priority inheritance; no model needed.
+add_executable(test-moe-io-admission test-moe-io-admission.cpp)
+target_link_libraries(test-moe-io-admission PRIVATE Threads::Threads)
+llama_test(test-moe-io-admission)
+set_tests_properties(test-moe-io-admission PROPERTIES TIMEOUT 30)
+
+# `LLAMA_MOE_LIVE_UNION` 的准入决策（纯函数）：不需要模型、后端或线程。
+add_executable(test-moe-live-union test-moe-live-union.cpp)
+target_include_directories(test-moe-live-union PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-moe-live-union)
+set_tests_properties(test-moe-live-union PROPERTIES TIMEOUT 30)

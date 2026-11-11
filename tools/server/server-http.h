@@ -3,6 +3,7 @@
 #include <atomic>
 #include <functional>
 #include <map>
+#include <unordered_map>
 #include <string>
 #include <thread>
 #include <vector>
