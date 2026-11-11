@@ -142,6 +142,12 @@ class MainActivity : AppCompatActivity() {
     private var updatePrompt: AlertDialog? = null
     private var pendingInstall: File? = null
 
+    // Returning from "install unknown apps" must resume the install even if the
+    // activity was recreated while the user was in Settings.
+    private val installPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { retryPendingInstall() }
+
     private data class PreparedImage(
         val prompt: String,
         val bytes: ByteArray,
@@ -3659,21 +3665,57 @@ class MainActivity : AppCompatActivity() {
                 return@launch
             }
             if (!ApkUpdater.canInstall(this@MainActivity)) {
-                // The user comes back through onResume(), which retries.
-                pendingInstall = apk
-                Toast.makeText(this@MainActivity, R.string.update_allow_install, Toast.LENGTH_LONG)
-                    .show()
-                if (!ApkUpdater.requestInstallPermission(this@MainActivity)) {
-                    pendingInstall = null
-                    Toast.makeText(this@MainActivity, R.string.update_install_failed, Toast.LENGTH_LONG)
-                        .show()
-                }
+                queueInstall(apk)
                 return@launch
             }
             if (!ApkUpdater.install(this@MainActivity, apk)) {
                 Toast.makeText(this@MainActivity, R.string.update_install_failed, Toast.LENGTH_LONG).show()
             }
         }
+    }
+
+    private fun updaterPrefs() = getSharedPreferences("updater", Context.MODE_PRIVATE)
+
+    /** No permission yet: remember the APK and send the user to the settings page. */
+    private fun queueInstall(apk: File) {
+        pendingInstall = apk
+        updaterPrefs().edit().putString(KEY_PENDING_APK, apk.absolutePath).apply()
+        Toast.makeText(this, R.string.update_allow_install, Toast.LENGTH_LONG).show()
+        val intent = ApkUpdater.installPermissionIntent(this)
+        if (intent == null) {
+            clearPendingInstall()
+            Toast.makeText(this, R.string.update_install_failed, Toast.LENGTH_LONG).show()
+            return
+        }
+        runCatching { installPermissionLauncher.launch(intent) }.onFailure {
+            clearPendingInstall()
+            Toast.makeText(this, R.string.update_install_failed, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    /**
+     * Called from the settings-result callback and from onResume. Re-verifies the
+     * cached APK: the process may have died and the cache may have been cleared.
+     */
+    private fun retryPendingInstall() {
+        val apk = pendingInstall
+            ?: updaterPrefs().getString(KEY_PENDING_APK, null)?.let(::File)
+            ?: return
+        if (!ApkUpdater.canInstall(this)) return
+        if (!apk.exists() || !ApkUpdater.isInstallable(this, apk)) {
+            clearPendingInstall()
+            Toast.makeText(this, R.string.update_download_failed, Toast.LENGTH_LONG).show()
+            return
+        }
+        clearPendingInstall()
+        if (!ApkUpdater.install(this, apk)) {
+            Toast.makeText(this, R.string.update_install_failed, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun clearPendingInstall() {
+        pendingInstall = null
+        updaterPrefs().edit().remove(KEY_PENDING_APK).apply()
     }
 
     private fun onMeteredNetwork(): Boolean = runCatching {
@@ -3696,14 +3738,7 @@ class MainActivity : AppCompatActivity() {
             finish()
             return
         }
-        pendingInstall?.let { apk ->
-            if (ApkUpdater.canInstall(this)) {
-                pendingInstall = null
-                if (!ApkUpdater.install(this, apk)) {
-                    Toast.makeText(this, R.string.update_install_failed, Toast.LENGTH_LONG).show()
-                }
-            }
-        }
+        retryPendingInstall()
         if (!::engine.isInitialized) return
         // The image model / generation parameters may have changed in the
         // configuration page while we were in the background.
@@ -3799,6 +3834,7 @@ class MainActivity : AppCompatActivity() {
         private val TAG = MainActivity::class.java.simpleName
         private const val STREAM_PERSIST_INTERVAL_MS = 1000L
         private const val STATE_CURRENT_CONVERSATION = "state_current_conversation"
+        private const val KEY_PENDING_APK = "pendingApk"
         private const val KEY_IMAGE_PROMPTS = "recent_image_prompts"
         private const val MAX_IMAGE_PROMPTS = 10
         // Share of the bar that belongs to each phase.

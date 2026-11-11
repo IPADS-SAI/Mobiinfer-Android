@@ -133,7 +133,7 @@ object ApkUpdater {
     }
 
     /** Package name, version and signer must all match what is installed. */
-    private fun isInstallable(context: Context, apk: File): Boolean {
+    fun isInstallable(context: Context, apk: File): Boolean {
         val pm = context.packageManager
         return try {
             val archive = pm.getPackageArchiveInfo(apk.absolutePath, signerFlags()) ?: return false
@@ -190,17 +190,16 @@ object ApkUpdater {
     fun canInstall(context: Context): Boolean =
         Build.VERSION.SDK_INT < 26 || context.packageManager.canRequestPackageInstalls()
 
-    fun requestInstallPermission(activity: Activity): Boolean {
-        if (Build.VERSION.SDK_INT < 26) return false
-        return runCatching {
-            activity.startActivity(
-                Intent(
-                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                    Uri.parse("package:${activity.packageName}")
-                )
+    /** Settings page for "install unknown apps"; null when the OS has no such flow. */
+    fun installPermissionIntent(context: Context): Intent? =
+        if (Build.VERSION.SDK_INT < 26) {
+            null
+        } else {
+            Intent(
+                Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                Uri.parse("package:${context.packageName}")
             )
-        }.onFailure { Log.w(TAG, "no unknown-sources settings activity", it) }.isSuccess
-    }
+        }
 
     /**
      * Hands the APK to the system installer. The app process is killed once the
