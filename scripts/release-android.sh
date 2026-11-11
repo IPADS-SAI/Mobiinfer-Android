@@ -23,6 +23,8 @@
 #   --min-supported <code> versionCode below which the update is mandatory
 #   --prerelease           Mark the GitCode release as a pre-release
 #   --no-build             Do not run gradle (requires --apk or a fresh build)
+#   --with-debug           Also build a debug APK and publish the "debug"
+#                          channel (GitCode + Chengdu)
 #   --replace              Re-upload assets when the release already exists
 #                          (refused by default: published versions are immutable)
 #   --no-verify            Skip the post-publish download/checksum checks
@@ -62,6 +64,7 @@ ALLOW_DIRTY=0
 PRERELEASE=0
 REPLACE=0
 VERIFY=1
+DO_DEBUG=0
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 log() { printf '\n== %s\n' "$*"; }
@@ -94,6 +97,7 @@ while [[ $# -gt 0 ]]; do
         --allow-dirty)   ALLOW_DIRTY=1; shift ;;
         --replace)       REPLACE=1; shift ;;
         --no-verify)     VERIFY=0; shift ;;
+        --with-debug)    DO_DEBUG=1; shift ;;
         -h|--help)       usage; exit 0 ;;
         *)               die "unknown option: $1 (try --help)" ;;
     esac
@@ -228,11 +232,47 @@ for a in assets:
     gc release upload "$TAG" "$DIST_APK" "$DIST/SHA256SUMS" -R "$GITCODE_REPO"
 fi
 
+# ---------------------------------------------------------------- debug channel
+
+DEBUG_SHA=""
+DEBUG_SIZE=""
+if (( DO_DEBUG )); then
+    log "building debug channel APK"
+    ( cd "$APP_DIR" && ./gradlew :app:assembleDebug )
+
+    src_debug="$APP_DIR/app/build/outputs/apk/debug/app-debug.apk"
+    [[ -f "$src_debug" ]] || die "no debug APK at $src_debug"
+
+    debug_badging=$("$AAPT2" dump badging "$src_debug")
+    debug_code=$(sed -nE "s/.*versionCode='([0-9]+)'.*/\1/p" <<<"$debug_badging" | head -1)
+    debug_name=$(sed -nE "s/.*versionName='([^']+)'.*/\1/p" <<<"$debug_badging" | head -1)
+    [[ "$debug_code" == "$VERSION_CODE" ]] \
+        || die "debug APK versionCode $debug_code != $VERSION_CODE"
+    [[ "$debug_name" == "$VERSION_NAME-debug" ]] \
+        || die "debug APK versionName $debug_name != $VERSION_NAME-debug"
+
+    DEBUG_APK="$DIST/MobiInfer-Android-v$VERSION_NAME-debug.apk"
+    cp -f "$src_debug" "$DEBUG_APK"
+    DEBUG_SHA=$(sha256_of "$DEBUG_APK")
+    DEBUG_SIZE=$(size_of "$DEBUG_APK")
+    log "debug APK $DEBUG_APK ($DEBUG_SIZE bytes, sha256 $DEBUG_SHA)"
+
+    if (( DO_PUSH )); then
+        gc release upload "$TAG" "$DEBUG_APK" -R "$GITCODE_REPO"
+    fi
+    if (( DO_CHENGDU )); then
+        scp -F "${HOME}/.ssh/config" -o BatchMode=yes \
+            "$DEBUG_APK" "$CHENGDU_HOST:$CHENGDU_WEBROOT/apk/"
+    fi
+fi
+
 # ---------------------------------------------------------------- update.json
 
 GITCODE_URL="https://gitcode.com/$GITCODE_REPO/releases/download/$TAG/MobiInfer-Android-v$VERSION_NAME.apk"
 CHENGDU_URL="$PUBLIC_BASE/apk/MobiInfer-Android-v$VERSION_NAME.apk"
 GITHUB_URL="https://github.com/$GITHUB_REPO/releases/download/$TAG/MobiInfer-Android-v$VERSION_NAME.apk"
+GITCODE_DEBUG_URL="https://gitcode.com/$GITCODE_REPO/releases/download/$TAG/MobiInfer-Android-v$VERSION_NAME-debug.apk"
+CHENGDU_DEBUG_URL="$PUBLIC_BASE/apk/MobiInfer-Android-v$VERSION_NAME-debug.apk"
 
 NOTES_ZH="MobiInfer-Android $TAG"
 if [[ -n "$NOTES_FILE" && -f "$NOTES_FILE" ]]; then
@@ -243,6 +283,8 @@ UPDATE_JSON="$DIST/update.json"
 VERSION_CODE="$VERSION_CODE" VERSION_NAME="$VERSION_NAME" MIN_SUPPORTED="$MIN_SUPPORTED" \
 SHA256="$sha" SIZE="$size" NOTES_ZH="$NOTES_ZH" \
 GITCODE_URL="$GITCODE_URL" CHENGDU_URL="$CHENGDU_URL" GITHUB_URL="$GITHUB_URL" \
+DEBUG_ENABLED="$DO_DEBUG" DEBUG_SHA256="$DEBUG_SHA" DEBUG_SIZE="$DEBUG_SIZE" \
+GITCODE_DEBUG_URL="$GITCODE_DEBUG_URL" CHENGDU_DEBUG_URL="$CHENGDU_DEBUG_URL" \
 python3 - > "$UPDATE_JSON" <<'PY'
 import json, os, sys
 from datetime import datetime, timezone
@@ -258,6 +300,14 @@ doc = {
     "publishedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "notes": {"zh": env["NOTES_ZH"], "en": env["NOTES_ZH"]},
 }
+if env.get("DEBUG_ENABLED") == "1":
+    doc["debug"] = {
+        "versionCode": int(env["VERSION_CODE"]),
+        "versionName": env["VERSION_NAME"] + "-debug",
+        "apkUrls": [env["GITCODE_DEBUG_URL"], env["CHENGDU_DEBUG_URL"]],
+        "sha256": env["DEBUG_SHA256"],
+        "sizeBytes": int(env["DEBUG_SIZE"]),
+    }
 json.dump(doc, sys.stdout, ensure_ascii=False, indent=2)
 print()
 PY
@@ -286,7 +336,7 @@ fi
 if (( VERIFY )); then
     log "verifying public URLs"
     verify_sha() {
-        local url=$1 tmp got
+        local url=$1 expected=${2:-$sha} tmp got
         tmp=$(mktemp)
         if ! curl -fsSL --max-time 300 -o "$tmp" "$url"; then
             rm -f "$tmp"
@@ -294,15 +344,21 @@ if (( VERIFY )); then
         fi
         got=$(sha256_of "$tmp")
         rm -f "$tmp"
-        [[ "$got" == "$sha" ]] || die "sha256 mismatch: $url"
+        [[ "$got" == "$expected" ]] || die "sha256 mismatch: $url"
         log "ok $url"
     }
 
     if (( DO_PUSH )); then
         verify_sha "$GITCODE_URL"
+        if (( DO_DEBUG )); then
+            verify_sha "$GITCODE_DEBUG_URL" "$DEBUG_SHA"
+        fi
     fi
     if (( DO_CHENGDU )); then
         verify_sha "$CHENGDU_URL"
+        if (( DO_DEBUG )); then
+            verify_sha "$CHENGDU_DEBUG_URL" "$DEBUG_SHA"
+        fi
         manifest_code=$(curl -fsS --max-time 30 "$PUBLIC_BASE/update.json" \
             | python3 -c 'import json, sys; print(json.load(sys.stdin)["versionCode"])')
         [[ "$manifest_code" == "$VERSION_CODE" ]] \
