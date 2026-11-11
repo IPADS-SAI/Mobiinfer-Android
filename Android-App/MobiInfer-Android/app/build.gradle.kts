@@ -23,8 +23,18 @@ android {
         // to the WebP icons in mipmap-{m,h,xh,xxh,xxxh}dpi/.
         minSdk = 24
         targetSdk = 36
-        versionCode = 6
-        versionName = "0.4"
+        versionCode = 10
+        versionName = "0.4.4"
+
+        // Where UpdateChecker looks for the update manifest. Kept out of the
+        // Kotlin source so the endpoint can move without editing code:
+        //   ./gradlew assembleRelease -PupdateManifestUrl=https://example/update.json
+        resValue(
+            "string",
+            "update_manifest_url",
+            providers.gradleProperty("updateManifestUrl")
+                .getOrElse("https://mobiinfer.yiguzhaojin.cn/update.json"),
+        )
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -89,7 +99,18 @@ android {
         }
     }
 
+    // Required for resValue(...) in defaultConfig: the update manifest endpoint
+    // is injected as a string resource instead of being hardcoded in Kotlin.
+    buildFeatures {
+        resValues = true
+    }
+
     buildTypes {
+        debug {
+            // Debug builds ship on their own update channel (see update.json's
+            // "debug" block); the suffix keeps them distinguishable on-device.
+            versionNameSuffix = "-debug"
+        }
         release {
             // Keep ProGuard/R8 disabled: the app calls native JNI symbols and
             // shrinking the Kotlin side has no measurable benefit here, while
