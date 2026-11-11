@@ -372,7 +372,7 @@ val buildImageGen = tasks.register("buildImageGen") {
     val sdSrcDir = File(repoRoot, "vendor/sdcpp-hexagon")
     // imagegen builds its own skels from the vendored ggml; they are staged
     // under libggml-htp-img-v<arch>.so (see the note in doLast).
-    val imageGenTargets = listOf("imagegen", "htp-v79", "htp-v81")
+    val imageGenTargets = listOf("imagegen", "htp-v79", "htp-v81", "htp-v85")
 
     val hexagonSdk = System.getenv("HEXAGON_SDK_ROOT")
         ?: error("Set HEXAGON_SDK_ROOT to the Hexagon SDK installation directory")
@@ -394,6 +394,7 @@ val buildImageGen = tasks.register("buildImageGen") {
         destDir.resolve("libstable-diffusion.so"),
         destDir.resolve("libggml-htp-img-v79.so"),
         destDir.resolve("libggml-htp-img-v81.so"),
+        destDir.resolve("libggml-htp-img-v85.so"),
     ))
 
     onlyIf { !skipImageGen }
@@ -446,7 +447,7 @@ val buildImageGen = tasks.register("buildImageGen") {
         // top-k-mask), and its ggml-hexagon.cpp is patched to load
         // libggml-htp-img-v<arch>.so. The llama/MoE backend keeps loading
         // libggml-htp-v<arch>.so, which buildHtpSkels stages from our ggml.
-        for (name in listOf("v79", "v81")) {
+        for (name in listOf("v79", "v81", "v85")) {
             val f = fileTree(bd).matching { include("**/ggml-hexagon/libggml-htp-$name.so") }.files.firstOrNull()
                 ?: error("buildImageGen: missing skel libggml-htp-$name.so under ${bd.absolutePath}")
             f.copyTo(File(destDir, "libggml-htp-img-$name.so"), overwrite = true)
