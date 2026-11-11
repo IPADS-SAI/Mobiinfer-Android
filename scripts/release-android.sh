@@ -23,8 +23,11 @@
 #   --min-supported <code> versionCode below which the update is mandatory
 #   --prerelease           Mark the GitCode release as a pre-release
 #   --no-build             Do not run gradle (requires --apk or a fresh build)
-#   --no-push              Do not create/push the tag or touch GitCode
+#   --no-push              Do not create/push the tag, touch GitCode or publish
+#                          update.json (implies --no-chengdu unless --chengdu)
 #   --no-chengdu           Do not upload the APK / update.json to Chengdu
+#   --chengdu              Publish to Chengdu even together with --no-push
+#   --allow-dirty          Tag HEAD even if the working tree has changes
 #
 # Environment overrides:
 #   GITCODE_REPO, GITCODE_REMOTE, CHENGDU_HOST, CHENGDU_WEBROOT, PUBLIC_BASE,
@@ -51,13 +54,25 @@ MIN_SUPPORTED=0
 DO_BUILD=1
 DO_PUSH=1
 DO_CHENGDU=1
+CHENGDU_EXPLICIT=0
+ALLOW_DIRTY=0
 PRERELEASE=0
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 log() { printf '\n== %s\n' "$*"; }
 
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    else
+        shasum -a 256 "$1" | cut -d' ' -f1
+    fi
+}
+
+size_of() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1"; }
+
 usage() {
-    sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -68,8 +83,10 @@ while [[ $# -gt 0 ]]; do
         --min-supported) MIN_SUPPORTED=${2:?}; shift 2 ;;
         --prerelease)    PRERELEASE=1; shift ;;
         --no-build)      DO_BUILD=0; shift ;;
-        --no-push)       DO_PUSH=0; shift ;;
+        --no-push)       DO_PUSH=0; (( CHENGDU_EXPLICIT )) || DO_CHENGDU=0; shift ;;
         --no-chengdu)    DO_CHENGDU=0; shift ;;
+        --chengdu)       DO_CHENGDU=1; CHENGDU_EXPLICIT=1; shift ;;
+        --allow-dirty)   ALLOW_DIRTY=1; shift ;;
         -h|--help)       usage; exit 0 ;;
         *)               die "unknown option: $1 (try --help)" ;;
     esac
@@ -86,6 +103,12 @@ log "release $TAG ($VERSION_NAME, versionCode $VERSION_CODE)"
 
 # ---------------------------------------------------------------- build / verify
 
+if (( ! ALLOW_DIRTY )) && {
+        ! git -C "$ROOT" diff --quiet || ! git -C "$ROOT" diff --cached --quiet
+    }; then
+    die "working tree is dirty; commit or stash first (or pass --allow-dirty)"
+fi
+
 if (( DO_BUILD )); then
     log "building :app:assembleRelease"
     # Keep the Gradle user home at its default: the release signing
@@ -101,7 +124,8 @@ fi
 
 ANDROID_HOME=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}
 [[ -n "$ANDROID_HOME" ]] || die "ANDROID_HOME is not set"
-BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null | sort -V | tail -1)
+BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/*/ 2>/dev/null \
+    | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
 [[ -n "$BUILD_TOOLS" ]] || die "no build-tools under $ANDROID_HOME"
 AAPT2="${BUILD_TOOLS}aapt2"
 APKSIGNER="${BUILD_TOOLS}apksigner"
@@ -113,15 +137,23 @@ apk_name=$(sed -nE "s/.*versionName='([^']+)'.*/\1/p" <<<"$badging" | head -1)
 [[ "$apk_name" == "$VERSION_NAME" ]] || die "APK versionName $apk_name != gradle $VERSION_NAME"
 
 "$APKSIGNER" verify --verbose "$APK" >/dev/null 2>&1 || die "APK signature invalid"
-if ! "$APKSIGNER" verify --verbose "$APK" 2>/dev/null | grep -q 'v2 scheme (APK Signature Scheme v2): true'; then
-    die "APK is not v2-signed"
-fi
+verify_out=$("$APKSIGNER" verify --verbose "$APK" 2>/dev/null)
+grep -q 'v2 scheme (APK Signature Scheme v2): true' <<<"$verify_out" || die "APK is not v2-signed"
+grep -q 'v3 scheme (APK Signature Scheme v3): true' <<<"$verify_out" || die "APK is not v3-signed"
+
+# A valid signature is not enough: it must be the key users already have,
+# otherwise every installed client rejects the update.
+CERT_SHA256=${CERT_SHA256:-01e0352b9f352035d9908de007a05901cdc48f69eafda8a67a894336a5ac7630}
+apk_cert=$("$APKSIGNER" verify --print-certs "$APK" 2>/dev/null \
+    | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -1)
+[[ "$apk_cert" == "$CERT_SHA256" ]] \
+    || die "APK signer $apk_cert != pinned $CERT_SHA256 (wrong keystore?)"
 
 mkdir -p "$DIST"
 DIST_APK="$DIST/MobiInfer-Android-v$VERSION_NAME.apk"
 cp -f "$APK" "$DIST_APK"
-sha=$(sha256sum "$DIST_APK" | cut -d' ' -f1)
-size=$(stat -c%s "$DIST_APK")
+sha=$(sha256_of "$DIST_APK")
+size=$(size_of "$DIST_APK")
 ( cd "$DIST" && printf '%s  %s\n' "$sha" "$(basename "$DIST_APK")" > SHA256SUMS )
 log "APK $DIST_APK ($size bytes, sha256 $sha)"
 
