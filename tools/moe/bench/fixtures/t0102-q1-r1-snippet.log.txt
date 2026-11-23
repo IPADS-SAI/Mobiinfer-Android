@@ -1,0 +1,10 @@
+ clear simple English.0.07.853.826 I slot print_timing: id  0 | task 0 | n_decoded =    103, tg =  27.88 t/s
+[moe-ssd] total[prefill]: miss=9699 bytes=4091.8 MiB pread=8408ms
+0.08.744.420 I slot print_timing: id  0 | task 0 | prompt eval time =     829.33 ms /    22 tokens (   37.70 ms per token,    26.53 tokens per second)
+0.08.744.427 I slot print_timing: id  0 | task 0 |        eval time =    4584.79 ms /   128 tokens (   35.82 ms per token,    27.92 tokens per second)
+0.08.744.428 I slot print_timing: id  0 | task 0 |       total time =    5414.11 ms /   150 tokens
+0.08.744.429 I slot print_timing: id  0 | task 0 |    graphs reused =         33
+0.08.744.429 I slot print_timing: id  0 | task 0 | draft acceptance = 0.90196 (   92 accepted /   102 generated)
+0.08.744.439 I statistics     draft-dspark: #calls(b,g,a) =    1     34     34, #gen drafts =     34, #acc drafts =    33, #gen tokens =    102, #acc tokens =    92, dur(b,g,a) = 0.000, 576.490, 0.001 ms
+0.08.744.448 I slot      release: id  0 | task 0 | stop processing: n_tokens = 149, truncated = 0
+[moe-ssd] total[final]: miss=10305 bytes=4347.4 MiB pread=9635ms

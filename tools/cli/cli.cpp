@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <thread>
@@ -77,7 +78,7 @@ struct cli_context {
         verbose_prompt = params.verbose_prompt;
     }
 
-    std::string generate_completion(result_timings & out_timings) {
+    std::string generate_completion(result_timings & out_timings, bool & failed) {
         server_response_reader rd = ctx_server.get_response_reader();
         auto chat_params = format_chat();
         {
@@ -137,6 +138,7 @@ struct cli_context {
                 break;
             }
             if (result->is_error()) {
+                failed = true;
                 json err_data = result->to_json();
                 if (err_data.contains("message")) {
                     console::error("Error: %s\n", err_data["message"].get<std::string>().c_str());
@@ -448,6 +450,10 @@ int llama_cli(int argc, char ** argv) {
 
     // interactive loop
     std::string cur_msg;
+    // input_files is cumulative across the session; remember how much of it has
+    // already been committed to a successful turn so a failed turn can drop the
+    // media that only belonged to that turn.
+    size_t pending_files_before = ctx_cli.input_files.size();
 
     auto add_text_file = [&](const std::string & fname) -> bool {
         std::string marker = ctx_cli.load_input_file(fname, false);
@@ -469,6 +475,7 @@ int llama_cli(int argc, char ** argv) {
         return true;
     };
 
+    int exit_status = EXIT_SUCCESS;
     while (true) {
         std::string buffer;
         console::set_display(DISPLAY_TYPE_USER_INPUT);
@@ -518,15 +525,34 @@ int llama_cli(int argc, char ** argv) {
         }
 
         bool add_user_msg = true;
+        const size_t messages_before_turn = ctx_cli.messages.size();
+        bool removed_assistant_valid = false;
+        json removed_assistant;
 
         // process commands
         if (string_starts_with(buffer, "/exit")) {
             break;
         } else if (string_starts_with(buffer, "/regen")) {
-            if (ctx_cli.messages.size() >= 2) {
-                size_t last_idx = ctx_cli.messages.size() - 1;
-                ctx_cli.messages.erase(last_idx);
-                add_user_msg = false;
+            if (!ctx_cli.messages.empty()) {
+                const std::string last_role = ctx_cli.messages.back().value("role", std::string());
+                if (last_role == "assistant") {
+                    if (ctx_cli.messages.size() < 2 ||
+                            ctx_cli.messages[ctx_cli.messages.size() - 2].value("role", std::string()) != "user") {
+                        console::error("No message to regenerate.\n");
+                        continue;
+                    }
+                    removed_assistant = ctx_cli.messages.back();
+                    removed_assistant_valid = true;
+                    ctx_cli.messages.erase(ctx_cli.messages.size() - 1);
+                    add_user_msg = false;
+                } else if (last_role == "user") {
+                    // A previous turn failed and was rolled back; regenerate the
+                    // user message itself instead of deleting it.
+                    add_user_msg = false;
+                } else {
+                    console::error("No message to regenerate.\n");
+                    continue;
+                }
             } else {
                 console::error("No message to regenerate.\n");
                 continue;
@@ -536,6 +562,7 @@ int llama_cli(int argc, char ** argv) {
             add_system_prompt();
 
             ctx_cli.input_files.clear();
+            pending_files_before = 0;
             console::log("Chat history cleared.\n");
             continue;
         } else if (
@@ -622,14 +649,29 @@ int llama_cli(int argc, char ** argv) {
             cur_msg.clear();
         }
         result_timings timings;
-        std::string assistant_content = ctx_cli.generate_completion(timings);
-        ctx_cli.messages.push_back({
-            {"role",    "assistant"},
-            {"content", assistant_content}
-        });
+        bool failed = false;
+        std::string assistant_content = ctx_cli.generate_completion(timings, failed);
+        // 失败的那一轮不能把（空/半截）assistant 内容留在历史里：下一轮会把它当成模型
+        // 已经说过的话重新喂给聊天模板，污染 prompt。正常提问失败时还要撤销本轮
+        // 追加的 user 消息及其媒体，否则下一次输入会留下连续两条 user；/regen
+        // 失败则恢复生成前撤下的 assistant。
+        if (!failed) {
+            ctx_cli.messages.push_back({
+                {"role",    "assistant"},
+                {"content", assistant_content}
+            });
+            pending_files_before = ctx_cli.input_files.size();
+        } else if (removed_assistant_valid) {
+            ctx_cli.messages.push_back(std::move(removed_assistant));
+        } else if (add_user_msg) {
+            while (ctx_cli.messages.size() > messages_before_turn) {
+                ctx_cli.messages.erase(ctx_cli.messages.size() - 1);
+            }
+            ctx_cli.input_files.resize(pending_files_before);
+        }
         console::log("\n");
 
-        if (params.show_timings) {
+        if (params.show_timings && !failed) {
             console::set_display(DISPLAY_TYPE_INFO);
             console::log("\n");
             console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s ]\n", timings.prompt_per_second, timings.predicted_per_second);
@@ -642,7 +684,11 @@ int llama_cli(int argc, char ** argv) {
         llama_moe_park_expert_memory(ctx_cli.ctx_server.get_llama_context());
 
         if (params.single_turn) {
+            exit_status = failed ? EXIT_FAILURE : EXIT_SUCCESS;
             break;
+        }
+        if (failed) {
+            exit_status = EXIT_FAILURE;
         }
     }
 
@@ -656,5 +702,5 @@ int llama_cli(int argc, char ** argv) {
     common_log_set_verbosity_thold(LOG_LEVEL_INFO);
     common_memory_breakdown_print(ctx_cli.ctx_server.get_llama_context());
 
-    return 0;
+    return exit_status;
 }

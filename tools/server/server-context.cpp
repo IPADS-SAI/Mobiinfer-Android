@@ -915,6 +915,14 @@ private:
             return false;
         }
 
+        // A model can load while its first context still fails (e.g. an MoE slot-bank
+        // configuration rejected during llama_context construction). Dereferencing the
+        // null context here would crash instead of reporting the load error.
+        if (ctx_tgt == nullptr) {
+            SRV_ERR("failed to create context, '%s'\n", params_base.model.path.c_str());
+            return false;
+        }
+
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);
@@ -959,7 +967,19 @@ private:
                 return false;
             }
 
+            try {
+                common_speculative_validate_a4_models(params_base.speculative, model_tgt, model_dft.get());
+            } catch (const std::exception & e) {
+                SRV_ERR("A4 draft/target model pairing rejected: %s\n", e.what());
+                return false;
+            }
+
             auto cparams = common_context_params_to_llama(params_dft);
+            // A4 reads the draft pre-norm channel per token; any pooling mode other than NONE
+            // makes llama_context skip that readback and leave stale/zero bytes in the buffer.
+            if (params_base.speculative.a4_selected()) {
+                cparams.pooling_type = LLAMA_POOLING_TYPE_NONE;
+            }
 
             const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                             params_base.speculative.types.end(),
@@ -975,6 +995,10 @@ private:
             // from the target model through this link
             cparams.ctx_other = ctx_tgt;
             ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
+            if (ctx_dft == nullptr) {
+                SRV_ERR("%s", "failed to create draft context\n");
+                return false;
+            }
 
             ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
 
@@ -1077,8 +1101,19 @@ private:
             slots.emplace_back();
         }
 
+        // G2-A4 (draft-pool) prototype: the pool ids live in the draft context and assume a
+        // single drafting sequence. Refuse multi-slot servers here instead of aborting in the
+        // middle of a decode.
+        // TODO(G2-A4): per-seq pool slots + multi-sequence aux grouping.
+        const bool a4_pool_arm = params_base.speculative.a4_selected();
+        if (a4_pool_arm && params_base.n_parallel != 1) {
+            SRV_ERR("G2-A4 (--spec-pool-size %d) currently supports --parallel 1 only (n_parallel = %d) - "
+                    "disabling speculative decoding\n", (int) params_base.speculative.draft.pool_size,
+                    (int) params_base.n_parallel);
+        }
+
         // try speculative decoding
-        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+        if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO && !(a4_pool_arm && params_base.n_parallel != 1)) {
             try {
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
             } catch (const std::exception & e) {
@@ -3727,6 +3762,7 @@ private:
                         SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                     }
 
+                    common_speculative_set_verified(spec.get(), slot.id, (uint16_t) n_draft);
                     common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
                     slot.spec_draft = std::move(accepted);
