@@ -8,7 +8,7 @@
 
 **Running a 35B-class MoE locally on a phone**
 
-[![Release](https://img.shields.io/badge/release-v0.1--alpha-blue)](https://github.com/IPADS-SAI/Mobiinfer-Android/releases)
+[![Release](https://img.shields.io/badge/release-v0.4.6-blue)](https://github.com/IPADS-SAI/Mobiinfer-Android/releases)
 [![Platform](https://img.shields.io/badge/platform-Android%20%7C%20Snapdragon-3DDC84)](#)
 [![Backend](https://img.shields.io/badge/backend-Hexagon%20NPU%20(HTP)-blue)](#)
 [![Base](https://img.shields.io/badge/built%20on-llama.cpp--omni-orange)](#)
@@ -22,6 +22,11 @@
 
 ## News
 
+- [2026.11.23] 🚀 **MobiInfer-Android v0.4.6: the Q2 tiled expert pack lifts MiniCPM-V 4.7 decode to 31.1 tok/s**
+  - 📦 **Q2 tiled experts**: routed experts are stored in Q2_K tiled, so on the same SoC decode goes from 23.3 tok/s with Q3 tiled to **31.1 tok/s**, with prefill at 24.57 tok/s on a 41-token prompt.
+  - 🧵 **Still runs alongside other apps**: 29.2 tok/s with other apps in the foreground, against 21.3–21.8 with Q3 tiled.
+  - 🔀 **MoE runtime sync**: LRU/LFU window eviction, shared expert cache, prefetch merging with read hardening, and the A4 draft pool (opt-in through `LLAMA_MOE_*`).
+  - 🧮 **Hexagon backend sync**: compact Q3_K slab, HVX-first dispatch for small-batch MUL_MAT / MUL_MAT_ID, and elementwise chain fusion.
 - [2026.11.11] 🚀 **MobiInfer-Android v0.4.5: MiniCPM-V 4.7 MoE decode peaks at 23.3 tok/s**
   - ⚡ **Cross-layer expert pipeline**: O_DIRECT expert reads, gate predictions submitted two layers ahead (H+2), one FIFO task per expert with resident reader threads — the I/O is hidden under compute. Same device, same prompt: 23.3 tok/s.
   - 🧵 **Runs alongside other apps**: MoE inference no longer needs exclusive access; generation keeps going while other apps are in the foreground, at 21.3–21.8 tok/s.
@@ -96,10 +101,13 @@ Architecture coverage includes `qwen3`/`qwen3moe`/`qwen3next`, `qwen3vl`/`qwen3v
 
 > 📱 Measured on OnePlus 13 (Snapdragon 8 Elite, HTP0 + HTP1), text-only, 128-token output.
 > 📱 iQOO 15 Ultra (Snapdragon 8 Elite Gen5, Hexagon v81), text-only, 260-token prompt, DSpark draft3.
+> 📱 iQOO 15 Ultra, Q2 tiled expert pack + LES, text-only, 41-token prompt, DSpark.
 
 | Model | Configuration | SoC | Prompt length | Prefill (token/s) | Decode (token/s) |
 |---|---|---|---|---:|---:|
-| MiniCPM-V 4.7 35B-A3B | Q3 tiled, H+2 pipeline + O_DIRECT + DSpark3 | 8 Elite Gen5 | 260 | 38.5 | **23.3** |
+| MiniCPM-V 4.7 35B-A3B | Q2 tiled, LES + DSpark | 8 Elite Gen5 | 41 | 24.57 | **31.1** |
+| MiniCPM-V 4.7 35B-A3B | as above, with other apps running | 8 Elite Gen5 | 41 | — | 29.2 |
+| MiniCPM-V 4.7 35B-A3B | Q3 tiled, H+2 pipeline + O_DIRECT + DSpark3 | 8 Elite Gen5 | 260 | 38.5 | 23.3 |
 | MiniCPM-V 4.7 35B-A3B | as above, with other apps running | 8 Elite Gen5 | 260 | — | 21.3–21.8 |
 | MiniCPM-V 4.7 35B-A3B | Q3, LES + DSpark | 8 Elite | 41 | 22.02 | 17.98 |
 | MiniCPM-V 4.7 35B-A3B | Q3, LES + DSpark | 8 Elite | 512 | 94.28 | 13.65 |
