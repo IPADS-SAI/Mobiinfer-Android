@@ -224,7 +224,22 @@ data class ModelInfo(
         // The upstream demo's other variants (V-4, V-4.6, MiniCPM5-1B/2B,
         // VoxCPM2) are intentionally not offered here.
         val AVAILABLE_MODELS = listOf(
-            // MiniCPM-V 4.7 is the default and appears first in every selector.
+            // Full Q2_K expert pack uploaded by this project. Text-only bundle:
+            // experts/ + dense/ + SHA256SUMS from fengerhu1/MiniCPM-V-4.7-35B-A3B-gguf-hexagon-q2k.
+            ModelInfo(
+                id = "q2k-full",
+                displayName = "MiniCPM-V-4.7 35B-A3B (Q2_K, NPU)",
+                descriptionResName = "model_desc_v47_npu",
+                ggufFileName = "dense/minicpm47-q2kdense-q1exp-30tps.gguf",
+                expertsDirectory = "experts",
+                expertsLayerCount = 40,
+                msRepo = "fengerhu1/MiniCPM-V-4.7-35B-A3B-gguf-hexagon-q2k",
+                bundleManifestFile = "SHA256SUMS",
+                totalBytes = 11_848_726_683L
+            ),
+            // MiniCPM-V 4.7 stays the default (DEFAULT_MODEL pins it by id); the
+            // Q2_K pack above is offered first because it is the smallest bundle
+            // this project publishes and the one existing devices already have.
             ModelInfo(
                 id = "minicpm-v-4_7",
                 displayName = "MiniCPM-V-4.7 35B-A3B (Q3, NPU)",
