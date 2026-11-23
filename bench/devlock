@@ -43,8 +43,12 @@ if [ "$#" -eq 0 ]; then
 fi
 
 # Keep the lock on a high fd so the command is unlikely to clobber it.
+# IMPORTANT: open read-write WITHOUT O_TRUNC. A diagnostic probe (`-n` or the
+# pre-check of `-w`) must never erase the holder line written by the process
+# that currently owns the flock. `<>` creates the file when missing but keeps
+# existing bytes. The holder line is rewritten only after we own the lock.
 LOCKFD=9
-exec 9>"$LOCKFILE"
+exec 9<>"$LOCKFILE"
 
 flock_opts=(-x)
 [ "$nonblock" -eq 1 ] && flock_opts+=(-n)
@@ -73,12 +77,17 @@ if ! flock -x -n "$LOCKFD" 2>/dev/null; then
   }
 fi
 
-# Record holder info for diagnostics.
+# Record holder info for diagnostics. We own the flock at this point, so it is
+# safe to truncate in place; concurrent probes only read the same inode and
+# never shorten it. Keep the inode (do not replace the file): flock is per
+# inode, and replacing it would let the next devlock lock a different file.
 info="pid=$$ host=$(hostname 2>/dev/null || echo phone) since=$(date '+%Y-%m-%dT%H:%M:%S') cmd=$*"
-printf '%s\n' "$info" >"$LOCKFILE"
+: >"$LOCKFILE"
+printf '%s\n' "$info" >&9
 
 # Run the command while holding fd 9. The kernel releases the flock when this
-# script exits (or is killed), so no manual cleanup is ever needed.
-"$@"
-rc=$?
+# script exits (or is killed), so no manual cleanup is ever needed. Capture the
+# rc explicitly (`|| rc=$?`) so `set -e` does not swallow it.
+rc=0
+"$@" || rc=$?
 exit "$rc"
