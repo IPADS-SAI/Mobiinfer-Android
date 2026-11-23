@@ -14,6 +14,7 @@
 
 struct ggml_cgraph;
 struct ggml_context;
+struct llama_context;
 struct ggml_tensor;
 
 struct llama_cparams;
@@ -138,6 +139,37 @@ public:
     ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
 
     const int64_t n_embd = 0;
+};
+
+// Extra hidden rows fed straight to the output (LM) head, bypassing the batch/ubatch entirely.
+// Used by the draft-pool A4 scheme: the draft publishes the post-norm hidden of its block rows
+// 4,5,6 and the target head projects them separately from the verify rows.
+// The rows never enter the batch: they do not touch n_tokens, KV positions or output_ids.
+class llm_graph_input_aux : public llm_graph_input_i {
+public:
+    llm_graph_input_aux(int64_t n_embd, uint32_t n_rows, uint32_t n_seqs, const float * host,
+                        uint32_t n_seq_max, const uint8_t * valid)
+        : n_embd(n_embd), n_rows(n_rows), n_seqs(n_seqs), host(host),
+          n_seq_max(n_seq_max), valid(valid) {}
+    virtual ~llm_graph_input_aux() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    // F32 [n_embd, n_rows*n_seqs]; one n_rows block per unique sequence, in ubatch.seq_id_unq order
+    ggml_tensor * aux = nullptr;
+
+    const int64_t  n_embd = 0;
+    const uint32_t n_rows = 0; // rows per sequence
+    const uint32_t n_seqs = 0; // number of sequence blocks in this graph
+
+    // host-side data, F32 [n_seq_max][n_rows][n_embd] (seq-major, indexed by llama_seq_id)
+    const float * host = nullptr;
+
+    // capacity of `host` in sequences and per-sequence upload-valid bits (may be nullptr)
+    const uint32_t  n_seq_max = 0;
+    const uint8_t * valid     = nullptr;
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {
@@ -587,8 +619,27 @@ using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor
 
 class llm_graph_result;
 
+// Bit i is set iff token i of the ubatch requested logits. A4 graph selection and graph reuse
+// must use the full mask, not only the number of outputs: 1110000 and 0111000 have the same
+// n_outputs but map different batch rows into the A4 head.
+static inline uint64_t llama_graph_a4_output_mask(const llama_ubatch & ub, int32_t block_rows) {
+    if (ub.output == nullptr || block_rows <= 0 || block_rows > 64) {
+        return 0;
+    }
+    uint64_t mask = 0;
+    const int32_t n = std::min<int32_t>(block_rows, (int32_t) ub.n_tokens);
+    for (int32_t i = 0; i < n; ++i) {
+        if (ub.output[i]) {
+            mask |= (uint64_t) 1 << i;
+        }
+    }
+    return mask;
+}
+
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
+    // owning context; used by context-scoped model state (e.g. the DFlash A4 arm)
+    const llama_context * ctx = nullptr;
 
     llama_hparams hparams;
     llama_cparams cparams;
@@ -610,6 +661,32 @@ struct llm_graph_params {
     // n_tokens 不足以区分：单 token 的 prefill 与 decode 都是 1。
     bool moe_decode_phase = false;
     const llama_cross            * cross;
+
+    // target aux LM-head rows (see llm_graph_input_aux): extra rows concatenated to the verify
+    // hidden after the final norm, so that one mul_mat covers verify + aux rows.
+    //   aux_rows   - rows per sequence; 0 = disabled (graph identical to the baseline)
+    //   aux_hidden - F32 [n_seq_max][aux_rows][n_embd] host buffer, seq-major
+    // both participate in allow_reuse(): a shape or pointer change must rebuild the graph,
+    // otherwise a cached graph keeps reading the old aux buffer.
+    uint32_t      aux_rows   = 0;
+    const float * aux_hidden = nullptr;
+    // capacity of aux_hidden in sequences and per-sequence upload-valid bits; the graph validates
+    // seq_id against these before reading host memory (unified KV can use ids above n_seq_max)
+    uint32_t        aux_n_seq_max = 0;
+    const uint8_t * aux_valid     = nullptr;
+    // T20: device top-k over the aux rows (0 = off); see src/llama-ext.h
+    uint32_t      aux_top_k  = 0;
+
+    // draft-pool A4 arm topology, copied from the owning context. The graph builder only reads
+    // these (never the mutable per-decode pool contents), so two contexts cannot race and a
+    // topology change forces a graph rebuild through allow_reuse().
+    bool    a4_armed      = false;
+    bool    a4_decode      = false; // this specific decode is the A4 draft block
+    bool    a4_pool_mode  = false;
+    int32_t a4_n_pool     = 0;
+    int32_t a4_head_k     = 0;
+    int32_t a4_aux_rows   = 0;
+    int32_t a4_block_rows = 0;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -691,6 +768,7 @@ struct llm_graph_params {
         }
 
         return
+            ctx == other.ctx &&
             cparams.embeddings  == other.cparams.embeddings  &&
             cparams.causal_attn == other.cparams.causal_attn &&
             cparams.n_expert_used == other.cparams.n_expert_used &&
@@ -700,6 +778,20 @@ struct llm_graph_params {
             loras == other.loras &&
             moe_slots == other.moe_slots &&
             moe_decode_phase == other.moe_decode_phase &&
+            aux_rows == other.aux_rows &&
+            aux_hidden == other.aux_hidden &&
+            aux_n_seq_max == other.aux_n_seq_max &&
+            aux_valid == other.aux_valid &&
+            aux_top_k == other.aux_top_k &&
+            a4_armed == other.a4_armed &&
+            a4_decode == other.a4_decode &&
+            (!a4_decode || llama_graph_a4_output_mask(ubatch, a4_block_rows) ==
+                           llama_graph_a4_output_mask(other.ubatch, other.a4_block_rows)) &&
+            a4_pool_mode == other.a4_pool_mode &&
+            a4_n_pool == other.a4_n_pool &&
+            a4_head_k == other.a4_head_k &&
+            a4_aux_rows == other.a4_aux_rows &&
+            a4_block_rows == other.a4_block_rows &&
             cross == other.cross;
     }
 };
@@ -712,6 +804,11 @@ public:
 
     ggml_tensor * get_inp_tokens()  const { return t_inp_tokens; }
     ggml_tensor * get_logits()      const { return t_logits; }
+    // aux LM-head logits: rows [n_outputs, n_outputs + n_aux_total) of the head matrix,
+    // only present when the graph was built with aux rows (see llm_graph_params::aux_rows)
+    ggml_tensor * get_aux_logits()  const { return t_aux_logits; }
+    ggml_tensor * get_aux_top_k_ids () const { return t_aux_top_k_ids; }
+    ggml_tensor * get_aux_top_k_vals() const { return t_aux_top_k_vals; }
     ggml_tensor * get_embd()        const { return t_embd; }
     // [诊断] 输入 embedding（token 路径是 get_rows(tok_embd)，embedding 路径就是喂进来的张量）。
     // 供 llama_model_token_embd() 的等值性测试取真值用，默认不参与任何正常路径。
@@ -746,6 +843,9 @@ public:
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
+    ggml_tensor * t_aux_logits  = nullptr; // [n_vocab, n_aux_total] rows of the head matrix after the verify rows
+    ggml_tensor * t_aux_top_k_ids  = nullptr; // I32 [3*k]   (T20 device top-k ids per aux row)
+    ggml_tensor * t_aux_top_k_vals = nullptr; // F32 [4*k]   (T20 shared-pool candidate values)
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_pre_norm  = nullptr; // [n_embd, n_outputs] hidden state before final output norm
@@ -825,6 +925,18 @@ struct llm_graph_context {
     const int64_t n_tokens;
     const int64_t n_outputs;
     const int32_t n_ctx_orig; // yarn
+
+    // target aux LM-head rows (draft-pool A4), 0 when disabled
+    const int64_t n_aux_rows  = 0; // rows per sequence
+    const int64_t n_aux_total = 0; // total rows in this graph = n_aux_rows * ubatch.n_seqs_unq
+
+    // host buffer with the aux rows, F32 [n_seq_max][n_aux_rows][n_embd] (seq-major)
+    const float * aux_hidden = nullptr;
+    // capacity of aux_hidden in sequences (== cparams.n_seq_max), and per-sequence upload-valid
+    // bits. The graph must validate seq_id against these before computing a host address: with a
+    // unified KV cache the decode may legally use seq_id values above cparams.n_seq_max.
+    const uint32_t aux_n_seq_max = 0;
+    const uint8_t * aux_valid = nullptr;
 
     const enum llama_pooling_type pooling_type;
     const enum llama_rope_type    rope_type;
@@ -959,6 +1071,7 @@ struct llm_graph_context {
     //
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
+    ggml_tensor * build_inp_aux() const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;

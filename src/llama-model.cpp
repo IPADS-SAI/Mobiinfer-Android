@@ -23,6 +23,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
@@ -980,6 +981,23 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
     return buft_list;
 }
 
+// LLAMA_MOE_* 布尔开关的统一解析：0/false/off = 关，1/true/on = 开，未设 = def，
+// 其它非空值按开并告警一次（每进程每变量一条）。
+static bool llama_moe_env_flag(const char * name, bool def) {
+    const char * v = std::getenv(name);
+    if (!v || !*v) {
+        return def;
+    }
+    if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 || std::strcmp(v, "off") == 0) {
+        return false;
+    }
+    if (std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 || std::strcmp(v, "on") == 0) {
+        return true;
+    }
+    LLAMA_LOG_WARN("%s: %s=%s is not one of 0/1/true/false/on/off; treating it as enabled\n", "llama-model", name, v);
+    return true;
+}
+
 struct llama_model::impl {
     impl() = default;
     ~impl() = default;
@@ -1018,6 +1036,8 @@ struct llama_model::impl {
 
     bool has_tensor_overrides;
     std::unique_ptr<llama_moe_experts> moe_experts;
+    bool moe_shared_decode = false;
+    std::atomic<bool> moe_shared_bank_in_use{false};
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1030,6 +1050,11 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
     }
     if (has_experts) {
         pimpl->moe_experts = std::make_unique<llama_moe_experts>(params.moe_experts_path);
+        // 布尔开关：0/false/off = 关，1/true/on = 开，未设 = 默认关；
+        // 其它非空值按"开"并告警（与本仓库 LLAMA_MOE_PHASE_REUSE 等只在"首字符非 0"上一致，
+        // 但显式把 false/off 当成关 —— 否则 `=false` 会静默把窗口模式换成共享模式，
+        // 连带让 lookahead/matmul-split 被禁用、bank 变常驻）。
+        pimpl->moe_shared_decode = llama_moe_env_flag("LLAMA_MOE_SHARED_DECODE", false);
     }
 }
 
@@ -1237,10 +1262,30 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         if (params.moe_slot_bank < (int32_t) hparams.n_expert_used) {
             throw std::runtime_error("MoE slot bank must be at least expert_used_count");
         }
-        // Shared-bank RAM is bank x one layer. Cap it at the old bank=32-per-layer budget.
         const int32_t n_moe_layers = pimpl->moe_experts->layer_count();
         constexpr int32_t kMoeSlotBankRamBaseline = 32;
-        if (n_moe_layers > 0 && params.moe_slot_bank > kMoeSlotBankRamBaseline * n_moe_layers) {
+        if (moe_shared_decode()) {
+            if (moe_decode_window() != 0) {
+                throw std::runtime_error("LLAMA_MOE_SHARED_DECODE requires LLAMA_MOE_DECODE_WINDOW=0");
+            }
+            // 共享 decode 依赖打包专家包里的 CRC 索引来校验 bank 槽位。原先这条前置条件
+            // 只在 context 构造（init_shared_decode）里才查：llama_init_from_model 返回
+            // null 之后，调用方（如 tools/server）还会去用 ctx → 实测 SIGSEGV。
+            // 挪到模型加载期失败，既能给出清晰错误，也不会走到那条空指针路径。
+            // 运行期 init_shared_decode() 拿 index 还要 LLAMA_MOE_HTP_PACKED_DIR 非空
+            // （get_tiled_span() 没有这个 env 就直接返回空 index），所以载入期一并查：
+            // 只查 manifest 的 checksums 会让"忘设 PACKED_DIR"这种情况漏到 context 构造期。
+            const char * packed_dir = std::getenv("LLAMA_MOE_HTP_PACKED_DIR");
+            if (!pimpl->moe_experts->packed_index_complete() || !packed_dir || !*packed_dir) {
+                throw std::runtime_error(
+                    "LLAMA_MOE_SHARED_DECODE requires a CRC-indexed packed expert manifest: "
+                    "point both --moe-experts and LLAMA_MOE_HTP_PACKED_DIR at the same packed dir "
+                    "(see tools/moe/HEXAGON.md)");
+            }
+            if (params.moe_slot_bank > (int64_t) n_moe_layers * hparams.n_expert) {
+                throw std::runtime_error("MoE shared decode bank exceeds the total number of experts");
+            }
+        } else if (n_moe_layers > 0 && params.moe_slot_bank > kMoeSlotBankRamBaseline * n_moe_layers) {
             throw std::runtime_error("MoE shared slot bank exceeds the bank=32-per-layer RAM budget");
         }
         const size_t bytes_all = pimpl->moe_experts->bytes_per_slot_all_layers();
@@ -1252,6 +1297,17 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             n_moe_layers,
             (bytes_one * (size_t) params.moe_slot_bank) / 1024.0 / 1024.0,
             (bytes_all * (size_t) kMoeSlotBankRamBaseline) / 1024.0 / 1024.0);
+        // bank 在两种模式下都是常驻的（分层窗口模式只是把 bank 再切成每层窗口），
+        // 超过 8 GiB 时提醒一次：这已经不是"多开一个开关"的量级。
+        const double resident_gib =
+            (double) (bytes_one * (size_t) params.moe_slot_bank) / 1024.0 / 1024.0 / 1024.0;
+        if (resident_gib > 8.0) {
+            LLAMA_LOG_WARN(
+                "%s: MoE slot bank keeps %d slots resident: %.2f GiB (%.2f MiB per expert, %s); "
+                "reduce --moe-slot-bank or free memory on this device\n",
+                __func__, params.moe_slot_bank, resident_gib, bytes_one / 1024.0 / 1024.0,
+                moe_shared_decode() ? "shared decode" : "per-layer windows");
+        }
     }
 
     pimpl->n_bytes = ml.n_bytes;
@@ -2121,6 +2177,18 @@ bool llama_model::moe_phase_reuse() const {
     return arch == LLM_ARCH_QWEN35MOE && value && *value && *value != '0';
 }
 
+bool llama_model::moe_shared_decode() const {
+    return pimpl->moe_shared_decode;
+}
+
+bool llama_model::acquire_moe_shared_bank() const {
+    return !pimpl->moe_shared_bank_in_use.exchange(true, std::memory_order_acq_rel);
+}
+
+void llama_model::release_moe_shared_bank() const {
+    pimpl->moe_shared_bank_in_use.store(false, std::memory_order_release);
+}
+
 int32_t llama_model::moe_decode_window() const {
     if (!pimpl->moe_experts) {
         return 0;
@@ -2186,24 +2254,15 @@ std::vector<int32_t> llama_model::moe_layer_windows() const {
         return out;                     // 没有按层覆盖 = 全部均匀
     }
 
-    // 解析 "0:128,1:80" 这类覆盖。非法项直接忽略（宁可退回均匀，也不要崩）。
-    const char * p = s;
-    while (*p) {
-        while (*p == ' ' || *p == ',') ++p;
-        if (!*p) break;
-        char * end = nullptr;
-        const long il = strtol(p, &end, 10);
-        if (end == p || *end != ':') break;
-        p = end + 1;
-        const long w = strtol(p, &end, 10);
-        if (end == p) break;
-        p = end;
-        if (il >= 0 && il < n_moe && w > 0) {
-            const int32_t lo = (int32_t) std::max<int64_t>(1, hparams.n_expert_used);
-            out[(size_t) il] = (int32_t) std::min<long>(std::max<long>(w, lo), 1024);
-        }
+    // 解析 "0:128,1:80" 这类覆盖。语义与旧实现逐位一致：非法项跳过/截断，
+    // 宁可直接退回均匀也不崩；解析器额外返回被忽略的项，这里打警告，
+    // 避免配置笔误再被静默吞掉（见 llama-moe-config.h、tests/test-moe-config.cpp）。
+    const int32_t lo = (int32_t) std::max<int64_t>(1, hparams.n_expert_used);
+    const auto parsed = llama_moe::config::parse_layer_windows(s, n_moe, base, lo, 1024);
+    for (const auto & ignored : parsed.ignored) {
+        LLAMA_LOG_WARN("%s: LLAMA_MOE_LAYER_WINDOWS: %s\n", __func__, ignored.c_str());
     }
-    return out;
+    return parsed.widths;
 }
 
 int32_t llama_model::moe_layer_windows_total() const {
@@ -2227,6 +2286,13 @@ int32_t llama_model::moe_prefetch_slots() const {
     const char * d = std::getenv("LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH");
     const int32_t k = d ? atoi(d) : 8;
     return llama_moe_slot_runtime::normalize_prefetch_depth(params.moe_slot_bank, k);
+}
+
+const std::vector<int32_t> * llama_model::moe_experts_order(int32_t layer) const {
+    if (!pimpl->moe_experts) {
+        return nullptr;
+    }
+    return pimpl->moe_experts->expert_order(layer);
 }
 
 const llama_moe_experts_entry * llama_model::moe_experts_entry(const char * tensor_name) const {
