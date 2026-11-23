@@ -10,11 +10,13 @@ import json
 from contextlib import ExitStack
 from pathlib import Path
 
-from experts import atomic_file
+from experts import atomic_file, load_expert_order
 from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
 
-# These are the quantizations exercised by the MiniCPM mixed-Q3 and Q4_K_M assets.
-QUANT_TYPES = {"Q3_K": 11, "Q4_K": 12, "Q6_K": 14}
+# These are the quantizations exercised by the MiniCPM mixed-Q3/Q4/Q5 and
+# Qwen3.5 Q4_K_M (Q4_K gate/up + Q5_K down) assets.  Q5_K has its own padded
+# tiled tile size (768 B / 32 k-values), so it cannot reuse the Q4_K layout.
+QUANT_TYPES = {"Q1_0": 41, "Q2_0": 42, "Q2_K": 10, "Q3_K": 11, "Q4_K": 12, "Q5_K": 13, "Q6_K": 14}
 
 
 def relative_file(directory: Path, name: str) -> Path:
@@ -32,6 +34,8 @@ def main() -> int:
     parser.add_argument("--experts", required=True, type=Path, help="raw experts.py extract output")
     parser.add_argument("--out-dir", required=True, type=Path, help="new or empty tiled output directory")
     parser.add_argument("--lib-dir", required=True, type=Path, help="directory containing matching native Hexagon libraries")
+    parser.add_argument("--expert-order", type=Path,
+                        help="optional dpsk-pack-order-v1 JSON; orders[layer] is position -> logical")
     args = parser.parse_args()
     source = args.experts.expanduser().resolve()
     destination = args.out_dir.expanduser().resolve()
@@ -45,6 +49,8 @@ def main() -> int:
     count = int(manifest["model"]["expert_count"])
     if count <= 0 or not manifest["entries"]:
         raise ValueError("manifest must contain experts")
+    if manifest.get("expert_order"):
+        raise ValueError("input raw manifest already contains expert_order; pack from an identity raw extract")
     groups: dict[str, list[dict]] = {}
     for entry in manifest["entries"]:
         name = entry["repacked_file"]
@@ -72,6 +78,15 @@ def main() -> int:
         if relative_file(source, name).stat().st_size != stride * count:
             raise ValueError(f"unexpected raw expert file size: {name}")
 
+    layers = sorted({int(entries[0]["layer"]) for entries in groups.values()})
+    for name, entries in groups.items():
+        layer_ids = {int(entry["layer"]) for entry in entries}
+        if len(layer_ids) != 1:
+            raise ValueError(f"expert file {name} mixes layers: {sorted(layer_ids)}")
+    order_by_layer = None
+    if args.expert_order is not None:
+        order_by_layer = load_expert_order(args.expert_order.expanduser().resolve(), layers, count)
+
     base = C.CDLL(str(libraries / "libggml-base.so"), mode=C.RTLD_GLOBAL)
     backend_path = libraries / "libggml-hexagon.so"
     backend = C.CDLL(str(backend_path), mode=C.RTLD_GLOBAL)
@@ -94,17 +109,19 @@ def main() -> int:
         with ExitStack() as stack:
             src = stack.enter_context(relative_file(source, name).open("rb"))
             out = stack.enter_context(atomic_file(relative_file(destination, name), "wb"))
-            for expert in range(count):
+            layer = int(entries[0]["layer"])
+            order = order_by_layer[layer] if order_by_layer is not None else list(range(count))
+            for position, logical in enumerate(order):
                 for entry, size in zip(entries, sizes):
-                    src.seek(entry["repacked_offset"] + expert * entry["expert_stride"])
+                    src.seek(entry["repacked_offset"] + logical * entry["expert_stride"])
                     raw = src.read(entry["bytes_per_expert"])
                     if len(raw) != entry["bytes_per_expert"]:
-                        raise ValueError(f"short read: {name}, expert {expert}")
+                        raise ValueError(f"short read: {name}, expert {logical}")
                     data = C.create_string_buffer(raw)
                     tiled = C.create_string_buffer(size)
                     written = pack(tiled, data, QUANT_TYPES[entry["quant_type"]], *entry["shape"][:2])
                     if written != size:
-                        raise ValueError(f"backend size mismatch: {name}, expert {expert}")
+                        raise ValueError(f"backend size mismatch: {name}, expert {logical}")
                     view = memoryview(tiled).cast("B")
                     out.write(view)
                     digest.update(view)
@@ -124,6 +141,15 @@ def main() -> int:
         "backend_sha256": backend_digest.hexdigest(),
         "files_sha256": checksums,
     }
+    if order_by_layer is not None:
+        canonical = json.dumps({str(layer): order_by_layer[layer] for layer in layers},
+                               sort_keys=True, separators=(",", ":")).encode()
+        result["expert_order"] = {
+            "format": "dpsk-pack-order-v1",
+            "direction": "position_to_logical",
+            "orders_sha256": hashlib.sha256(canonical).hexdigest(),
+            "orders": {str(layer): order_by_layer[layer] for layer in layers},
+        }
     with atomic_file(destination / "manifest.json", "w") as output:
         json.dump(result, output, indent=2)
         output.write("\n")

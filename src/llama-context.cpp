@@ -412,6 +412,16 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    if (sched) {
+        if (moe_slots) {
+            // Finish reads from the slot runtime before releasing its context lease.
+            ggml_backend_sched_synchronize(sched.get());
+        }
+        // aux logits / pre-norm rows may still be in flight from the last llama_decode(); the
+        // output host buffers are members and are destroyed after this body, so synchronize
+        // before the scheduler and buffers go away even if the caller never read the aux output.
+        synchronize();
+    }
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -1114,7 +1124,16 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
         if (reg) {
             auto * set_abort_callback_fn = (ggml_backend_set_abort_callback_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_abort_callback");
             if (set_abort_callback_fn) {
-                set_abort_callback_fn(backend.get(), this->abort_callback, this->abort_callback_data);
+                if (moe_slots && backend.get() == backend_cpu) {
+                    // The CPU custom op reports an expert-load failure before the next split runs.
+                    set_abort_callback_fn(backend.get(), [](void * data) {
+                        auto & ctx = *static_cast<llama_context *>(data);
+                        return ctx.moe_slots->graph_failed() ||
+                            (ctx.abort_callback && ctx.abort_callback(ctx.abort_callback_data));
+                    }, this);
+                } else {
+                    set_abort_callback_fn(backend.get(), this->abort_callback, this->abort_callback_data);
+                }
             }
         }
     }
@@ -1145,6 +1164,206 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
     // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
     sched_need_reserve = true;
+}
+
+void llama_context::set_aux_head(uint32_t n_rows) {
+    LLAMA_LOG_DEBUG("%s: n_rows = %u\n", __func__, n_rows);
+
+    GGML_ASSERT(n_rows <= LLAMA_MAX_AUX_ROWS);
+
+    if (n_rows > 0 && model.arch != LLM_ARCH_QWEN35MOE) {
+        // the aux head rows are implemented in the qwen35moe graph; other archs would silently
+        // ignore them (no t_aux_logits, llama_get_aux_logits keeps returning nullptr)
+        LLAMA_LOG_WARN("%s: aux head rows are only implemented for the qwen35moe graph (arch = %s)\n",
+                __func__, llm_arch_name(model.arch));
+    }
+
+    if (aux_head.n_rows == n_rows) {
+        return;
+    }
+
+    // an async aux-logits/top-k readback may still be in flight into the old host buffers
+    if (aux_head.n_rows > 0) {
+        synchronize();
+    }
+    // the old rows (and their row count/stride) are no longer valid for either channel
+    std::fill(aux_head.logits_valid.begin(), aux_head.logits_valid.end(), 0);
+    std::fill(aux_head.top_k_valid.begin(), aux_head.top_k_valid.end(), 0);
+
+    // The device top-k channel is defined for exactly 3 aux rows. If the new row count is anything
+    // else, drop it here: otherwise output_reserve() would skip the host logits buffer (top_k != 0)
+    // while the graph no longer emits the top-k ops, leaving both channels unreadable.
+    if (aux_head.top_k > 0 && n_rows != 3) {
+        aux_head.top_k = 0;
+        aux_head.top_k_ids .clear();
+        aux_head.top_k_vals.clear();
+        aux_head.top_k_valid.clear();
+    }
+
+    const int64_t  n_embd    = model.hparams.n_embd;
+    const uint32_t n_seq_max = this->n_seq_max();
+
+    aux_head.n_rows = n_rows;
+
+    if (n_rows > 0) {
+        // allocate the seq-major host buffer once per row count so that the pointer handed to the
+        // graph through llm_graph_params stays stable across decodes (it participates in graph reuse)
+        aux_head.hidden.assign((size_t) n_rows*n_embd*n_seq_max, 0.0f);
+        aux_head.hidden_valid.assign(n_seq_max, 0);
+    } else {
+        aux_head.hidden.clear();
+        aux_head.hidden.shrink_to_fit();
+        aux_head.hidden_valid.clear();
+
+        aux_head.logits = {nullptr, 0};
+        aux_head.logits_valid.clear();
+    }
+
+    // the LM head shape changed -> rebuild + re-reserve the worst-case graphs
+    sched_need_reserve = true;
+}
+
+void llama_context::set_aux_top_k(uint32_t k) {
+    LLAMA_LOG_DEBUG("%s: k = %u\n", __func__, k);
+
+    if (k > 0) {
+        GGML_ASSERT(aux_head.n_rows == 3 && "T20: the device top-k channel is defined for 3 aux rows");
+        GGML_ASSERT(k <= 4096);
+    }
+
+    if (aux_head.top_k == k) {
+        return;
+    }
+
+    // a previous decode can still have an async readback in flight into top_k_ids/top_k_vals;
+    // reallocating (or freeing) those buffers before the copy completes would write to freed
+    // memory. Sequential use from a single thread does not order the backend copy.
+    if (aux_head.n_rows > 0) {
+        synchronize();
+        if (aux_head.top_k > 0) {
+            std::fill(aux_head.top_k_valid.begin(), aux_head.top_k_valid.end(), 0);
+        }
+    }
+    // switching either channel invalidates both outputs for this decode generation
+    std::fill(aux_head.logits_valid.begin(), aux_head.logits_valid.end(), 0);
+
+    aux_head.top_k = k;
+
+    const size_t n_seq_max = this->n_seq_max();
+    if (k > 0) {
+        aux_head.top_k_ids .assign(n_seq_max*3*k, 0);
+        aux_head.top_k_vals.assign(n_seq_max*4*k, 0.0f);
+        aux_head.top_k_valid.assign(n_seq_max, 0);
+    } else {
+        aux_head.top_k_ids .clear();
+        aux_head.top_k_vals.clear();
+        aux_head.top_k_valid.clear();
+    }
+
+    // the head graph changed (top_k ops added/removed) -> re-reserve
+    sched_need_reserve = true;
+}
+
+uint32_t llama_context::n_aux_top_k() const {
+    return aux_head.top_k;
+}
+
+const int32_t * llama_context::get_aux_top_k_ids(llama_seq_id seq_id) {
+    synchronize();
+
+    if (aux_head.top_k == 0 || seq_id < 0 || (size_t) seq_id >= aux_head.top_k_valid.size()) {
+        return nullptr;
+    }
+    if (!aux_head.top_k_valid[seq_id]) {
+        return nullptr;
+    }
+    return aux_head.top_k_ids.data() + (size_t) seq_id*3*aux_head.top_k;
+}
+
+const float * llama_context::get_aux_top_k_vals(llama_seq_id seq_id) {
+    synchronize();
+
+    if (aux_head.top_k == 0 || seq_id < 0 || (size_t) seq_id >= aux_head.top_k_valid.size()) {
+        return nullptr;
+    }
+    if (!aux_head.top_k_valid[seq_id]) {
+        return nullptr;
+    }
+    return aux_head.top_k_vals.data() + (size_t) seq_id*4*aux_head.top_k;
+}
+
+bool llama_context::set_aux_hidden(llama_seq_id seq_id, const float * data) {
+    if (aux_head.n_rows == 0) {
+        return false;
+    }
+
+    if (seq_id < 0 || seq_id >= (llama_seq_id) this->n_seq_max()) {
+        LLAMA_LOG_ERROR("%s: invalid seq_id = %d (n_seq_max = %u)\n", __func__, seq_id, this->n_seq_max());
+        return false;
+    }
+
+    const size_t block = (size_t) aux_head.n_rows*model.hparams.n_embd;
+
+    float * dst = aux_head.hidden.data() + (size_t) seq_id*block;
+
+    if (data == nullptr) {
+        // clear this sequence's rows, so that a stale upload can never leak into a later decode
+        std::fill(dst, dst + block, 0.0f);
+        if ((size_t) seq_id < aux_head.hidden_valid.size()) {
+            aux_head.hidden_valid[seq_id] = 0;
+        }
+    } else {
+        std::copy(data, data + block, dst);
+        if ((size_t) seq_id < aux_head.hidden_valid.size()) {
+            aux_head.hidden_valid[seq_id] = 1;
+        }
+    }
+
+    return true;
+}
+
+void llama_context::clear_aux_seq(llama_seq_id seq_id) {
+    if (seq_id < 0) {
+        return;
+    }
+    if ((size_t) seq_id < aux_head.hidden_valid.size()) {
+        aux_head.hidden_valid[seq_id] = 0;
+    }
+    if ((size_t) seq_id < aux_head.logits_valid.size()) {
+        aux_head.logits_valid[seq_id] = 0;
+    }
+    if ((size_t) seq_id < aux_head.top_k_valid.size()) {
+        aux_head.top_k_valid[seq_id] = 0;
+    }
+}
+
+void llama_context::aux_decode_abort() {
+    std::fill(aux_head.hidden_valid.begin(), aux_head.hidden_valid.end(), 0);
+    std::fill(aux_head.logits_valid.begin(), aux_head.logits_valid.end(), 0);
+    std::fill(aux_head.top_k_valid.begin(), aux_head.top_k_valid.end(), 0);
+}
+
+uint32_t llama_context::n_aux_rows() const {
+    return aux_head.n_rows;
+}
+
+float * llama_context::get_aux_logits(llama_seq_id seq_id) {
+    synchronize();
+
+    if (aux_head.n_rows == 0 || !aux_head.logits.has_data()) {
+        return nullptr;
+    }
+
+    if (seq_id < 0 || (size_t) seq_id >= aux_head.logits_valid.size()) {
+        return nullptr;
+    }
+
+    if (!aux_head.logits_valid[seq_id]) {
+        // this sequence did not get aux logits from the last decode
+        return nullptr;
+    }
+
+    return aux_head.logits.data + (size_t) seq_id*aux_head.n_rows*model.vocab.n_tokens();
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -1666,6 +1885,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
         const uint32_t n_embd = hparams.n_embd;
         GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_pre_norm.size);
         ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm.data, 0, n_tokens*n_embd*sizeof(float));
+        embd_pre_norm_valid = true;
     }
 
     // TODO: hacky solution
@@ -1802,6 +2022,18 @@ static void copy_tensor_async_candidates(
     }
 }
 
+// backend of a tensor that may be a view: views are not assigned a backend of their own by the
+// scheduler, they live on the backend of their view source (e.g. the aux logits view of the head matmul)
+static ggml_backend_t sched_tensor_backend(ggml_backend_sched_t sched, ggml_tensor * t) {
+    while (t != nullptr) {
+        if (ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, t)) {
+            return backend;
+        }
+        t = t->view_src;
+    }
+    return nullptr;
+}
+
 static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, llama_sampler *> & samplers) {
     for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
         if (!ubatch.output[i]) {
@@ -1832,6 +2064,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
+    }
+
+    // A failed/cancelled decode must not leave a pending aux upload or stale readback behind.
+    // Success is committed at the single return 0 below; every other exit discards the channel.
+    struct aux_decode_guard {
+        llama_context * ctx;
+        bool ok = false;
+        ~aux_decode_guard() { if (!ok) ctx->aux_decode_abort(); }
+    } aux_guard{this};
+
+    embd_pre_norm_valid = false;
+
+    // readbacks of the previous decode are invalid before this new verify starts
+    if (!aux_head.logits_valid.empty()) {
+        std::fill(aux_head.logits_valid.begin(), aux_head.logits_valid.end(), 0);
+    }
+    if (!aux_head.top_k_valid.empty()) {
+        std::fill(aux_head.top_k_valid.begin(), aux_head.top_k_valid.end(), 0);
     }
 
     const auto & vocab   = model.vocab;
@@ -2045,9 +2295,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         // extract logits
         if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
-            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+            // resolve the backend through the view source (t_logits can be a graph output)
+            ggml_backend_t backend_res = sched_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
+
+            // The graph may intentionally produce fewer rows than the batch requested (A4 head
+            // only covers head_k rows). Validate before the copy instead of relying on the caller
+            // to keep n_outputs in sync with the tensor shape.
+            if (n_outputs > t_logits->ne[1]) {
+                LLAMA_LOG_ERROR("%s: n_outputs=%d exceeds logits tensor rows=%" PRId64 "\n",
+                        __func__, (int) n_outputs, t_logits->ne[1]);
+                return -1;
+            }
 
             float * logits_out = logits.data + n_outputs_prev*n_vocab;
 
@@ -2055,6 +2315,30 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+            }
+        }
+
+        // extract aux head logits (draft-pool A4) - independent channel, never mixed with t_logits
+        if (aux_head.n_rows > 0) {
+            if (n_outputs > 0) {
+                if (aux_head.top_k > 0) {
+                    // T20: only ids + shared-candidate values cross the bus; the F32 logits stay on device
+                    if (res->get_aux_top_k_ids() != nullptr) {
+                        extract_aux_top_k(res, ubatch);
+                    }
+                } else if (aux_head.logits.data != nullptr && res->get_aux_logits() != nullptr) {
+                    extract_aux_logits(res, ubatch);
+                }
+            }
+
+            // any decode consumes a pending hidden upload - even one that produced no valid aux
+            // output (n_outputs == 0, missing channel, prefill). It must not survive to the next
+            // request and be mistaken for a fresh verify source.
+            for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+                const llama_seq_id seq_id = ubatch.seq_id_unq[s];
+                if (seq_id >= 0 && (size_t) seq_id < aux_head.hidden_valid.size()) {
+                    aux_head.hidden_valid[seq_id] = 0;
+                }
             }
         }
 
@@ -2136,6 +2420,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_pre_norm.size);
                 ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm_out, 0, n_rows*n_embd*sizeof(float));
+                embd_pre_norm_valid = true;
             }
         }
 
@@ -2209,6 +2494,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
+    aux_guard.ok = true;
     return 0;
 }
 
@@ -2241,6 +2527,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     size_t backend_token_count = 0;
     size_t embd_layer_inp_float_count = 0;
 
+    // target aux LM-head logits (draft-pool A4): one [n_rows][n_vocab] block per sequence,
+    // kept in a channel fully separate from the verify logits above
+    // T20: with the device top-k channel the [n_rows][n_vocab] F32 staging buffer is unused
+    const bool   has_aux_logits  = aux_head.n_rows > 0 && aux_head.top_k == 0;
+    const size_t aux_logits_size = has_aux_logits ? (size_t) n_vocab*aux_head.n_rows*n_seq_max() : 0;
+
     logits.size        = has_logits        ? n_vocab*n_outputs_max     : 0;
     embd.size          = has_embd          ? n_embd_out*n_outputs_max  : 0;
     embd_pre_norm.size = has_embd_pre_norm ? n_embd*n_outputs_max      : 0;
@@ -2271,7 +2563,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
-        (logits.size + embd.size + embd_pre_norm.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
+        (logits.size + embd.size + embd_pre_norm.size + embd_layer_inp_float_count + backend_float_count + aux_logits_size) * sizeof(float) +
         (                                                                         backend_token_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
@@ -2292,6 +2584,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             for (auto & layer_inp : embd_layer_inp) {
                 layer_inp = {nullptr, 0};
             }
+            aux_head.logits = {nullptr, 0};
         }
 
         auto * buft = ggml_backend_cpu_buffer_type();
@@ -2330,6 +2623,18 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         } else {
             embd_layer_inp[il] = buffer_view<float>{nullptr, 0};
         }
+    }
+
+    // aux head logits (draft-pool A4), one [n_rows][n_vocab] block per sequence
+    if (has_aux_logits) {
+        aux_head.logits = buffer_view<float>{(float *) (base + offset), aux_logits_size};
+        offset += aux_logits_size * sizeof(float);
+
+        // the buffer may have been reallocated (stale data) - never report it as valid
+        aux_head.logits_valid.assign(n_seq_max(), 0);
+    } else {
+        aux_head.logits = buffer_view<float>{nullptr, 0};
+        aux_head.logits_valid.clear();
     }
 
     if (has_sampling) {
@@ -2402,6 +2707,90 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         GGML_ASSERT(backend != nullptr);
         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
     }
+}
+
+void llama_context::extract_aux_logits(const llm_graph_result * res, const llama_ubatch & ubatch) {
+    ggml_tensor * t_aux_logits = res->get_aux_logits();
+
+    if (t_aux_logits == nullptr) {
+        return;
+    }
+
+    const int64_t n_vocab = model.vocab.n_tokens();
+    const size_t  n_rows  = aux_head.n_rows;
+
+    GGML_ASSERT(ubatch.n_seqs_unq > 0);
+    GGML_ASSERT(t_aux_logits->ne[1] == (int64_t) ubatch.n_seqs_unq*n_rows);
+
+    // t_aux_logits is the independent aux head matmul output
+    ggml_backend_t backend = sched_tensor_backend(sched.get(), t_aux_logits);
+    GGML_ASSERT(backend != nullptr);
+
+    const size_t row_bytes = (size_t) n_vocab*sizeof(float);
+    const size_t seq_bytes = n_rows*row_bytes;
+
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+        const llama_seq_id seq_id = ubatch.seq_id_unq[s];
+
+        // the host logits channel is indexed by cparams.n_seq_max, not LLAMA_MAX_SEQ: a unified-KV
+        // decode may legally carry a seq_id above that capacity, which has no aux output slot
+        if (seq_id < 0 || (size_t) seq_id >= aux_head.logits_valid.size()) {
+            continue;
+        }
+
+        // only a sequence whose aux rows were uploaded for this verify may publish aux logits;
+        // a prefill decode or a stale upload must not become the next pool source
+        if ((size_t) seq_id >= aux_head.hidden_valid.size() || !aux_head.hidden_valid[seq_id]) {
+            continue;
+        }
+
+        const size_t dst_off = (size_t) seq_id*n_rows*n_vocab;
+        GGML_ASSERT(dst_off + n_rows*n_vocab <= aux_head.logits.size);
+
+        // row block s of the view <-> sequence seq_id
+        ggml_backend_tensor_get_async(backend, t_aux_logits, aux_head.logits.data + dst_off, (size_t) s*seq_bytes, seq_bytes);
+
+        aux_head.logits_valid[seq_id] = 1;
+        // the upload has been consumed by this decode; it must not be reused by the next one
+        aux_head.hidden_valid[seq_id] = 0;
+    }
+}
+
+void llama_context::extract_aux_top_k(const llm_graph_result * res, const llama_ubatch & ubatch) {
+    ggml_tensor * t_ids  = res->get_aux_top_k_ids();
+    ggml_tensor * t_vals = res->get_aux_top_k_vals();
+
+    if (t_ids == nullptr || t_vals == nullptr || aux_head.top_k == 0) {
+        return;
+    }
+
+    // prototype: the target graph builds the top-k channel for a single sequence only
+    GGML_ASSERT(ubatch.n_seqs_unq == 1 && "T20: aux top-k channel supports n_seqs_unq == 1");
+
+    const uint32_t k = aux_head.top_k;
+    GGML_ASSERT(t_ids ->ne[0] == 3*(int64_t) k);
+    GGML_ASSERT(t_vals->ne[0] == 4*(int64_t) k);
+
+    const llama_seq_id seq_id = ubatch.seq_id_unq[0];
+    // the top-k channel has one slot per cparams.n_seq_max; skip legal unified-KV ids above it
+    if (seq_id < 0 || (size_t) seq_id >= aux_head.top_k_valid.size()) {
+        return;
+    }
+
+    // same rule as the F32 channel: only an upload made for this verify may become a pool source
+    if ((size_t) seq_id >= aux_head.hidden_valid.size() || !aux_head.hidden_valid[seq_id]) {
+        return;
+    }
+
+    ggml_backend_t backend_ids  = sched_tensor_backend(sched.get(), t_ids);
+    ggml_backend_t backend_vals = sched_tensor_backend(sched.get(), t_vals);
+    GGML_ASSERT(backend_ids != nullptr && backend_vals != nullptr);
+
+    ggml_backend_tensor_get_async(backend_ids,  t_ids,  aux_head.top_k_ids .data() + (size_t) seq_id*3*k, 0, (size_t) 3*k*sizeof(int32_t));
+    ggml_backend_tensor_get_async(backend_vals, t_vals, aux_head.top_k_vals.data() + (size_t) seq_id*4*k, 0, (size_t) 4*k*sizeof(float));
+
+    aux_head.top_k_valid[seq_id] = 1;
+    aux_head.hidden_valid[seq_id] = 0;
 }
 
 void llama_context::output_reorder() {
@@ -2527,7 +2916,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type), /*reserve=*/ true);
 
     res->reset();
 
@@ -2555,9 +2944,11 @@ llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const {
+                          llm_graph_type   gtype,
+                          bool             reserve) const {
     return {
         /*.arch        =*/ model.arch,
+        /*.ctx         =*/ this,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
         /*.ubatch      =*/ ubatch,
@@ -2578,6 +2969,26 @@ llm_graph_params llama_context::graph_params(
         /*.moe_decode_phase =*/ moe_slots != nullptr && moe_slots->decode_window() > 0 &&
                                 ubatch.n_tokens <= moe_slots->window_max_rows(),
         /*.cross       =*/ &cross,
+        // draft-pool A4: aux head rows. The rows are not part of the batch; the graph only needs
+        // the row count and the stable host buffer pointer. Both are part of allow_reuse(), so
+        // enabling/disabling aux rows (or reallocating the host buffer) rebuilds the graph.
+        /*.aux_rows    =*/ aux_head.n_rows,
+        /*.aux_hidden  =*/ aux_head.n_rows > 0 && !aux_head.hidden.empty() ? aux_head.hidden.data() : nullptr,
+        /*.aux_n_seq_max =*/ (uint32_t) this->n_seq_max(),
+        /*.aux_valid   =*/ aux_head.n_rows > 0 && !aux_head.hidden_valid.empty() ? aux_head.hidden_valid.data() : nullptr,
+        /*.aux_top_k   =*/ aux_head.top_k,
+        // draft-pool A4 topology: context-owned, part of allow_reuse(). The mutable pool contents
+        // (ids/anchor/mode) are read by the graph input from the same context at set_input().
+        /*.a4_armed     =*/ dflash_a4_state.armed,
+        // Only the real draft decode may carry the per-decode marker. graph_reserve() builds a
+        // dummy batch (cparams.n_ubatch rows); passing the marker there would make DFlash reject
+        // the reservation graph before the actual A4 block is ever decoded.
+        /*.a4_decode    =*/ !reserve && dflash_a4_state.decode_active,
+        /*.a4_pool_mode =*/ dflash_a4_state.pool_mode,
+        /*.a4_n_pool    =*/ dflash_a4_state.n_pool,
+        /*.a4_head_k    =*/ dflash_a4_state.head_k,
+        /*.a4_aux_rows  =*/ dflash_a4_state.aux_rows,
+        /*.a4_block_rows=*/ dflash_a4_state.block_rows,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -2605,7 +3016,14 @@ ggml_status llama_context::graph_compute(
     }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    if (moe_slots && moe_slots->clear_graph_error()) {
+        status = GGML_STATUS_FAILED;
+    }
     if (status != GGML_STATUS_SUCCESS) {
+        if (moe_slots) {
+            ggml_backend_sched_synchronize(sched.get());
+            moe_slots->discard_deferred();
+        }
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
@@ -3911,6 +4329,10 @@ float * llama_get_embeddings_pre_norm(llama_context * ctx) {
     return ctx->get_embeddings_pre_norm();
 }
 
+bool llama_pre_norm_valid(const llama_context * ctx) {
+    return ctx != nullptr && ctx->pre_norm_valid();
+}
+
 float * llama_get_embeddings_pre_norm_ith(llama_context * ctx, int32_t i) {
     ctx->synchronize();
 
@@ -3925,6 +4347,46 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
     ctx->synchronize();
 
     return ctx->get_embeddings_layer_inp(lid);
+}
+
+//
+// target aux LM-head rows (draft-pool A4) - see llama-ext.h for the layout contract
+//
+
+void llama_set_aux_head(llama_context * ctx, uint32_t n_rows) {
+    ctx->set_aux_head(n_rows);
+}
+
+bool llama_set_aux_hidden(llama_context * ctx, llama_seq_id seq_id, const float * data) {
+    return ctx->set_aux_hidden(seq_id, data);
+}
+
+void llama_aux_clear_seq(llama_context * ctx, llama_seq_id seq_id) {
+    ctx->clear_aux_seq(seq_id);
+}
+
+void llama_set_aux_top_k(llama_context * ctx, uint32_t k) {
+    ctx->set_aux_top_k(k);
+}
+
+uint32_t llama_n_aux_top_k(const llama_context * ctx) {
+    return ctx->n_aux_top_k();
+}
+
+const int32_t * llama_aux_top_k_ids(llama_context * ctx, llama_seq_id seq_id) {
+    return ctx->get_aux_top_k_ids(seq_id);
+}
+
+const float * llama_aux_top_k_vals(llama_context * ctx, llama_seq_id seq_id) {
+    return ctx->get_aux_top_k_vals(seq_id);
+}
+
+uint32_t llama_n_aux_rows(const llama_context * ctx) {
+    return ctx->n_aux_rows();
+}
+
+float * llama_get_aux_logits(llama_context * ctx, llama_seq_id seq_id) {
+    return ctx->get_aux_logits(seq_id);
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {

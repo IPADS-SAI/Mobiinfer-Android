@@ -140,6 +140,52 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_aux::set_input(const llama_ubatch * ubatch) {
+    GGML_ASSERT(aux);
+    GGML_ASSERT(host);
+    GGML_ASSERT(n_seqs == ubatch->n_seqs_unq);
+    GGML_ASSERT(aux->ne[0] == n_embd);
+    GGML_ASSERT(aux->ne[1] == (int64_t) n_rows*n_seqs);
+
+    const size_t seq_bytes = (size_t) n_rows*n_embd*sizeof(float);
+
+    // copy each sequence's block from its seq-major slot in the host buffer into the graph rows,
+    // ordered by ubatch.seq_id_unq (same order the extraction side uses).
+    //
+    // With a unified KV cache the ubatch can legally contain seq_id values above cparams.n_seq_max
+    // (the host buffer capacity), and a sequence may have no uploaded rows at all. Validate the
+    // index against both bounds BEFORE forming the address; write zeros for anything not valid so
+    // the graph rows are deterministic and no host memory outside aux_hidden is read.
+    std::vector<float> zeros(seq_bytes/sizeof(float), 0.0f);
+    for (uint32_t s = 0; s < ubatch->n_seqs_unq; ++s) {
+        const llama_seq_id seq_id = ubatch->seq_id_unq[s];
+        const bool in_range = seq_id >= 0 && (uint32_t) seq_id < n_seq_max;
+        const bool uploaded = in_range && valid != nullptr && valid[seq_id] != 0;
+
+        if (uploaded) {
+            ggml_backend_tensor_set(aux, host + (int64_t) seq_id*(n_rows*n_embd),
+                    (size_t) s*seq_bytes, seq_bytes);
+        } else {
+            ggml_backend_tensor_set(aux, zeros.data(), (size_t) s*seq_bytes, seq_bytes);
+        }
+    }
+}
+
+bool llm_graph_input_aux::can_reuse(const llm_graph_params & params) {
+    bool res = true;
+
+    // a different number of rows, capacity, validity bitmap or host buffer needs a rebuild
+    res &= params.aux_rows      == n_rows;
+    res &= params.aux_hidden    == host;
+    res &= params.aux_n_seq_max == n_seq_max;
+    res &= params.aux_valid     == valid;
+
+    // one n_rows block per unique sequence in the ubatch
+    res &= aux != nullptr && aux->ne[1] == (int64_t) n_rows*params.ubatch.n_seqs_unq;
+
+    return res;
+}
+
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -914,6 +960,9 @@ void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
+    t_aux_logits  = nullptr;
+    t_aux_top_k_ids  = nullptr;
+    t_aux_top_k_vals = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_pre_norm  = nullptr;
@@ -952,6 +1001,15 @@ void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
 void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_logits != nullptr) {
         ggml_set_output(t_logits);
+    }
+    if (t_aux_logits != nullptr) {
+        ggml_set_output(t_aux_logits);
+    }
+    if (t_aux_top_k_ids != nullptr) {
+        ggml_set_output(t_aux_top_k_ids);
+    }
+    if (t_aux_top_k_vals != nullptr) {
+        ggml_set_output(t_aux_top_k_vals);
     }
     if (t_embd != nullptr) {
         ggml_set_output(t_embd);
@@ -1069,6 +1127,11 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     n_tokens         (ubatch.n_tokens),
     n_outputs        (params.n_outputs),
     n_ctx_orig       (cparams.n_ctx_orig_yarn),
+    n_aux_rows       (params.aux_rows),
+    n_aux_total      ((int64_t) params.aux_rows*ubatch.n_seqs_unq),
+    aux_hidden       (params.aux_hidden),
+    aux_n_seq_max    (params.aux_n_seq_max),
+    aux_valid        (params.aux_valid),
     pooling_type     (cparams.pooling_type),
     rope_type        (hparams.rope_type),
     sched            (params.sched),
@@ -1630,39 +1693,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    const bool use_slots = moe_slots && moe_slots->uses_layer(il);
+    const bool split_experts = use_slots && moe_decode_phase && moe_slots->matmul_split() > 0 &&
+        type_op == LLM_FFN_SILU &&
+        !weight_before_ffn && !gate_up_exps && gate_exps && up_exps && down_exps &&
+        !up_exps_b && !gate_exps_b && !down_exps_b &&
+        !up_exps_s && !gate_exps_s && !down_exps_s &&
+        n_expert_used > moe_slots->matmul_split();
     ggml_tensor * selected_experts_mm = selected_experts;
-    if (moe_slots && moe_slots->uses_layer(il)) {
-        selected_experts_mm = moe_slots->build_slot_ids_tensor(ctx0, selected_experts, il);
+    if (use_slots) {
+        selected_experts_mm = moe_slots->build_slot_ids_tensor(ctx0, selected_experts, il, split_experts);
         cb(selected_experts_mm, "ffn_moe_slots", il);
     }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
-    // ── A2：把 MoE 拆成两段，让「已驻留专家」的计算盖住「缺失专家」的读取 ──
-    //
-    // 结构（Metal 按 split 提交，所以这个顺序天然产生重叠）：
-    //   MTL0: [位置 0..split_at) 的 gate/up → swiglu → down    ← 提交后立刻开算
-    //   CPU : phase B 节点 —— 读那些被延后的缺失专家              ← 与上面的 GPU 重叠
-    //   MTL0: [位置 split_at..8) 同样的链
-    //   MTL0: concat 回原顺序 → 加权 → 求和
-    //
-    // 只拆 ids、不拆 weights：weights 是 [1, n_expert_used, n_tokens]，expert 维
-    // 与 token 维的步长交错，切出来是非连续视图（ggml 会断言）。concat 回原顺序后
-    // 再整体加权，求和顺序与不拆完全一致 —— 输出可逐字节校验。
-    //
-    // 只在「没有 bias / 没有 per-expert scale / 没有合并 gate_up」时启用，
-    // 其它情况回退到原路径。
-    // 只在 **decode 阶段**启用，用引擎既有的 `moe_decode_phase`（图缓存 key 的一部分）
-    // 而不是自己判断 n_tokens —— prefill 与 decode 本来就不必走同一套逻辑：
-    //   - prefill 是带宽受限（93% 时间在读），重叠延迟没有意义，反而多一次 matmul
-    //   - prefill 走 mul_mm_id，它的 map0 kernel 只对特定 ne20 预编译
-    //     （实测 ne20=7/5 编译失败），decode 走 mul_mv_id 没这个限制
-    if (moe_decode_phase &&
-        moe_slots && moe_slots->uses_layer(il) && moe_slots->matmul_split() > 0 &&
-        !weight_before_ffn && !gate_up_exps && gate_exps && up_exps && down_exps &&
-        !up_exps_b && !gate_exps_b && !down_exps_b &&
-        !up_exps_s && !gate_exps_s && !down_exps_s &&
-        (int) n_expert_used > moe_slots->matmul_split()) {
+    // Phase B can load its remaining experts once phase A has submitted its matmuls.
+    // Concatenate in router rank order before applying weights and reducing.
+    if (split_experts) {
         const int split_at = (int) n_expert_used - moe_slots->matmul_split();
         auto slice_ids = [&](ggml_tensor * t, int lo, int hi) {
             return ggml_view_2d(ctx0, t, hi - lo, n_tokens, t->nb[1], (size_t) lo * t->nb[0]);
@@ -1999,6 +2047,25 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     // make sure the produced embeddings are immediately materialized in the ggml graph
     // ref: https://github.com/ggml-org/llama.cpp/pull/18599
     ggml_build_forward_expand(gf, cur);
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_inp_aux() const {
+    GGML_ASSERT(n_aux_rows > 0 && n_aux_total > 0);
+    GGML_ASSERT(aux_hidden != nullptr);
+    GGML_ASSERT(ubatch.n_seqs_unq > 0);
+
+    auto inp = std::make_unique<llm_graph_input_aux>(n_embd, (uint32_t) n_aux_rows, ubatch.n_seqs_unq,
+            aux_hidden, aux_n_seq_max, aux_valid);
+
+    auto & cur = inp->aux;
+
+    cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_aux_total);
+    ggml_set_input(cur);
+    ggml_format_name(cur, "inp_aux_%d", (int) n_aux_rows);
+
+    res->add_input(std::move(inp));
 
     return cur;
 }

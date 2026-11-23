@@ -29,9 +29,11 @@
 #include "ggml-common.h"
 #include "hex-bitmap.h"
 #include "htp-ctx.h"
+#include "htp-opbuf-mask.h"
 #include "htp-dcache.h"
 #include "htp-ops.h"
 #include "htp_iface.h"
+#include "htp-caps.h"
 #include "work-queue.h"
 #include "htp-trace.h"
 #include "allreduce-ops.h"
@@ -800,6 +802,16 @@ AEEResult htp_iface_hwinfo(remote_handle64 handle, uint32_t * n_threads, uint32_
     return AEE_SUCCESS;
 }
 
+AEEResult htp_iface_capabilities(remote_handle64 handle, uint32_t * flags) {
+    (void) handle;
+    if (!flags) {
+        return AEE_EBADPARM;
+    }
+
+    *flags = HTP_CAP_BIT_Q3K_COMPACT | HTP_CAP_ROWNORM;
+    return AEE_SUCCESS;
+}
+
 static void htp_error_callback(dspqueue_t queue, int error, void * context) {
     // No errors expected on the DSP.
     FARF(ERROR, "Error callback: 0x%08x", (unsigned) error);
@@ -1088,14 +1100,16 @@ static int execute_op(struct htp_ops_context * octx) {
     return HTP_STATUS_NO_SUPPORT;
 }
 
-static inline bool reuse_buf(struct htp_context *ctx, uint32_t *m_reuse, struct htp_buf_desc *b) {
+static inline bool reuse_buf(struct htp_context *ctx, uint64_t *m_reuse, struct htp_buf_desc *b, struct htp_opbuf_stats *st) {
     b->base = NULL;
 
     for (uint32_t i=0; i<HTP_MAX_MMAPS; i++) {
         struct htp_mmap *m = ctx->mmap + i;
+        htp_opbuf_stats_scan(st, 1);
         if (m->size && m->fd == b->fd && m->flags == b->flags) {
             b->base   = m->base;
-            *m_reuse |= (1 << i);
+            htp_opbuf_mask_set(m_reuse, i);
+            htp_opbuf_stats_reuse(st);
             return true;
         }
     }
@@ -1103,10 +1117,11 @@ static inline bool reuse_buf(struct htp_context *ctx, uint32_t *m_reuse, struct 
     return false;
 }
 
-static inline void drop_mmap(struct htp_context *ctx, struct htp_mmap *m) {
+static inline void drop_mmap(struct htp_context *ctx, struct htp_mmap *m, struct htp_opbuf_stats *st) {
     if (m->size) {
         FARF(ALWAYS, "unmap : fd %u base 0x%llx size %llu", m->fd, (unsigned long long) m->base, (unsigned long long) m->size);
         htp_munmap(m->base, m->size, m->flags);
+        htp_opbuf_stats_drop(st, m->size);
         m->size = 0;
         m->base = 0;
         m->fd   = -1;
@@ -1114,12 +1129,13 @@ static inline void drop_mmap(struct htp_context *ctx, struct htp_mmap *m) {
     }
 }
 
-static inline bool mmap_buf(struct htp_context *ctx, struct htp_buf_desc *b) {
+static inline bool mmap_buf(struct htp_context *ctx, struct htp_buf_desc *b, struct htp_opbuf_stats *st) {
     if (b->base) return true; // already mapped
 
     // find unused mapping
     for (uint32_t i=0; i < HTP_MAX_MMAPS; i++) {
         struct htp_mmap *m = &ctx->mmap[i];
+        htp_opbuf_stats_scan(st, 1);
         if (!m->size) {
             uint64_t va = htp_mmap(b->fd, b->size, b->flags);
             if (va == 0) {
@@ -1131,6 +1147,7 @@ static inline bool mmap_buf(struct htp_context *ctx, struct htp_buf_desc *b) {
             m->fd     = b->fd;
             m->size   = b->size;
             m->flags  = b->flags;
+            htp_opbuf_stats_map(st, b->size);
 
             FARF(ALWAYS, "mmap : fd %u base 0x%llx size %llu flags 0x%x", m->fd, (unsigned long long) m->base, (unsigned long long) m->size, m->flags);
             return true;
@@ -1141,23 +1158,26 @@ static inline bool mmap_buf(struct htp_context *ctx, struct htp_buf_desc *b) {
     return false;
 }
 
-static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uint32_t n_bufs) {
-    uint32_t m_reuse = 0; // mmap reuse mask (index from ctx->mmap array)
+static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uint32_t n_bufs, struct htp_opbuf_stats *st) {
+    uint64_t m_reuse = 0; // mmap reuse mask (index from ctx->mmap array)
     uint32_t b_reuse = 0; // buf reuse count
 
     uint64_t m_vmem  = 0; // mapped vmem
     uint64_t e_vmem  = 0; // extra  vmem
 
+    htp_opbuf_stats_init(st, n_bufs, ctx->max_vmem);
+
     // See what we can reuse
     for (uint32_t i=0; i < n_bufs; i++) {
         struct htp_buf_desc *b = bufs + i;
-        if (reuse_buf(ctx, &m_reuse, b)) {
+        if (reuse_buf(ctx, &m_reuse, b, st)) {
             b_reuse++;
         } else if (!(b->flags & HTP_BUF_EXTENDED)) {
             e_vmem += b->size;
         }
         FARF(HIGH, "prep-buf #%u : pass0 fd %u base 0x%llx size %llu flags 0x%x", i, b->fd, (unsigned long long) b->base, (unsigned long long) b->size, b->flags);
     }
+    st->e_vmem = e_vmem;
 
     if (b_reuse == n_bufs) return; // all bufs reuse existing mappings
 
@@ -1167,6 +1187,7 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
             m_vmem += ctx->mmap[i].size;
         }
     }
+    st->m_vmem = m_vmem;
 
     FARF(HIGH, "prep-bufs : pass1 mmap-vmem %zu extra-vmem %zu max-vmem %zu : n-bufs %u b-reuse %u",
             (size_t) m_vmem, (size_t) e_vmem, (size_t) ctx->max_vmem, n_bufs, b_reuse);
@@ -1174,9 +1195,9 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
     if ((m_vmem + e_vmem) > ctx->max_vmem) {
         // Drop unused mappings
         for (uint32_t i=0; i < HTP_MAX_MMAPS; i++) {
-            bool used = m_reuse & (1<<i);
+            bool used = htp_opbuf_mask_test(m_reuse, i);
             if (!used && !(ctx->mmap[i].flags & HTP_BUF_EXTENDED)) {
-                drop_mmap(ctx, ctx->mmap + i);
+                drop_mmap(ctx, ctx->mmap + i, st);
             }
         }
     }
@@ -1185,7 +1206,7 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
     bool mmap_ok = true;
     for (uint32_t i=0; i < n_bufs; i++) {
         struct htp_buf_desc *b = bufs + i;
-        if (!mmap_buf(ctx, b)) {
+        if (!mmap_buf(ctx, b, st)) {
             mmap_ok = false;
             break;
         }
@@ -1194,10 +1215,11 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
 
     if (!mmap_ok) {
         // Attempt defragmentation: drop 32-bit mappings and remap (pass 2)
+        htp_opbuf_stats_defrag(st);
         FARF(HIGH, "prep-bufs : dropping 32-bit mappings to defragment address space");
         for (uint32_t i=0; i < HTP_MAX_MMAPS; i++) {
             if (!(ctx->mmap[i].flags & HTP_BUF_EXTENDED)) {
-                drop_mmap(ctx, ctx->mmap + i);
+                drop_mmap(ctx, ctx->mmap + i, st);
             }
         }
 
@@ -1206,7 +1228,7 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
             if (!(b->flags & HTP_BUF_EXTENDED)) {
                 b->base = 0;
             }
-            if (!mmap_buf(ctx, b)) {
+            if (!mmap_buf(ctx, b, st)) {
                 FARF(ERROR, "prep-bufs : mmap failed after defragmentation (fd %u size %llu)", b->fd, (unsigned long long) b->size);
                 abort();
             }
@@ -1342,7 +1364,8 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_L2FLUSH, 0);
 
     htp_trace_event_start(&ctx->trace[0], HTP_TRACE_EVT_BUFF, 0);
-    prep_op_bufs(ctx, bufs, n_bufs);
+    struct htp_opbuf_stats opbuf_stats;
+    prep_op_bufs(ctx, bufs, n_bufs, &opbuf_stats);
     htp_trace_event_stop(&ctx->trace[0], HTP_TRACE_EVT_BUFF, 0);
 
     prep_tensors(ctx, bufs, tens, n_tens);
@@ -1406,6 +1429,9 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     rsp.usecs        = batch_prof.usecs;
     rsp.cycles_start = batch_prof.cycles_start;
     rsp.cycles_stop  = batch_prof.cycles_stop;
+    rsp.abi_magic    = HTP_OPBATCH_ABI_MAGIC;
+    rsp.abi_reserved = 0;
+    rsp.opbuf        = opbuf_stats;
 
     if (ctx->profiler == HTP_PROF_TRACE) {
         for (uint32_t t = 0; t < ctx->n_threads; t++) {

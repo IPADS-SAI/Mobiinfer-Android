@@ -14,6 +14,9 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <cstdlib>
+#include <cerrno>
+#include <stdexcept>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0A00
@@ -299,10 +302,43 @@ struct common_params_model {
     std::string name        = ""; // in format <user>/<model>[:<tag>] (tag is optional)     // NOLINT
 };
 
+// G2-A4 (draft-pool) arm: how the draft LM head is applied
+enum common_speculative_pool_mode {
+    COMMON_SPECULATIVE_POOL_MODE_AUTO = 0, // pool iff the previous verify was fully accepted and the pool is valid
+    COMMON_SPECULATIVE_POOL_MODE_POOL,     // force pool (falls back to full when the pool is not valid)
+    COMMON_SPECULATIVE_POOL_MODE_FULL,     // force the full-vocab draft head/chain (current behavior)
+};
+
+// G2-A4: where the next round's pool logits come from
+enum common_speculative_pool_src {
+    COMMON_SPECULATIVE_POOL_SRC_AUTO   = 0, // target aux logits if available, else the dev-only draft fallback
+    COMMON_SPECULATIVE_POOL_SRC_TARGET,     // target aux logits only (real A4 arm)
+    COMMON_SPECULATIVE_POOL_SRC_DRAFT,      // DEV ONLY: draft's own full-vocab rows (not the A4 arm)
+};
+
+// G2-A4: default size of the first / shared candidate pools (user decision 2026-11-15: 512)
+#define COMMON_SPECULATIVE_POOL_SIZE_DEFAULT 512
+
 // draft-model-based speculative decoding parameters
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
+
+    // G2-A4 split of the runtime knobs that used to be all derived from n_max.
+    // 0 keeps the legacy behavior (block rows / candidates derived from n_max).
+    int32_t block_rows  = 0; // draft block rows: [anchor, MASK x (block_rows-1)], all in one ubatch
+    int32_t proposal_k  = 0; // tokens proposed to the target per cycle (block rows 0..proposal_k-1)
+    int32_t head_k      = 0; // block rows that go through the (restricted) draft LM head + Markov chain
+    int32_t aux_rows    = 0; // lookahead block rows (block_rows - head_k - 1) sent to the target aux head
+    // vocab rows kept per pool. NOTE: this only takes effect together with block_rows > 0, so the
+    // default value keeps every existing (non-A4) invocation unchanged; `--spec-pool-size 0` still
+    // disables the pool arm explicitly.
+    int32_t pool_size   = COMMON_SPECULATIVE_POOL_SIZE_DEFAULT;
+
+    common_speculative_pool_mode pool_mode = COMMON_SPECULATIVE_POOL_MODE_AUTO;
+    common_speculative_pool_src  pool_src  = COMMON_SPECULATIVE_POOL_SRC_AUTO;
+
+    bool a4() const { return block_rows > 0 && pool_size > 0; }
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
@@ -326,6 +362,67 @@ struct common_params_speculative_draft {
 
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 };
+
+// Resolve the A4 block shape from the raw flags. This is intentionally independent of the model:
+// it runs during argument parsing / before the target context is created, so an obviously invalid
+// or huge proposal_k cannot first allocate a huge recurrent snapshot ring. `block_rows` is passed
+// explicitly because the speculator later calls this again after clamping to the trained block.
+struct common_a4_shape {
+    int32_t block_rows = 0;
+    int32_t proposal_k = 0;
+    int32_t head_k     = 0;
+    int32_t aux_rows   = 0;
+};
+
+static inline common_a4_shape common_a4_resolve_shape(
+        const common_params_speculative_draft & d, int32_t block_rows, int32_t n_max) {
+    const int64_t proposal_k = d.proposal_k > 0 ? (int64_t) d.proposal_k : (int64_t) std::max(0, n_max);
+    const int64_t head_k     = d.head_k     > 0 ? (int64_t) d.head_k     : proposal_k;
+    const int64_t aux_rows   = d.aux_rows   > 0 ? (int64_t) d.aux_rows
+                                                : (int64_t) block_rows - head_k - 1;
+
+    auto invalid = [&](const std::string & why) -> void {
+        throw std::invalid_argument(std::string("G2-A4 invalid shape (") +
+                "block_rows=" + std::to_string(block_rows) +
+                ", proposal_k=" + std::to_string(proposal_k) +
+                ", head_k=" + std::to_string(head_k) +
+                ", aux_rows=" + std::to_string(aux_rows) + "): " + why);
+    };
+
+    // The recurrent ring has at most A4_RS_SEQ_MAX = 64 entries; proposal_k + 1 must fit.
+    // Do this before any model/context allocation and use int64 arithmetic for 2*head_k.
+    if (proposal_k <= 0 || proposal_k > 63) {
+        invalid("proposal_k must be in [1, 63]");
+    }
+    if (block_rows <= 0 || block_rows > 64 || head_k <= 0 || head_k >= block_rows) {
+        invalid("need 0 < block_rows <= 64 and 0 < head_k < block_rows "
+                "(the A4 output-mask/graph helper is 64 rows wide)");
+    }
+    if (proposal_k > head_k) {
+        invalid("proposal_k must be <= head_k");
+    }
+    if (d.pool_mode != COMMON_SPECULATIVE_POOL_MODE_FULL && head_k != proposal_k) {
+        invalid("a real aux pool requires head_k == proposal_k; the aux rows are the lookahead "
+                "after the proposal row, so another head_k silently misaligns the first-candidate "
+                "pool (use --spec-pool-mode full for a full-only head configuration)");
+    }
+    if (aux_rows <= 0 || aux_rows > 32) {
+        invalid("aux_rows must be in [1, 32]");
+    }
+    if (aux_rows != (int64_t) block_rows - head_k - 1) {
+        invalid("aux_rows must equal block_rows - head_k - 1 (the trailing lookahead rows)");
+    }
+    if (head_k < aux_rows) {
+        invalid("head_k must be >= aux_rows; the pre-norm packing reserves head_k slots");
+    }
+    // pool layout: [aux padded to head_k] + [z: head_k] must fit in block_rows
+    if (d.pool_mode != COMMON_SPECULATIVE_POOL_MODE_FULL && head_k > block_rows/2) {
+        invalid("block_rows must be >= 2*head_k for the pool packing "
+                "(use --spec-pool-mode full to allow a smaller block)");
+    }
+
+    return common_a4_shape{ block_rows, (int32_t) proposal_k, (int32_t) head_k, (int32_t) aux_rows };
+}
 
 struct common_params_speculative_ngram_mod {
     int32_t n_match = 24;
@@ -362,12 +459,83 @@ struct common_params_speculative {
         return !draft.mparams.path.empty() || !draft.mparams.hf_repo.empty();
     }
 
+    bool a4_selected() const {
+        const bool has_dspark = std::any_of(types.begin(), types.end(), [](auto t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+        });
+        return has_dspark && draft.a4();
+    }
+
+    // Run during argument parsing (common_params_parse) and again from need_n_rs_seq. It only
+    // validates the raw shape; model-dependent checks (trained block size, vocab width) stay in
+    // the speculator constructor.
+    void validate_a4_params() const {
+        if (a4_selected()) {
+            int n_types = 0;
+            for (auto t : types) {
+                if (t != COMMON_SPECULATIVE_TYPE_NONE) {
+                    n_types++;
+                }
+            }
+            if (n_types != 1) {
+                throw std::invalid_argument("G2-A4 requires exactly one speculator type (DSpark); "
+                        "mixed drafters are unsupported because the recurrent rollback ring is sized "
+                        "from the A4 proposal_k, not the other drafter's n_max");
+            }
+            (void) common_a4_resolve_shape(draft, draft.block_rows, draft.n_max);
+        }
+    }
+
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        if (!needs_rs_seq) {
+            return 0u;
+        }
+
+        // A4 is selected only when the DSPARK implementation is active *and* the A4 block flags
+        // are set. For every other (legacy) path the snapshot depth stays exactly `n_max`, even if
+        // the unused A4 flags are present on the command line.
+        if (!a4_selected()) {
+            return draft.n_max > 0 ? (uint32_t) draft.n_max : 0u;
+        }
+
+        // G2-A4: the required rollback depth is the number of rejected verify rows, which is
+        // bounded by the *proposal* count (+1 for the correction row), NOT by the draft block rows.
+        // Resolve/validate the raw shape here, before any context or snapshot allocation, and use
+        // the validated proposal count. This rejects proposal_k=100000 with a clear parameter
+        // error instead of first trying to allocate a 100001-row recurrent ring.
+        const common_a4_shape shape = common_a4_resolve_shape(draft, draft.block_rows, draft.n_max);
+        uint32_t n_rs = (uint32_t) shape.proposal_k + 1u;
+
+        // task-22 A/B knob: the recurrent/short-conv snapshot ring depth. A4 only; the value is
+        // parsed strictly and may only increase the depth (a shorter ring would make the
+        // all-rejected rollback fail at runtime instead of here).
+        constexpr uint32_t A4_RS_SEQ_MAX = 64;
+        const char * n_rs_override = std::getenv("LLAMA_A4_RS_SEQ");
+        if (n_rs_override != nullptr && *n_rs_override != '\0') {
+            for (const char * p = n_rs_override; *p != '\0'; ++p) {
+                if (*p < '0' || *p > '9') {
+                    throw std::invalid_argument("LLAMA_A4_RS_SEQ must be a plain decimal integer");
+                }
+            }
+            errno = 0;
+            char * end = nullptr;
+            const unsigned long value = std::strtoul(n_rs_override, &end, 10);
+            if (errno == ERANGE || end == n_rs_override || *end != '\0' ||
+                value == 0 || value > A4_RS_SEQ_MAX) {
+                throw std::invalid_argument("LLAMA_A4_RS_SEQ must be in [1, 64]");
+            }
+            if (value < n_rs) {
+                throw std::invalid_argument("LLAMA_A4_RS_SEQ is smaller than the required A4 "
+                        "rollback depth (proposal_k + 1)");
+            }
+            n_rs = (uint32_t) value;
+        }
+
+        return n_rs;
     }
 };
 

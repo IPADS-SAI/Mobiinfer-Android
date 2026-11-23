@@ -98,6 +98,62 @@ def parse_layers(spec: str | None) -> set[int] | None:
     return result
 
 
+def validate_order(values: list, count: int, where: str) -> list[int]:
+    """Validate one layer order as a permutation of 0..count-1."""
+    if len(values) != count:
+        raise SystemExit(f"{where}: expected {count} entries, got {len(values)}")
+    result = []
+    seen = set()
+    for position, value in enumerate(values):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise SystemExit(f"{where}[{position}] is not an integer: {value!r}")
+        if value < 0 or value >= count:
+            raise SystemExit(f"{where}[{position}] out of range: {value}")
+        if value in seen:
+            raise SystemExit(f"{where} repeats expert {value}; not a bijection")
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def parse_expert_order(document: Any, layers: list[int], count: int) -> dict[int, list[int]]:
+    """Return layer -> (position -> logical) from a dpsk-pack-order-v1 document.
+
+    Accepted shapes: {"format":..., "orders":{"0":[...],...}} or a bare
+    {"0":[...],...}. `direction` may be position_to_logical (default, the
+    T-0055 convention) or logical_to_position.
+    """
+    if not isinstance(document, dict):
+        raise SystemExit("expert order document must be a JSON object")
+    orders = document.get("orders", document)
+    if not isinstance(orders, dict):
+        raise SystemExit("expert order document must contain an 'orders' object")
+    direction = document.get("direction", "position_to_logical")
+    if direction not in ("position_to_logical", "logical_to_position"):
+        raise SystemExit(f"unsupported expert order direction: {direction!r}")
+    expected = {str(layer) for layer in layers}
+    actual = {str(key) for key in orders}
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        raise SystemExit(f"expert order layers mismatch; missing={missing} extra={extra}")
+    result = {}
+    for layer in layers:
+        values = validate_order(orders[str(layer)], count, f"orders[{layer}]")
+        if direction == "logical_to_position":
+            position_to_logical = [0] * count
+            for logical, position in enumerate(values):
+                position_to_logical[position] = logical
+            values = position_to_logical
+        result[layer] = values
+    return result
+
+
+def load_expert_order(path: Path, layers: list[int], count: int) -> dict[int, list[int]]:
+    return parse_expert_order(json.loads(path.expanduser().resolve().read_text(encoding="utf-8")),
+                              layers, count)
+
+
 def tensor_info(name: str) -> tuple[int, str] | None:
     match = TENSOR_RE.match(name)
     if match is None or match.group(2) not in ROUTED_FAMILIES:
@@ -180,6 +236,10 @@ def extract(args: argparse.Namespace) -> int:
     by_layer: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for entry in entries:
         by_layer[entry["layer"]].append(entry)
+    layers = sorted(by_layer)
+    order_by_layer = None
+    if args.expert_order is not None:
+        order_by_layer = load_expert_order(args.expert_order, layers, metadata["expert_count"])
 
     with ExitStack() as stack:
         sources = [stack.enter_context(path.open("rb")) for path in model_paths]
@@ -193,16 +253,18 @@ def extract(args: argparse.Namespace) -> int:
                 entry["expert_stride"] = stride
                 family_offset += entry["bytes_per_expert"]
 
+            order = (order_by_layer[layer] if order_by_layer is not None
+                     else list(range(metadata["expert_count"])))
             with atomic_file(out_dir / f"layer_{layer:03d}.bin", "wb") as output:
-                for expert in range(metadata["expert_count"]):
+                for logical in order:
                     for entry in layer_entries:
                         size = entry["bytes_per_expert"]
                         copy_range(
                             sources[entry["source_shard_index"]],
                             output,
-                            entry["source_offset"] + expert * size,
+                            entry["source_offset"] + logical * size,
                             size,
-                            f"{entry['tensor_name']} expert {expert}",
+                            f"{entry['tensor_name']} expert {logical}",
                         )
 
     manifest = {
@@ -214,6 +276,12 @@ def extract(args: argparse.Namespace) -> int:
         "model": metadata,
         "entries": entries,
     }
+    if order_by_layer is not None:
+        manifest["expert_order"] = {
+            "format": "dpsk-pack-order-v1",
+            "direction": "position_to_logical",
+            "orders": {str(layer): order_by_layer[layer] for layer in layers},
+        }
     with atomic_file(out_dir / "manifest.json", "w") as output:
         json.dump(manifest, output, indent=2)
         output.write("\n")
@@ -231,6 +299,11 @@ def verify(args: argparse.Namespace) -> int:
         manifest_path = manifest_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     expected, metadata = collect_entries(model_paths, parse_layers(args.layers))
+    order_by_layer = None
+    if manifest.get("expert_order"):
+        verify_layers = sorted({int(entry["layer"]) for entry in manifest.get("entries", [])})
+        order_by_layer = parse_expert_order(manifest["expert_order"], verify_layers,
+                                            metadata["expert_count"])
     expected_by_name = {entry["tensor_name"]: entry for entry in expected}
     entries = manifest.get("entries", [])
 
@@ -252,14 +325,18 @@ def verify(args: argparse.Namespace) -> int:
                 expert_file = stack.enter_context((manifest_path.parent / entry["repacked_file"]).open("rb"))
                 experts[entry["repacked_file"]] = expert_file
             size = entry["bytes_per_expert"]
-            for expert in range(metadata["expert_count"]):
-                sources[source["source_shard_index"]].seek(source["source_offset"] + expert * size)
-                expert_file.seek(entry["repacked_offset"] + expert * entry["expert_stride"])
+            order = (order_by_layer[int(entry["layer"])] if order_by_layer is not None else None)
+            for position in range(metadata["expert_count"]):
+                logical = order[position] if order is not None else position
+                sources[source["source_shard_index"]].seek(source["source_offset"] + logical * size)
+                expert_file.seek(entry["repacked_offset"] + position * entry["expert_stride"])
                 remaining = size
                 while remaining:
                     count = min(8 << 20, remaining)
                     if sources[source["source_shard_index"]].read(count) != expert_file.read(count):
-                        raise SystemExit(f"byte mismatch for '{entry['tensor_name']}' expert {expert}")
+                        raise SystemExit(
+                            f"byte mismatch for '{entry['tensor_name']}' position {position} "
+                            f"(expert {logical})")
                     remaining -= count
 
     if {entry["tensor_name"] for entry in entries} != set(expected_by_name):
@@ -278,6 +355,8 @@ def main() -> int:
     extract_parser.add_argument("--out-dir", required=True, type=Path)
     extract_parser.add_argument("--layers")
     extract_parser.add_argument("--force", action="store_true")
+    extract_parser.add_argument("--expert-order", type=Path,
+                                help="optional dpsk-pack-order-v1 JSON; orders[layer] is position -> logical")
     extract_parser.set_defaults(func=extract)
 
     verify_parser = commands.add_parser("verify")

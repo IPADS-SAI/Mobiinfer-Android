@@ -3,6 +3,8 @@
 #include "llama-moe-experts.h"
 #include "llama-moe-slot.h"
 
+#include <tuple>
+
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -90,13 +92,13 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
     };
     // family -> (bytes_per_expert -> 层号升序)
     // A bank belongs to one device; cross-device views cannot share allocation contexts.
-    using bank_key = std::pair<size_t, ggml_backend_dev_t>;
+    using bank_key = std::tuple<size_t, ggml_type, ggml_backend_dev_t>;
     std::map<bank_key, std::vector<int>> groups[4];
     for (int il = 0; il < (int) n_layer; ++il) {
         for (int fi = 0; fi < 4; ++fi) {
             const auto * e = moe_experts_entry(tn(fam_ids[fi], "weight", il).str().c_str());
             if (e) {
-                groups[fi][{e->bytes_per_expert, dev_layer(il)}].push_back(il);
+                groups[fi][{e->bytes_per_expert, e->type, dev_layer(il)}].push_back(il);
             }
         }
     }
@@ -175,7 +177,8 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
             n_expert,
             slots_for(tensor_name),
             entry->type,
-            entry->bytes_per_expert);
+            entry->bytes_per_expert,
+            entry->compact_q3k);
         return tensor;
     };
 
@@ -342,7 +345,7 @@ void llama_model_qwen35moe::load_arch_tensors(llama_model_loader & ml) {
                     throw std::runtime_error(format(
                         "MoE base '%s' has no usable experts entry", ggml_get_name(base)));
                 }
-                if (e->bytes_per_expert != kv.first.first) {
+                if (e->bytes_per_expert != std::get<0>(kv.first)) {
                     throw std::runtime_error(format(
                         "MoE group for '%s' has inconsistent expert bytes", ggml_get_name(base)));
                 }
@@ -533,12 +536,75 @@ llama_model_qwen35moe::graph::graph(const llama_model & model, const llm_graph_p
     res->t_embd = cur;
 
     // LM head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    if (n_aux_total > 0) {
+        // draft-pool A4: the draft publishes the post-norm hidden of its lookahead rows and we
+        // project them in a *separate* aux channel.
+        //
+        // The verify rows deliberately keep the exact baseline path (norm -> LM head -> logits).
+        // The phone pool-arm divergence is not root-caused yet, so the fused verify+aux MUL_MAT is
+        // not used: this removes it as a variable instead of attributing the divergence to it.
+        // The aux rows are NOT batch tokens: they bypass inp_out_ids, have no KV position and do
+        // not affect n_tokens/output_ids.
+        GGML_ASSERT(n_aux_total == n_aux_rows*(int64_t) ubatch.n_seqs_unq);
 
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
+        // baseline verify path - byte-for-byte the same ops as the non-A4 branch below
+        cur = build_lora_mm(model.output, cur, model.output_s);
 
-    ggml_build_forward_expand(gf, cur);
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+
+        ggml_build_forward_expand(gf, cur);
+
+        // independent aux projection, own graph output
+        ggml_tensor * inp_aux = build_inp_aux();
+        ggml_tensor * t_aux_logits = build_lora_mm(model.output, inp_aux, model.output_s);
+        cb(t_aux_logits, "result_aux_logits", -1);
+        res->t_aux_logits = t_aux_logits;
+
+        ggml_build_forward_expand(gf, t_aux_logits);
+
+        // T20: device top-k over the aux rows. Per row on purpose - the HTP top_k layout solver only
+        // takes its fast chunked/merge path for a single row, and 3 rows at once serialize on 1 HVX.
+        //   ids  = [row0 top-k | row1 top-k | row2 top-k]                          I32 [3*k]
+        //   vals = [ values of (ids1||ids2) on row1 | on row2 ]                    F32 [4*k]
+        // The host rebuilds the exact top_k(max(row1,row2)) shared pool from the union.
+        if (params.aux_top_k > 0 && ubatch.n_seqs_unq == 1 && n_aux_rows == 3) {
+            const int64_t k      = (int64_t) params.aux_top_k;
+            const int64_t n_voc  = t_aux_logits->ne[0];
+            GGML_ASSERT(k <= n_voc);
+
+            ggml_tensor * row[3];
+            ggml_tensor * ids[3];
+            for (int r = 0; r < 3; ++r) {
+                row[r] = ggml_view_1d(ctx0, t_aux_logits, n_voc, (size_t) r*t_aux_logits->nb[1]);
+                ids[r] = ggml_top_k(ctx0, row[r], (int) k);
+                ggml_format_name(ids[r], "aux_topk_%d", r);
+            }
+
+            ggml_tensor * ids_all = ggml_concat(ctx0, ggml_concat(ctx0, ids[0], ids[1], 0), ids[2], 0); // [3k]
+            ggml_tensor * ids_uni = ggml_concat(ctx0, ids[1], ids[2], 0);                              // [2k]
+
+            // scalar gather: reshape the rows to [1, n_vocab] so get_rows yields the values
+            ggml_tensor * r1_2d = ggml_reshape_2d(ctx0, row[1], 1, n_voc);
+            ggml_tensor * r2_2d = ggml_reshape_2d(ctx0, row[2], 1, n_voc);
+            ggml_tensor * v1 = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, r1_2d, ids_uni), 2*k); // [2k]
+            ggml_tensor * v2 = ggml_reshape_1d(ctx0, ggml_get_rows(ctx0, r2_2d, ids_uni), 2*k); // [2k]
+            ggml_tensor * vals = ggml_concat(ctx0, v1, v2, 0);                                   // [4k]
+
+            res->t_aux_top_k_ids  = ids_all;
+            res->t_aux_top_k_vals = vals;
+
+            ggml_build_forward_expand(gf, ids_all);
+            ggml_build_forward_expand(gf, vals);
+        }
+    } else {
+        cur = build_lora_mm(model.output, cur, model.output_s);
+
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+
+        ggml_build_forward_expand(gf, cur);
+    }
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35moe::graph::build_qkvz(

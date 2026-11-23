@@ -1,8 +1,12 @@
 #include "htp-fusion.h"
 #include "htp-kparams.h"
+#include "htp/binary-ops.h"
+#include "htp/sum-rows-ops.h"
+#include "htp-caps.h"
 #include "ggml-impl.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 static inline bool htp_same_tensor_data(const ggml_tensor * a, const ggml_tensor * b) {
@@ -320,6 +324,7 @@ static bool fuse_mul_mat_id_nx(const ggml_hexagon_session * sess, htp_opnode & p
     if (x_in != x || ids_in != ids || w_in->type != w0->type ||
         w_in->ne[0] != w0->ne[0] || w_in->ne[2] != w0->ne[2] ||
         ggml_hexagon_tensor_is_tiled(w_in) != ggml_hexagon_tensor_is_tiled(w0) ||
+        ggml_hexagon_tensor_is_q3k_compact(w_in) != ggml_hexagon_tensor_is_q3k_compact(w0) ||
         orig_kparams->n_hmx != cur_kparams->n_hmx) {
         return false;
     }
@@ -562,6 +567,138 @@ static bool fuse_binary_nx(const ggml_hexagon_session * sess, htp_opnode & prev,
     return true;
 }
 
+// The sort kernel picks a different algorithm for is_top_k vs full sort unless ne0 is one of the
+// dedicated bitonic sizes; only there are the two guaranteed to produce identical order (tie
+// handling included). Keep the rewrite inside that set so the fused op is bit-exact.
+static inline bool htp_sort_same_kernel(uint32_t ne0) {
+    switch (ne0) {
+        case 32: case 64: case 128: case 256: case 512: case 1024:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// NOTE: an "ARGSORT followed by a CONT of its leading k columns -> single TOP_K" rule was
+// implemented and measured here, and then rejected: the HTP TOP_K kernel is 2.4x-4.6x slower
+// than a plain ARGSORT on the shapes where this pattern appears (measured on OnePlus 13 v79,
+// 256-wide router logits, k=1..16: TOP_K 24-92 us vs ARGSORT 10-18 us). The production graph
+// runs this pattern 4x per layer for the lookahead prefetch, so the rewrite would have cost
+// milliseconds per step. Keeping the two ops (ARGSORT + an identity CONT) is cheaper.
+// fuse_concat_copy below does the same "identity CONT" elimination for CONCAT, where the
+// consumer really is free.
+
+// CONCAT followed by a CONT/DUP of its own result: the concat destination is already contiguous,
+// so the copy is an identity move. Retarget the concat to write the copy destination directly.
+static bool fuse_concat_copy(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
+    GGML_UNUSED(sess);
+    if (prev.opcode != HTP_OP_CONCAT) return false;
+    if (prev.outputs.size() != 1) return false;
+    if (cur.opcode != HTP_OP_CPY || !cur.node) return false;
+    if (cur.node->op != GGML_OP_CONT && cur.node->op != GGML_OP_DUP) return false;
+
+    const ggml_tensor * cat      = prev.dst();
+    const ggml_tensor * copy_src = cur.src0();
+    const ggml_tensor * copy_dst = cur.dst();
+    if (!cat || !copy_src || !copy_dst) return false;
+    if (copy_src != cat) return false;
+    if (!ggml_hexagon_tensor_is_fuseable(cat)) return false;
+    if (!ggml_are_same_layout(cat, copy_dst)) return false;
+    if (!ggml_is_contiguous(cat) || !ggml_is_contiguous(copy_dst)) return false;
+    // A plain elementwise op may alias an input with the same data pointer and stride (in-place),
+    // but CONCAT cannot: writing the left input into the copy destination may overwrite the right
+    // input before CONCAT has read it. A concat along the outer dimension can have the same stride
+    // for both inputs and the destination even when the shapes differ, so check every input for
+    // any overlap and allow no exception.
+    for (const auto * in : prev.inputs) {
+        if (htp_tensors_overlap(copy_dst, in)) return false;
+    }
+
+    prev.outputs[0] = copy_dst;
+    prev.fused.push_back(cur.node);
+    return true;
+}
+
+
+// MoE weight normalisation, step 1: SUM_ROWS followed by CLAMP of that sum.
+// ggml_clamp() returns a *view* of its input, so the two ops write the same memory: fusing them means
+// letting SUM_ROWS write the clamped value directly. The clamp bounds come from the CLAMP node's own
+// op_params (never hardcoded) and are carried to the device in this op's op_params[0]/[1].
+static bool fuse_sum_rows_clamp(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
+    if (!htp_session_has_capability(sess, HTP_CAP_ROWNORM)) return false;
+    if (prev.opcode != HTP_OP_SUM_ROWS || prev.outputs.size() != 1) return false;
+    if (cur.opcode != HTP_OP_CLAMP) return false;
+    // A second CLAMP would overwrite the first clamp's bounds in params[0]/[1].
+    if (prev.params[15] & HTP_SUM_ROWS_FLAG_CLAMP) return false;
+
+    const ggml_tensor * sums    = prev.dst();
+    // NOTE: use the original graph tensor. htp_opnode_collapse() may have replaced the opnode's
+    // output with a shape-collapsed dummy (e.g. (1,n) -> (n,1)) for elementwise unary ops, and the
+    // fusion has to keep the graph-visible tensor, not that internal view.
+    const ggml_tensor * clamped = cur.node;
+    if (!sums || !clamped) return false;
+    if (!ggml_hexagon_tensor_is_fuseable(sums) || !ggml_hexagon_tensor_is_fuseable(clamped)) return false;
+    if (sums->type != GGML_TYPE_F32 || clamped->type != GGML_TYPE_F32) return false;
+    if (!ggml_are_same_shape(sums, clamped)) return false;
+    if (sums->ne[2] != 1 || sums->ne[3] != 1) return false;
+    if (sums->nb[1] != clamped->nb[1] || sums->nb[2] != clamped->nb[2] || sums->nb[3] != clamped->nb[3]) return false;
+    if (cur.node->src[0] != sums) return false;
+
+    float cmin = 0.0f;
+    float cmax = 0.0f;
+    memcpy(&cmin, (const float *) cur.params + 0, sizeof(float));
+    memcpy(&cmax, (const float *) cur.params + 1, sizeof(float));
+    if (std::isnan(cmin) || std::isnan(cmax)) return false;
+
+    memcpy(&prev.params[0], &cmin, sizeof(float));
+    memcpy(&prev.params[1], &cmax, sizeof(float));
+    prev.params[15] = HTP_SUM_ROWS_FLAG_CLAMP;
+
+    prev.outputs[0] = clamped;
+    prev.fused.push_back(cur.node);
+    return true;
+}
+
+// MoE weight normalisation, step 2: (clamped) SUM_ROWS followed by DIV of the row values by that sum.
+// Collapses SUM_ROWS+CLAMP+DIV into a single op that recomputes the column sum itself, so the
+// intermediate (1, n_tokens) tensor disappears. Numerically identical: same reduce, same IEEE divide.
+static bool fuse_rows_norm_div(const ggml_hexagon_session * sess, htp_opnode & prev, const htp_opnode & cur) {
+    if (!htp_session_has_capability(sess, HTP_CAP_ROWNORM)) return false;
+    if (prev.opcode != HTP_OP_SUM_ROWS || prev.params[15] != HTP_SUM_ROWS_FLAG_CLAMP) return false;
+    if (prev.outputs.size() != 1 || prev.inputs.empty()) return false;
+    if (cur.opcode != HTP_OP_DIV || !cur.node) return false;
+
+    const ggml_tensor * divisor = prev.dst();          // clamped (1, n_tokens) sum, original graph tensor
+    const ggml_tensor * numer   = cur.node->src[0];    // (k, n_tokens) weights
+    const ggml_tensor * dst     = cur.node;
+    if (!divisor || !numer || !dst) return false;
+    if (cur.node->src[1] != divisor) return false;
+    if (!ggml_hexagon_tensor_is_fuseable(divisor)) return false;
+    // SUM_ROWS must have summed exactly the tensor that DIV divides. Equal data pointers are not
+    // enough: a shorter view at the same address would pass that check but denormalise a different
+    // number of columns.
+    if (!prev.node || prev.node->op != GGML_OP_SUM_ROWS || prev.node->src[0] != numer) return false;
+
+    if (numer->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
+    if (numer->ne[2] != 1 || numer->ne[3] != 1 || dst->ne[2] != 1 || dst->ne[3] != 1) return false;
+    if (numer->ne[0] <= 0 || numer->ne[0] > 64 || numer->ne[0] != dst->ne[0]) return false;
+    if (numer->ne[1] != dst->ne[1] || divisor->ne[0] != 1 || divisor->ne[1] != numer->ne[1]) return false;
+    if (!ggml_is_contiguous(numer) || !ggml_is_contiguous(dst)) return false;
+    if (htp_tensors_overlap(dst, numer) || htp_tensors_overlap(dst, divisor)) return false;
+    // The fused kernel walks both tensors directly (no DMA staging) and rejects extended (DMA64)
+    // buffers. If this op is the last one in the batch, the host only notices that at sync time as
+    // a DSP error. Keep the ordinary DIV/SUM_ROWS chain instead; the chain's own kernels stage
+    // extended buffers through DMA and are supported.
+    if (htp_session_tensor_is_extended(sess, numer) || htp_session_tensor_is_extended(sess, dst)) return false;
+
+    prev.opcode = HTP_OP_DIV;
+    prev.inputs = { numer };
+    prev.outputs[0] = dst;
+    prev.params[15] = HTP_BINARY_VARIANT_ROWNORM;
+    prev.fused.push_back(cur.node);
+    return true;
+}
+
 bool htp_fusion_can_stack(const struct ggml_tensor * a) {
     if (!a || !a->src[0] || !a->src[1]) return false;
     switch (a->op) {
@@ -630,8 +767,19 @@ void htp_fusion_tag_graph(struct ggml_cgraph * graph) {
              op == GGML_OP_UNARY    || op == GGML_OP_ADD   || op == GGML_OP_SUB    ||
              op == GGML_OP_MUL      || op == GGML_OP_DIV   || op == GGML_OP_MUL_MAT_ID ||
              op == GGML_OP_SSM_CONV ||
+             op == GGML_OP_ARGSORT                              ||
+             op == GGML_OP_CONCAT                               ||
+             op == GGML_OP_SUM_ROWS                             ||
              (op == GGML_OP_MUL_MAT && !htp_is_hadamard(node))) &&
             ggml_node_has_n_uses(graph, i, 1)) {
+            ggml_hexagon_tensor_set_flags(node, HTP_TENSOR_FUSEABLE);
+        }
+
+        // ggml_clamp() returns a view of its input, so ggml_node_has_n_uses() rejects it by design
+        // ("some other node might be using the intermediate result via the view source"). It is still
+        // safe to fuse into its producer when it has exactly one consumer and is not a graph output.
+        if (op == GGML_OP_CLAMP && ggml_node_get_use_count(graph, i) == 1 &&
+            (node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
             ggml_hexagon_tensor_set_flags(node, HTP_TENSOR_FUSEABLE);
         }
     }
@@ -652,16 +800,21 @@ bool htp_fusion_try_fuse(const struct ggml_hexagon_session * sess, struct htp_op
                    (htp_fusion_enabled(HTP_FUSE_MUL_MUL_SCALAR) && fuse_mul_mul_scalar(sess, prev, cur)) ||
                    (htp_fusion_enabled(HTP_FUSE_BINARY_NX)      && fuse_binary_nx(sess, prev, cur));
         case HTP_OP_SUB:
-        case HTP_OP_DIV:
             return htp_fusion_enabled(HTP_FUSE_BINARY_NX) && fuse_binary_nx(sess, prev, cur);
+        case HTP_OP_DIV:
+            return (opt_fuse_wnorm && htp_fusion_enabled(HTP_FUSE_ROWNORM_DIV) && fuse_rows_norm_div(sess, prev, cur)) ||
+                   (htp_fusion_enabled(HTP_FUSE_BINARY_NX) && fuse_binary_nx(sess, prev, cur));
         case HTP_OP_SCALE:
             return htp_fusion_enabled(HTP_FUSE_RMS_NORM_SCALE) && fuse_rms_norm_scale(sess, prev, cur);
         case HTP_OP_UNARY_SILU:
             return htp_fusion_enabled(HTP_FUSE_SSM_CONV_SILU) && fuse_ssm_conv_silu(sess, prev, cur);
         case HTP_OP_GET_ROWS:
             return htp_fusion_enabled(HTP_FUSE_REPEAT_GET_ROWS) && fuse_repeat_get_rows(sess, prev, cur);
+        case HTP_OP_CLAMP:
+            return opt_fuse_wnorm && htp_fusion_enabled(HTP_FUSE_SUM_CLAMP) && fuse_sum_rows_clamp(sess, prev, cur);
         case HTP_OP_CPY:
-            return htp_fusion_enabled(HTP_FUSE_GDN_CPY) && fuse_gdn_cpy(sess, prev, cur);
+            return (htp_fusion_enabled(HTP_FUSE_CONCAT_COPY) && fuse_concat_copy(sess, prev, cur)) ||
+                   (htp_fusion_enabled(HTP_FUSE_GDN_CPY)     && fuse_gdn_cpy(sess, prev, cur));
         case HTP_OP_MUL_MAT:
             return htp_fusion_enabled(HTP_FUSE_MUL_MAT_NX) && fuse_mul_mat_nx(sess, prev, cur);
         case HTP_OP_MUL_MAT_ID:

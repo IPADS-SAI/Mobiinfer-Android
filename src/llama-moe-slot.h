@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "llama-moe-config.h"
 
 #include <memory>
 
@@ -8,11 +9,11 @@ struct llama_model;
 
 class llama_moe_slot_runtime {
 public:
-    static constexpr int max_prefetch_depth = 16;
+    static constexpr int max_prefetch_depth = llama_moe::config::max_prefetch_depth;
     // Model allocation and runtime must reserve the same number of slots.
+    // 纯函数实现见 llama-moe-config.h（host 单测覆盖负 depth / bank 太小）。
     static int normalize_prefetch_depth(int bank, int requested) {
-        const int depth = requested < 0 ? 0 : (requested > max_prefetch_depth ? max_prefetch_depth : requested);
-        return bank >= 2 * depth + 8 ? depth : 0;
+        return llama_moe::config::normalize_prefetch_depth(bank, requested);
     }
     explicit llama_moe_slot_runtime(const llama_model & model);
     ~llama_moe_slot_runtime();
@@ -42,9 +43,22 @@ public:
     ggml_tensor * build_slot_ids_tensor(
         ggml_context * ctx,
         ggml_tensor * expert_ids,
+        int layer, bool deferred);
+    // Backward-compatible overloads used by the pre-A2 call sites. The merged
+    // tree keeps the branch's deferred list implementation; `deferred` is
+    // accepted for API compatibility and ignored here.
+    ggml_tensor * build_slot_ids_tensor(
+        ggml_context * ctx,
+        ggml_tensor * expert_ids,
         int layer);
     void process(int layer, const ggml_tensor * expert_ids, ggml_tensor * slot_ids,
+                 bool deferred, const ggml_tensor * lookahead_pred = nullptr);
+    void process(int layer, const ggml_tensor * expert_ids, ggml_tensor * slot_ids,
                  const ggml_tensor * lookahead_pred = nullptr);
+
+    bool graph_failed() const;
+    bool clear_graph_error();
+    void discard_deferred();
 
     /// 累加「图执行期间的专家管理耗时」（`map_custom` 回调内）。
     ///

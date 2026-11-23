@@ -8,7 +8,7 @@
 
 **在手机上本地运行 35B 级 MoE 大模型**
 
-[![Release](https://img.shields.io/badge/release-v0.4.5-blue)](https://github.com/IPADS-SAI/Mobiinfer-Android/releases)
+[![Release](https://img.shields.io/badge/release-v0.4.6-blue)](https://github.com/IPADS-SAI/Mobiinfer-Android/releases)
 [![Platform](https://img.shields.io/badge/platform-Android%20%7C%20Snapdragon-3DDC84)](#)
 [![Backend](https://img.shields.io/badge/backend-Hexagon%20NPU%20(HTP)-blue)](#)
 [![Base](https://img.shields.io/badge/built%20on-llama.cpp--omni-orange)](#)
@@ -22,6 +22,7 @@
 
 ## 最新动态
 
+- [2026.11.23] 🚀 **发布 MobiInfer-Android v0.4.6，Q2 tiled 专家包把 35B-A3B 解码推到 31.1 tok/s**
 - [2026.11.11] 🚀 **发布 MobiInfer-Android v0.4.5，MiniCPM-V 4.7 MoE 解码峰值 23.3 tok/s**
   - ⚡ **跨层专家流水**：专家读盘改走 O_DIRECT，提前 2 层提交 gate 预测（H+2），每专家独立任务队列 + 常驻读线程，把 I/O 藏进计算里；同机同 prompt 解码 23.3 tok/s。
   - 🧵 **可与其他 App 并行推理**：MoE 推理不要求独占设备，其他应用在前台运行时仍可持续生成，吞吐保持 21.3–21.8 tok/s。
@@ -106,10 +107,13 @@ MobiInfer-Android 引入完整的 **Qualcomm Hexagon NPU 后端**，打通了**�
 
 > 📱 OnePlus 13（Snapdragon 8 Elite，HTP0 + HTP1），纯文本实测，128-token 输出。
 > 📱 iQOO 15 Ultra（Snapdragon 8 Elite Gen5，Hexagon v81），纯文本、260-token prompt、DSpark draft3。
+> 📱 iQOO 15 Ultra，Q2 tiled 专家包 + LES，纯文本、41-token prompt、DSpark。
 
 | 模型 | 配置 | SoC | Prompt长度 | Prefill (token/s) | Decode (token/s) |
 |---|---|---|---|---:|---:|
-| MiniCPM-V 4.7 35B-A3B | Q3 tiled，H+2 跨层流水 + O_DIRECT + DSpark3 | 8 Elite Gen5 | 260 | 38.5 | **23.3** |
+| MiniCPM-V 4.7 35B-A3B | Q2 tiled，LES + DSpark | 8 Elite Gen5 | 41 | 24.57 | **31.1** |
+| MiniCPM-V 4.7 35B-A3B | 同上，App 前台运行时 | 8 Elite Gen5 | 41 | — | 29.2 |
+| MiniCPM-V 4.7 35B-A3B | Q3 tiled，H+2 跨层流水 + O_DIRECT + DSpark3 | 8 Elite Gen5 | 260 | 38.5 | 23.3 |
 | MiniCPM-V 4.7 35B-A3B | 同上，其他 App 前台运行时 | 8 Elite Gen5 | 260 | — | 21.3–21.8 |
 | MiniCPM-V 4.7 35B-A3B| Q3，LES + DSpark | 8 Elite | 41 | 22.02 | 17.98 |
 | MiniCPM-V 4.7 35B-A3B| Q3 LES + DSpark| 8 Elite | 512 | 94.28 | 13.65 |

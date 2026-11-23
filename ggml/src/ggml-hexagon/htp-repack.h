@@ -6,6 +6,7 @@
 
 #include "ggml.h"
 #include "htp/htp-tensor.h"
+#include "htp/q3k-compact.h"
 
 static inline bool htp_is_tiled_weight_type(enum ggml_type type) {
     return type == GGML_TYPE_Q1_0  || type == GGML_TYPE_Q2_0   ||
@@ -57,6 +58,10 @@ static inline size_t htp_tiled_row_size(enum ggml_type type, int64_t ne0) {
     }
     return ggml_row_size(type, ne0);
 }
+
+// Pack one expert from contiguous GGUF Q3_K blocks into the compact layout.
+void htp_repack_q3k_compact(void * dst, const void * raw, int64_t ne0, int64_t ne1);
+void htp_unpack_q3k_compact(void * raw, const struct ggml_tensor * tensor, size_t offset, size_t size);
 
 void htp_repack_tensor_tiled(struct ggml_tensor * t, const void * data, size_t size);
 void htp_unpack_tensor_tiled(void * data, const struct ggml_tensor * t, size_t offset, size_t size);

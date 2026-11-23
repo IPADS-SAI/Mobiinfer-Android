@@ -1,0 +1,32 @@
+{
+  "pr": 8,
+  "sha": "b484e250989572630b8018ab9f3c37d34ea9649d",
+  "created_at": "2026-11-06T09:30:00+08:00",
+  "operator": "yydh",
+  "device": "vivo V2546A / SM8850 / HTP0 / v81",
+  "model": {
+    "path": "~/csm/moe-exp/models/MiniCPM-V-4.7-35B-A3B-gguf-hexagon/",
+    "sha256": "<GGUF 的 SHA256>",
+    "quant": "Q4_K_M",
+    "draft": "Q8_0"
+  },
+  "command": "ssh vivo 'cd ~/csm/moe-exp && ./devlock ./release-v81/bin/llama-cli -m ... -p ... -n 128 --temp 0 --seed 42'",
+  "metrics": {
+    "decode_tok_s": {
+      "A": [15.10, 15.32, 15.21, 15.04, 15.18],
+      "B": [15.62, 15.51, 15.70, 15.44, 15.58]
+    },
+    "prefill_tok_s": {
+      "A": [21.0, 21.2, 20.9, 21.1, 21.0],
+      "B": [21.1, 21.0, 21.3, 20.8, 21.1]
+    },
+    "aa_decode_tok_s": [15.12, 15.08, 15.20, 15.15, 15.10],
+    "aa_prefill_tok_s": [21.0, 20.9, 21.1, 21.0, 21.0],
+    "rss_mb": { "A": 7000, "B": 7010 }
+  },
+  "correctness": {
+    "llama_moe_verify_slot": true,
+    "note": "LLAMA_MOE_VERIFY_SLOT=1，byte 级自检通过（40 层 × 256 专家抽样）"
+  },
+  "notes": "ABBA 交替，轮间冷却 60s，全程 devlock 串行；温度 34→37°C，电量 88%→83%"
+}

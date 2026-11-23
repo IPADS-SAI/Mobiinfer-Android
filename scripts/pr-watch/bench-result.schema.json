@@ -1,0 +1,58 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["pr", "sha", "created_at", "device", "command", "metrics", "correctness"],
+  "properties": {
+    "pr": { "type": "integer" },
+    "sha": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+    "created_at": { "type": "string", "description": "ISO8601，建议带时区" },
+    "operator": { "type": "string" },
+    "device": { "type": "string", "description": "例：vivo V2546A / SM8850 / HTP0 / v81" },
+    "model": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string" },
+        "sha256": { "type": "string" },
+        "quant": { "type": "string" },
+        "draft": { "type": "string" }
+      }
+    },
+    "command": { "type": "string", "description": "可粘贴的完整命令（含 devlock）" },
+    "metrics": {
+      "type": "object",
+      "required": ["decode_tok_s"],
+      "properties": {
+        "decode_tok_s": {
+          "type": "object",
+          "required": ["A", "B"],
+          "properties": {
+            "A": { "type": "array", "items": { "type": "number" }, "minItems": 1 },
+            "B": { "type": "array", "items": { "type": "number" }, "minItems": 1 }
+          }
+        },
+        "prefill_tok_s": {
+          "type": "object",
+          "properties": {
+            "A": { "type": "array", "items": { "type": "number" } },
+            "B": { "type": "array", "items": { "type": "number" } }
+          }
+        },
+        "aa_decode_tok_s": { "type": "array", "items": { "type": "number" } },
+        "aa_prefill_tok_s": { "type": "array", "items": { "type": "number" } },
+        "rss_mb": {
+          "type": "object",
+          "properties": { "A": { "type": "number" }, "B": { "type": "number" } }
+        }
+      }
+    },
+    "correctness": {
+      "type": "object",
+      "required": ["llama_moe_verify_slot"],
+      "properties": {
+        "llama_moe_verify_slot": { "type": "boolean" },
+        "note": { "type": "string" }
+      }
+    },
+    "notes": { "type": "string" }
+  }
+}

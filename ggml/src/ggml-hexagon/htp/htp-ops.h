@@ -3,6 +3,8 @@
 
 #include <assert.h>
 
+#include "htp-opbuf-stats.h"
+
 // ggml-common.h must be included prio to this header
 
 enum htp_status {
@@ -142,6 +144,13 @@ enum htp_op_code {
 #define HTP_FENCE_TIMEOUT  (1000000000ULL)
 #define HTP_FENCE_SLOT_SIZE 128
 
+// Capability bits returned by htp_iface_capabilities(). They live in their own
+// bit namespace, separate from the htp_tensor_flags values below: capabilities
+// describe DSP features, tensor flags describe a tensor's memory layout. A value
+// from one namespace must never be masked against, or compared to, a value from
+// the other, they only happen to both be "a set of bits" in a uint32_t.
+#define HTP_CAP_BIT_Q3K_COMPACT (1U << 0)
+
 #define HTP_OP_MAX_VMEM_DEFAULT (3355443200u)
 
 #define HTP_MMAP_MAX_VMEM  (2147483648u)
@@ -153,6 +162,7 @@ enum htp_tensor_flags {
     HTP_TENSOR_TILED    = (1U << 1), // Tensor is in tiled format
     HTP_TENSOR_FENCE    = (1U << 2), // Tensor is synchronization fence (explicitly managed)
     HTP_TENSOR_FUSEABLE = (1U << 3), // Tensor can be fused (host-only)
+    HTP_TENSOR_Q3K_COMPACT = (1U << 4),
 };
 
 enum htp_buf_flags {
@@ -239,6 +249,7 @@ enum htp_trace_event_id {
     HTP_TRACE_EVT_INIT                = 2,
     HTP_TRACE_EVT_BUFF                = 3,
     HTP_TRACE_EVT_FENCE               = 4,
+    HTP_TRACE_EVT_DMA_WAIT            = 5,
 
     HTP_TRACE_EVT_HVX_COMP            = 20,
     HTP_TRACE_EVT_HVX_A_QUANT         = 21,
@@ -261,6 +272,7 @@ enum htp_trace_event_id {
     HTP_TRACE_EVT_HVX_GDN_REM         = 37,
 
     HTP_TRACE_EVT_HMX_COMP            = 40,
+    HTP_TRACE_EVT_HMX_WAIT            = 41,
 };
 
 struct htp_trace_desc {
@@ -301,7 +313,29 @@ struct htp_opbatch_rsp {
     uint32_t n_ops;          // Number of op profile descriptors
     uint32_t usecs;          // Number of usec
     uint32_t n_traces[HTP_OP_MAX_NTHREADS];
+    // T-0304: P0 op-buffer counters (GGML_HEXAGON_OPBUFSTAT).  abi_magic lets
+    // the host reject a skel built from different headers instead of silently
+    // reading a shorter legacy response.  Host and skels must be rebuilt
+    // together whenever this layout changes.
+    uint32_t abi_magic;      // HTP_OPBATCH_ABI_MAGIC
+    uint32_t abi_reserved;   // 0
+    struct htp_opbuf_stats opbuf;
     // struct htp_prof_desc profs[];  -- dspqueue buf 0
 };
+
+HTP_OPBUF_STATIC_ASSERT(sizeof(struct htp_opbuf_stats) == 72, "htp_opbuf_stats ABI changed");
+HTP_OPBUF_STATIC_ASSERT(sizeof(struct htp_opbatch_rsp) == 168, "htp_opbatch_rsp ABI changed");
+
+// Host-side ABI checks (T-0304).  A skel built before the counters were
+// appended writes a shorter response; a skel built from a different header
+// revision writes the right size but a different magic.  Both must be
+// rejected loudly instead of being read as the current layout.
+static inline int htp_opbatch_rsp_size_ok(uint32_t rsp_size, uint32_t n_dbufs) {
+    return rsp_size == sizeof(struct htp_opbatch_rsp) && n_dbufs == 1;
+}
+
+static inline int htp_opbatch_rsp_magic_ok(uint32_t abi_magic) {
+    return abi_magic == HTP_OPBATCH_ABI_MAGIC;
+}
 
 #endif /* HTP_OPS_H */

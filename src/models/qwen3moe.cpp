@@ -3,6 +3,8 @@
 #include "llama-moe-experts.h"
 #include "llama-moe-slot.h"
 
+#include <tuple>
+
 void llama_model_qwen3moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
 
@@ -50,14 +52,14 @@ void llama_model_qwen3moe::load_arch_tensors(llama_model_loader & ml) {
         LLM_TENSOR_FFN_DOWN_EXPS,
     };
     // family -> (bytes_per_expert -> 层号升序)；一个 bank 只属于一个 device。
-    using bank_key = std::pair<size_t, ggml_backend_dev_t>;
+    using bank_key = std::tuple<size_t, ggml_type, ggml_backend_dev_t>;
     std::map<bank_key, std::vector<int>> groups[3];
     if (moe_slot_bank_enabled()) {
         for (int il = 0; il < (int) n_layer; ++il) {
             for (int fi = 0; fi < 3; ++fi) {
                 const auto * e = moe_experts_entry(tn(fam_ids[fi], "weight", il).str().c_str());
                 if (e) {
-                    groups[fi][{e->bytes_per_expert, dev_layer(il)}].push_back(il);
+                    groups[fi][{e->bytes_per_expert, e->type, dev_layer(il)}].push_back(il);
                 }
             }
         }
@@ -127,7 +129,8 @@ void llama_model_qwen3moe::load_arch_tensors(llama_model_loader & ml) {
             n_expert,
             slots_for(tensor_name),
             entry->type,
-            entry->bytes_per_expert);
+            entry->bytes_per_expert,
+            entry->compact_q3k);
         return tensor;
     };
 
@@ -195,7 +198,7 @@ void llama_model_qwen3moe::load_arch_tensors(llama_model_loader & ml) {
                     throw std::runtime_error(format(
                         "MoE base '%s' has no usable experts entry", ggml_get_name(base)));
                 }
-                if (e->bytes_per_expert != kv.first.first) {
+                if (e->bytes_per_expert != std::get<0>(kv.first)) {
                     throw std::runtime_error(format(
                         "MoE group for '%s' has inconsistent expert bytes", ggml_get_name(base)));
                 }

@@ -216,7 +216,8 @@ struct llama_model_loader {
         int64_t n_expert,
         int64_t n_slots,
         enum ggml_type experts_type,
-        size_t bytes_per_expert);
+        size_t bytes_per_expert,
+        bool compact_q3k);
 
     // Make dst a view of src so later backend alloc only pays for src.
     // dst may be a smaller / different quant of the same expert geometry.

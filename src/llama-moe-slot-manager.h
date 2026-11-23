@@ -16,6 +16,9 @@ class slot_manager {
 public:
     enum class phase { absent, queued, loading, resident, failed, cancelled };
     enum class origin { prefetch, demand, prewarm };
+    /// 窗口淘汰策略。lru = 现状（按 slot.age）；lfu = 按 (expert 访问次数, age)。
+    /// 频率计数只对**请求过的专家**累加，可选按 decay_period 次访问整体减半。
+    enum class evict_policy { lru, lfu };
     enum class outcome { created, coalesced, promoted, joined, reused, stale, capacity, selected, writer_limit };
     struct ticket {
         int32_t expert = -1;
@@ -78,6 +81,12 @@ private:
     size_t selected_count = 0, hinted_count = 0;
     uint64_t binding = 1, generation = 0, age = 0, selected_stamp = 0;
     uint32_t loading_count = 0, prefetch_loading = 0, pin_count = 0;
+    // LFU 状态：freq 只对 lfu 分配；freq_touch 用于周期性衰减。
+    evict_policy policy = evict_policy::lru;
+    uint32_t decay_period = 0;
+    uint64_t freq_touch = 0;
+    std::vector<uint32_t> freq;
+    uint64_t n_lfu_touch = 0, n_lfu_decay = 0;
     int32_t prefetch_limit;
     int32_t cache_slots;
     bool unified;
@@ -94,8 +103,33 @@ private:
         return t && t.binding == binding && (size_t) t.expert < entries.size() && same(entries[t.expert].value.request, t);
     }
     bool before(int32_t a, int32_t b, int32_t heap) const {
-        if (heap >= 2 && slots[a].age != slots[b].age) return slots[a].age < slots[b].age;
+        if (heap < 2) return a < b;
+        if (policy == evict_policy::lfu) {
+            // 常驻堆按 (访问次数, age) 排序：先淘汰最不常用的，同频再淘汰最久未用的。
+            const uint32_t fa = freq_of(a), fb = freq_of(b);
+            if (fa != fb) return fa < fb;
+        }
+        if (slots[a].age != slots[b].age) return slots[a].age < slots[b].age;
         return a < b;
+    }
+    uint32_t freq_of(int32_t slot) const {
+        const auto & o = slots[slot].owner;
+        return o && (size_t) o.expert < freq.size() ? freq[(size_t) o.expert] : 0;
+    }
+    /// 记一次访问；到衰减周期就把所有计数减半并重建常驻堆（键变了必须重排）。
+    void account(int32_t expert) {
+        if (policy != evict_policy::lfu) return;
+        ++freq[(size_t) expert];
+        ++n_lfu_touch;
+        if (decay_period && ++freq_touch >= decay_period) { freq_touch = 0; decay(); }
+    }
+    void decay() {
+        for (auto & f : freq) f >>= 1;
+        for (size_t h = 2; h < heaps.size(); ++h) {
+            auto & v = heaps[h];
+            for (size_t i = v.size() / 2; i-- > 0;) sift_down((int32_t) h, i);
+        }
+        ++n_lfu_decay;
     }
     void exchange(int32_t heap, size_t a, size_t b) {
         auto & h = heaps[heap];
@@ -205,16 +239,21 @@ private:
 
 public:
     slot_manager(std::mutex & mutex, int32_t experts, int32_t count, int32_t cache, bool unified, int32_t pf_limit = -1,
-                 bool pf_probation = false) :
+                 bool pf_probation = false, evict_policy policy_ = evict_policy::lru, uint32_t decay_period_ = 0) :
         mutex(mutex), entries((size_t) experts), slots((size_t) count), selected((size_t) experts),
         hinted((size_t) experts), prefetch_limit(pf_limit < 0 ? count : pf_limit), cache_slots(cache), unified(unified),
-        pf_probation(pf_probation) {
+        pf_probation(pf_probation), policy(policy_), decay_period(decay_period_) {
+        if (policy == evict_policy::lfu) freq.assign((size_t) experts, 0);
         if (experts <= 0 || count <= 0 || cache < 0 || cache > count) throw std::invalid_argument("invalid MoE slot-manager dimensions");
         for (size_t h = 0; h < (pf_probation ? heaps.size() : 6); ++h) heaps[h].reserve((size_t) count);
         for (int32_t s = 0; s < count; ++s) { slots[s].region = s >= cache; insert(s, slots[s].region); }
     }
     uint64_t binding_generation() const { return binding; }
     probation_counters probation_stats() const { return probation; }
+    const char * evict_policy_name() const { return policy == evict_policy::lfu ? "lfu" : "lru"; }
+    uint32_t evict_decay_period() const { return decay_period; }
+    uint64_t evict_touches() const { return n_lfu_touch; }
+    uint64_t evict_decays() const { return n_lfu_decay; }
     uint32_t writers() const { return loading_count; }
     uint32_t prefetch_writers() const { return prefetch_loading; }
     void set_prefetch_limit(int32_t limit) {
@@ -281,7 +320,7 @@ public:
         if (!writing(t)) return false;
         if (entries[t.expert].value.owner == origin::prefetch) --prefetch_loading;
         entries[t.expert].value.state = phase::resident; --loading_count;
-        slots[t.slot].age = ++age; make_available(t.expert); changed.notify_all(); return true;
+        slots[t.slot].age = ++age; account(t.expert); make_available(t.expert); changed.notify_all(); return true;
     }
     bool fail(ticket t, std::exception_ptr error) {
         if (!writing(t)) return false;
@@ -334,7 +373,9 @@ public:
         if (e.value.state != phase::resident) return false;
         auto & s = slots[e.value.request.slot];
         const bool promoted = pf_probation && s.pf_unselected;
-        remove(e.value.request.slot); s.pf_unselected = false; s.age = ++age; make_available(expert);
+        remove(e.value.request.slot); s.pf_unselected = false; s.age = ++age;
+        account(expert);                       // 真正用到一次：频率 +1（lfu 生效时）
+        make_available(expert);
         if (promoted) ++probation.promotions;
         return promoted;
     }

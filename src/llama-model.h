@@ -657,6 +657,9 @@ struct llama_model {
     int32_t moe_decode_window() const;
     // Experimental Qwen3.5 MoE layout: overlap prefill and decode expert storage.
     bool moe_phase_reuse() const;
+    bool moe_shared_decode() const;
+    bool acquire_moe_shared_bank() const;
+    void release_moe_shared_bank() const;
 
     /// 每层的 decode 窗口宽度（**按 MoE 层序号**，不含预读暂存区）。
     ///
@@ -679,6 +682,9 @@ struct llama_model {
     int32_t moe_experts_layer_count() const;
 
     const llama_moe_experts_entry * moe_experts_entry(const char * tensor_name) const;
+
+    /// 逻辑 expert id -> 打包文件位置；未提供 order / 被环境变量关掉时返回 nullptr。
+    const std::vector<int32_t> * moe_experts_order(int32_t layer) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

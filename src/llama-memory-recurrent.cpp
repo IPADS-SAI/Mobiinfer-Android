@@ -13,6 +13,18 @@
 #include <map>
 #include <stdexcept>
 
+// task-22 / A4 P0 instrumentation: log the GDN (recurrent) snapshot "generation" bookkeeping so the
+// a_k=0 (rollback=3) vs a_k=1 (rollback=2) paths can be compared. Env gated, no behaviour change.
+//   LLAMA_A4_GDN_DBG=1 ->  GDNROLL (on partial rollback) / GDNSC (per state copy source generation)
+static bool a4_gdn_dbg() {
+    static const bool on = [] {
+        const char * v = std::getenv("LLAMA_A4_GDN_DBG");
+        return v && *v && *v != '0';
+    }();
+    return on;
+}
+
+
 //
 // llama_memory_recurrent
 //
@@ -96,7 +108,14 @@ llama_memory_recurrent::llama_memory_recurrent(
             throw std::runtime_error("failed to create ggml context for rs cache");
         }
 
-        const uint32_t n_rows = mem_size * (1 + n_rs_seq);
+        // n_rows is a uint32 tensor dimension; guard the arithmetic before narrowing so a bad
+        // n_rs_seq (e.g. an attacker/user supplied env override) cannot wrap into a tiny ring.
+        const uint64_t n_rows64 = (uint64_t) mem_size * (1ull + (uint64_t) n_rs_seq);
+        if (n_rows64 == 0 || n_rows64 > std::numeric_limits<uint32_t>::max()) {
+            throw std::runtime_error("llama_memory_recurrent: invalid rs cache size (mem_size=" +
+                    std::to_string(mem_size) + ", n_rs_seq=" + std::to_string(n_rs_seq) + ")");
+        }
+        const uint32_t n_rows = (uint32_t) n_rows64;
         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
         ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
         ggml_format_name(r, "cache_r_l%d", i);
@@ -181,6 +200,13 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             // partial rollback via per-token snapshot index (bounded by n_rs_seq)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
                 const llama_pos rollback = cell.pos - (p0 - 1);
+                if (a4_gdn_dbg()) {
+                    LLAMA_LOG_INFO("%s: GDNROLL seq=%d rollback=%d n_rs_seq=%u rs_idx_before=%u pos_before=%d pos_after=%d ok=%d\n",
+                            __func__, (int) seq_id, (int) rollback, n_rs_seq,
+                            (seq_id >= 0 && (size_t) seq_id < rs_idx.size()) ? rs_idx[seq_id] : 0U,
+                            (int) cell.pos, (int) (p0 - 1),
+                            (rollback >= 1 && rollback <= (llama_pos) n_rs_seq) ? 1 : 0);
+                }
                 if (rollback >= 1 && rollback <= (llama_pos) n_rs_seq) {
                     set_rs_idx(seq_id, (uint32_t) rollback);
                     cell.pos = p0 - 1;
@@ -1254,6 +1280,11 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
         if (seq >= 0 && (size_t) seq < mem->rs_idx.size()) {
             idx = mem->rs_idx[seq];
+            if (a4_gdn_dbg()) {
+                LLAMA_LOG_INFO("%s: GDNSC cell=%u seq=%d src0=%d gen=%u n_rs_seq=%u size=%u src_row=%d head=%d rs_z=%d\n",
+                        __func__, i, (int) seq, src0, idx, mem->n_rs_seq, mem->size,
+                        (int) ((int32_t)(idx * mem->size) + src0), (int) mem->head, (int) mem->rs_z);
+            }
             // reset rollback idx
             mem->rs_idx[seq] = 0;
         }

@@ -118,6 +118,11 @@ set_target_properties  (${TARGET_SINGLE_TEST_OMNI} PROPERTIES OUTPUT_NAME llama-
 target_link_libraries  (${TARGET_SINGLE_TEST_OMNI} PRIVATE llama-common omni Threads::Threads)
 target_compile_features(${TARGET_SINGLE_TEST_OMNI} PRIVATE cxx_std_17)
 
+# The VoxCPM2 TTS *libraries* below are always built: server-context links
+# voxcpm2_runtime, so they are a compile-time dependency of llama-cli / server.
+# Only the demo CLI + smoke test are optional (LLAMA_BUILD_VOXCPM2, default OFF).
+option(LLAMA_BUILD_VOXCPM2 "Build the voxcpm2-cli demo and its smoke test" OFF)
+
 # VoxCPM2 MiniCPMLM wrapper (shared with omni and test)
 add_library(voxcpm2_llm STATIC
     voxcpm2/voxcpm2_llm.cpp
@@ -187,7 +192,8 @@ add_executable(token2wav-example token2wav/token2wav-example.cpp)
 target_link_libraries(token2wav-example PRIVATE llama-common omni Threads::Threads)
 target_compile_features(token2wav-example PRIVATE cxx_std_17)
 
-# VoxCPM2 CLI demo
+# VoxCPM2 CLI demo (optional; libraries above are always built)
+if (LLAMA_BUILD_VOXCPM2)
 set(TARGET_VOXCPM2_CLI voxcpm2-cli)
 add_executable         (${TARGET_VOXCPM2_CLI} voxcpm2/voxcpm2_cli.cpp)
 set_target_properties  (${TARGET_VOXCPM2_CLI} PROPERTIES OUTPUT_NAME voxcpm2-cli)
@@ -210,6 +216,8 @@ if (LLAMA_BUILD_TESTS)
         LABELS "main;voxcpm2"
     )
 endif()
+
+endif() # LLAMA_BUILD_VOXCPM2 (CLI demo)
 
 # Token2Mel-DiT CoreML 单元测试（仅 macOS + CoreML enable 时有效）
 if(ENABLE_COREML)

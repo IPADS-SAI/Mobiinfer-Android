@@ -32,6 +32,7 @@ add_library(llama
             llama-mmap.cpp
             llama-moe-experts.cpp
             llama-moe-experts.h
+            llama-moe-evict.h
             llama-moe-slot.cpp
             llama-moe-slot.h
             llama-model-loader.cpp

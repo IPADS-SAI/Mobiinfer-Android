@@ -2095,15 +2095,107 @@ static void quantize_row_q4_0_impl(const float * GGML_RESTRICT x, block_q4_0 * G
     }
 }
 
+// Number of negative importance-matrix entries clamped to zero by the Q1_0
+// weighted path since process start.  Internal test hook only (not in a public
+// header): the count makes the "negative weights are treated as 0" rule
+// observable without changing the quantized format or adding a dependency.
+size_t ggml_q1_0_negative_weight_count(void);
+
+static size_t q1_0_negative_weight_count = 0;
+
+size_t ggml_q1_0_negative_weight_count(void) {
+    return q1_0_negative_weight_count;
+}
+
+// Weighted Q1_0 scale.  The sign of every value is fixed to s_i = sign(x_i)
+// (with x_i == 0 mapping to +1, exactly like quantize_row_q1_0_ref), so for a
+// block the quantized value is d*s_i and the scale that minimizes the weighted
+// squared error sum_i w_i (x_i - d*s_i)^2 is
+//
+//     d = sum_i w_i |x_i| / sum_i w_i .
+//
+// We use w_i = qw_i * sqrtf(sigma2 + x_i^2) with sigma2 = sum x_i^2 / k, the
+// same weighting as quantize_row_q4_0_impl(): it damps a single huge imatrix
+// entry relative to the rest of the block.  The choice is deterministic and
+// only changes the fp16 block scale (and, through it, the dequantized value) --
+// the symbol packing, block layout and output size are unchanged.
+//
+// Degenerate blocks fall back to the unweighted reference path block by block:
+// quant_weights == nullptr, a non-finite weight, or sum_i w_i <= 0.  Negative
+// weights are clamped to zero and counted.  This keeps the failure mode
+// identical to the pre-weighted behaviour instead of producing NaNs.
+static void quantize_row_q1_0_impl(const float * GGML_RESTRICT x, block_q1_0 * GGML_RESTRICT y, int64_t k, const float * quant_weights) {
+    static_assert(QK1_0 == 128, "QK1_0 must be 128");
+
+    assert(k % QK1_0 == 0);
+
+    if (!quant_weights) {
+        quantize_row_q1_0_ref(x, y, k);
+        return;
+    }
+
+    float weight[QK1_0];
+
+    float sum_x2 = 0.0f;
+    for (int64_t j = 0; j < k; ++j) {
+        sum_x2 += x[j]*x[j];
+    }
+    const float sigma2 = sum_x2/k;
+
+    const int64_t nb = k/QK1_0;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        const float * xb = x + QK1_0*ib;
+        const float * qw = quant_weights + QK1_0*ib;
+
+        int fallback = 0;
+        float sum_w     = 0.0f;
+        float sum_w_abs = 0.0f;
+        for (int j = 0; j < QK1_0; ++j) {
+            float w = qw[j];
+            if (!isfinite(w)) {
+                fallback = 1;
+                break;
+            }
+            if (w < 0.0f) {
+                ++q1_0_negative_weight_count;
+                w = 0.0f;
+            }
+            weight[j] = w * sqrtf(sigma2 + xb[j]*xb[j]);
+            sum_w     += weight[j];
+            sum_w_abs += weight[j] * fabsf(xb[j]);
+        }
+
+        if (fallback || !(sum_w > 0.0f) || !isfinite(sum_w) || !isfinite(sum_w_abs)) {
+            quantize_row_q1_0_ref(xb, y + ib, QK1_0);
+            continue;
+        }
+
+        const float d = sum_w_abs / sum_w;
+
+        y[ib].d = GGML_FP32_TO_FP16(d);
+
+        for (int j = 0; j < QK1_0 / 8; ++j) {
+            y[ib].qs[j] = 0;
+        }
+        for (int j = 0; j < QK1_0; ++j) {
+            if (xb[j] >= 0.0f) {
+                y[ib].qs[j / 8] |= (1 << (j % 8));
+            }
+        }
+    }
+}
+
 size_t quantize_q1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
     if (!quant_weights) {
+        // No importance matrix: keep the historical path bit-for-bit.
         quantize_row_q1_0_ref(src, dst, (int64_t)nrow*n_per_row);
         return nrow * ggml_row_size(GGML_TYPE_Q1_0, n_per_row);
     }
     size_t row_size = ggml_row_size(GGML_TYPE_Q1_0, n_per_row);
     char * qrow = (char *)dst;
     for (int64_t row = 0; row < nrow; ++row) {
-        quantize_row_q1_0_ref(src, (block_q1_0*)qrow, n_per_row);
+        // quant_weights is a per-column vector: every row starts at [0].
+        quantize_row_q1_0_impl(src, (block_q1_0*)qrow, n_per_row, quant_weights);
         src += n_per_row;
         qrow += row_size;
     }

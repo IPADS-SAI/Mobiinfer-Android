@@ -5,7 +5,13 @@
 #
 # 关键 env（都有默认）：
 #   REL, MODEL, EXPERTS, DRAFT, N, BANK, WINDOW, DEPTH, READ, IO_THREADS, PREFETCH,
-#   HORIZON, QUEUE, MAX_ROWS, READY, REFRESH, H1_FRONT, PROBATION, IO_BUDGET, VERIFY_SLOT
+#   HORIZON, QUEUE, MAX_ROWS, READY, REFRESH, H1_FRONT, PROBATION, IO_BUDGET, VERIFY_SLOT,
+#   SWEEP_PATH, PREFETCH_TIMING, LAYER_WINDOWS, DRAFT_DEVICE, DRAFT_THREADS, DRAFT_NGL,
+#   ARCH, HOSTBUF, IOSTAT
+#
+# 预取相关的口径（别算错预算）：
+#   层宽 = WINDOW + DEPTH（缓存 WINDOW + 预取 DEPTH；见 src/llama-moe-slot.cpp:989）
+#   bank 乒乓模式预留 2*DEPTH，且 BANK >= 2*DEPTH + 8，否则 depth 被归一化成 0
 # 输出：stdout 里由调用方解析 "[ Prompt: .. t/s | Generation: .. t/s ]"
 #
 # ⚠️ READ/DEPTH/WINDOW/PREFETCH/IO_THREADS 这类**只认短名**：直接传对应 LLAMA_MOE_*
@@ -52,11 +58,22 @@ IO_BUDGET=${IO_BUDGET:-${LLAMA_MOE_EXPERT_IO_BUDGET:-0}}
 VERIFY_SLOT=${VERIFY_SLOT:-${LLAMA_MOE_VERIFY_SLOT:-0}}
 SPLIT=${SPLIT:-${LLAMA_MOE_MATMUL_SPLIT:-0}}
 PROFILE=${PROFILE:-0}
+# T-0296: the UFS/GC sidecar is implemented in sweep.sh; bench.sh only carries
+# the switch (default 0) so nested invocations see the same value.  It never
+# changes argv, output, or timing.
+IOSTAT=${IOSTAT:-0}
+export IOSTAT
 FW_PROBE=${FW_PROBE:-0}
 LV=${LV:-3}
 PERF=${PERF:-0}
 SPEC=${SPEC:-1}
 SPECN=${SPECN:-3}
+# DSpark draft 的位置/线程数/offload 层数：默认 HTP0 / 空 / 99 → 命令行与旧行为等价。
+# DRAFT_THREADS 只在非空时追加；DRAFT_NGL=0 可让 draft 各层留在 CPU（DSpark 的
+# lm-head/embedding 复用 target，仍留在 HTP0，故设备不能给 none）。
+DRAFT_DEVICE=${DRAFT_DEVICE:-HTP0}
+DRAFT_THREADS=${DRAFT_THREADS:-}
+DRAFT_NGL=${DRAFT_NGL:-99}
 FA=${FA:-auto}
 PROMPT_FILE=${PROMPT_FILE:-}
 PROMPT=${PROMPT:-"Explain how rain forms in clear simple English."}
@@ -90,8 +107,18 @@ fi
 export LD_LIBRARY_PATH="/system/lib64:/vendor/lib64:$REL/lib"
 export ADSP_LIBRARY_PATH="$REL/lib;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp"
 export GGML_HEXAGON_DEVICES=1
-export GGML_HEXAGON_ARCH=81
-export GGML_HEXAGON_HOSTBUF=1
+# vivo default remains v81/HOSTBUF=1.  ARCH/HOSTBUF are short-name overrides so
+# the nubia wrapper (bench-nubia.sh) can select v79 / non-host without a fork.
+# Unset ARCH = vivo default 81; explicitly empty ARCH = leave the variable
+# unset so the backend auto-detects (nubia `ARCH=`, see GATES.md §3.3).
+if [ -n "${ARCH:-}" ]; then
+    export GGML_HEXAGON_ARCH=$ARCH
+elif [ -n "${ARCH+x}" ]; then
+    unset GGML_HEXAGON_ARCH
+else
+    export GGML_HEXAGON_ARCH=81
+fi
+export GGML_HEXAGON_HOSTBUF=${HOSTBUF:-1}
 export GGML_HEXAGON_MBUF=${MBUF:-256M,512M,4G}
 export GGML_HEXAGON_OPPOLL=${OPPOLL:-1}
 export GGML_HEXAGON_PROFILE=$PROFILE
@@ -120,6 +147,10 @@ export LLAMA_MOE_READY_FAST_FIRST=0
 export LLAMA_MOE_READY_TRACE=${READY_TRACE:-0}
 export LLAMA_MOE_SKIP_READ=${SKIP_READ:-0}
 export LLAMA_MOE_SWEEP=${SWEEP_PATH:-}
+# 逐层预取统计（read_experts/late_jobs/overlap_us）；空串=关，安全。
+export LLAMA_MOE_PREFETCH_TIMING=${PREFETCH_TIMING:-}
+# 按层窗口 "0:N,1:M,..."（覆盖 WINDOW）；空串/非法项会被模型侧忽略。
+export LLAMA_MOE_LAYER_WINDOWS=${LAYER_WINDOWS:-}
 export LLAMA_MOE_DRAFT_THRESHOLD=${DRAFT_THRESHOLD:-}
 export LLAMA_MOE_DUMMY_READ=${DUMMY_READ:-0}
 export LLAMA_FW_PROBE=$FW_PROBE
@@ -127,7 +158,8 @@ export LLAMA_FW_PROBE=$FW_PROBE
 if [ -n "${PROMPT_FILE:-}" ]; then PROMPT_ARGS=(-f "$PROMPT_FILE"); else PROMPT_ARGS=(-p "$PROMPT"); fi
 # EXTRA：透传任意额外 llama-cli 参数（例如 EXTRA="-no-cnv"）。
 # 注意：本脚本只认**短名** env（PREFETCH/SKIP_READ/DUMMY_READ/READ/DEPTH/
-# IO_THREADS…），传 LLAMA_MOE_* 会被这里 export 的默认值覆盖。
+# IO_THREADS/SWEEP_PATH/PREFETCH_TIMING/LAYER_WINDOWS…），传 LLAMA_MOE_*
+# 会被这里 export 的默认值覆盖。
 EXTRA=${EXTRA:-}
 
 LIB_SHA=$(sha256sum "$REL/lib/libllama.so" 2>/dev/null | cut -c1-12)
@@ -139,4 +171,4 @@ exec "$REL/bin/llama-cli" -m "$MODEL" \
   ${NOMAP:+--no-mmap} -c ${CTX:-2048} -b ${BATCH:-512} -ub ${UB:-128} -ctk ${CTK:-f16} -ctv ${CTV:-f16} -fa "$FA" -fit off --no-warmup \
   --seed 42 --temp 0 --single-turn --reasoning off -lv "$LV" \
   "${PROMPT_ARGS[@]}" $EXTRA \
-  ${SPEC:+$([ "$SPEC" = "1" ] && echo "--spec-type draft-dspark --model-draft $DRAFT --device-draft HTP0 -ngld 99 --spec-draft-n-max $SPECN ${SPECN_MIN:+--spec-draft-n-min $SPECN_MIN} ${SPECPMIN:+--spec-draft-p-min $SPECPMIN}")} -n "$N" ${PERF:+$([ "$PERF" = "1" ] && echo --perf)}
+  ${SPEC:+$([ "$SPEC" = "1" ] && echo "--spec-type draft-dspark --model-draft $DRAFT --device-draft $DRAFT_DEVICE -ngld $DRAFT_NGL ${DRAFT_THREADS:+--spec-draft-threads $DRAFT_THREADS} --spec-draft-n-max $SPECN ${SPECN_MIN:+--spec-draft-n-min $SPECN_MIN} ${SPECPMIN:+--spec-draft-p-min $SPECPMIN}")} -n "$N" ${PERF:+$([ "$PERF" = "1" ] && echo --perf)}

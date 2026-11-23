@@ -20,6 +20,24 @@ class llama_batch_allocr;
 class llama_io_read_i;
 class llama_io_write_i;
 
+// Mutable per-decode state of the DFlash draft-pool (A4) arm. Owned by the draft context so that
+// two contexts cannot observe or terminate each other's arm, and so that the graph builder never
+// reads process-global mutable state.
+struct llama_dflash_a4_state {
+    bool    armed       = false;
+    bool    decode_active = false; // set for the single draft decode that owns this A4 block
+    bool    pool_mode   = false;
+    int32_t n_pool      = 0;
+    int32_t head_k      = 0;
+    int32_t aux_rows    = 0;
+    int32_t block_rows  = 0;
+    int32_t anchor      = -1;
+    llama_seq_id seq_id = -1;
+
+    std::vector<int32_t> ids_first;  // [n_pool] vocab rows of the first-candidate pool
+    std::vector<int32_t> ids_shared; // [n_pool] vocab rows of the shared 2nd/3rd pool
+};
+
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
 struct llama_memory_context_i;
@@ -87,6 +105,7 @@ struct llama_context {
 
     float * get_embeddings_pre_norm();
     float * get_embeddings_pre_norm_ith(int32_t i);
+    bool    pre_norm_valid() const { return embd_pre_norm_valid; }
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
@@ -115,6 +134,27 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_pre_norm(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+
+    // target aux LM-head rows (draft-pool A4, see llama-ext.h):
+    // enable n_rows extra head rows per sequence (0 = disable), upload one sequence's rows and
+    // read back the aux logits of the last decode. the aux rows never enter the batch.
+    // the graph is rebuilt/reserved when n_rows changes.
+    void set_aux_head(uint32_t n_rows);
+    bool set_aux_hidden(llama_seq_id seq_id, const float * data);
+    void clear_aux_seq(llama_seq_id seq_id);
+    uint32_t n_aux_rows() const;
+    float * get_aux_logits(llama_seq_id seq_id);
+
+    // T20: device top-k over the aux rows (ids + shared-pool candidate values only)
+    void            set_aux_top_k(uint32_t k);
+    uint32_t        n_aux_top_k() const;
+    const int32_t * get_aux_top_k_ids(llama_seq_id seq_id);
+    const float   * get_aux_top_k_vals(llama_seq_id seq_id);
+
+    // DFlash draft-pool A4 state, owned by this (draft) context (see src/models/dflash.cpp)
+    llama_dflash_a4_state       & dflash_a4()       { return dflash_a4_state; }
+    const llama_dflash_a4_state & dflash_a4() const { return dflash_a4_state; }
+
     void set_causal_attn(bool value);
     void set_warmup(bool value);
     void set_moe_lookahead_prefetch_depth(int32_t depth);
@@ -241,6 +281,13 @@ private:
     // from backend into host-side embd_layer_inp buffers
     void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
 
+    // discard pending aux uploads/outputs after a failed/cancelled decode
+    void aux_decode_abort();
+    // async-copy the aux head logits (if any) of this ubatch from the backend into aux_head.logits
+    void extract_aux_logits(const llm_graph_result * res, const llama_ubatch & ubatch);
+    // T20: async-copy the per-row aux top-k ids and the shared-pool candidate values
+    void extract_aux_top_k(const llm_graph_result * res, const llama_ubatch & ubatch);
+
     //
     // graph
     //
@@ -267,7 +314,8 @@ private:
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                          bool             reserve = false) const;
 
     llm_graph_cb graph_get_cb() const;
 
@@ -305,10 +353,44 @@ private:
     // populated only when cparams.embeddings_pre_norm is enabled and the model graph
     // sets llm_graph_result::t_h_pre_norm
     buffer_view<float> embd_pre_norm = {nullptr, 0};
+    bool embd_pre_norm_valid = false; // this decode actually wrote the pre-norm channel
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
+
+    // target aux LM-head rows (draft-pool A4). Extra rows for the output head, uploaded from the
+    // host and returned in a channel fully separate from logits/embd. The rows are not batch
+    // tokens: no KV entry, no position, no output_ids entry.
+    struct aux_head_info {
+        uint32_t n_rows = 0; // rows per sequence; 0 = disabled
+
+        // host-side input rows, F32 [n_seq_max][n_rows][n_embd] (seq-major)
+        std::vector<float> hidden;
+
+        // set for sequences with a hidden upload that has not been consumed by a decode yet.
+        // An aux-logits readback is only valid for a sequence whose rows were uploaded for *this*
+        // verify; prefill decodes (or a stale upload from an earlier request) must not publish a
+        // pool source.
+        std::vector<uint8_t> hidden_valid;
+
+        // host-side aux logits of the last decode, F32 [n_seq_max][n_rows][n_vocab] (seq-major)
+        buffer_view<float> logits = {nullptr, 0};
+
+        // set for sequences whose aux logits were computed by the last decode
+        std::vector<uint8_t> logits_valid;
+
+        // T20: device top-k channel - ids [3*k] + shared-candidate values [4*k] per sequence
+        uint32_t             top_k = 0;
+        std::vector<int32_t> top_k_ids;   // [n_seq_max][3*k]
+        std::vector<float>   top_k_vals;  // [n_seq_max][4*k]
+        std::vector<uint8_t> top_k_valid; // [n_seq_max]
+    };
+
+    aux_head_info aux_head;
+
+    // draft-pool A4 arm/graph state, owned by this context
+    llama_dflash_a4_state dflash_a4_state;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

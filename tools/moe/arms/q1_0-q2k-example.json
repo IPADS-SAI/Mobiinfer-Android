@@ -1,0 +1,19 @@
+{
+  "id": "q1_0-block36-39",
+  "base_model": "/home/ma-user/moe-work/mixed-quant/minicpm47-bf16-nomtp.gguf",
+  "default_type": "Q6_K",
+  "rules": [
+    {"regex": "blk\\.(36|37|38|39)\\.ffn_(gate|up|down)_exps\\.weight", "type": "Q2_K"},
+    {"regex": "ffn_(gate|up|down)_exps\\.weight", "type": "Q1_0"}
+  ],
+  "ppl": {
+    "corpus": "/home/ma-user/workspace/csm/moe-exp/t-0037/corpus-wikitext2.txt",
+    "chunks": 128,
+    "ctx": 2048,
+    "batch": 2048,
+    "ubatch": 512,
+    "threads": 16
+  },
+  "pack": {"enabled": true, "expert_order": null},
+  "quantize_threads": 16
+}

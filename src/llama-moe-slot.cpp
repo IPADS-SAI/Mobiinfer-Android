@@ -3,6 +3,9 @@
 #include "llama-moe-live-union.h"
 #include "llama-moe-io-admission.h"
 #include "llama-moe-prefetch-schedule.h"
+#include "llama-moe-prefetch-merge.h"
+#include "llama-moe-merge-read-hardening.h"
+#include "llama-moe-merge-gate.h"
 
 #include "ggml-backend.h"
 #include "llama-impl.h"
@@ -26,12 +29,15 @@
 #include <new>
 #include <map>
 #include <mutex>
+#include <numeric>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+namespace pfmerge = llama_moe::prefetch_merge;
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -71,6 +77,48 @@ static bool slot_manager_enabled() {
         return value && std::strcmp(value, "1") == 0;
     }();
     return enabled;
+}
+
+static void moe_log(const char * fmt, ...);
+
+using evict_override = std::pair<llama_moe::slot_manager::evict_policy, uint32_t>;
+
+/// 窗口淘汰策略：LLAMA_MOE_EVICT = lru（默认）| lfu | lfu<N>
+///   lfu    : 按 (专家访问次数, age) 淘汰，计数不衰减
+///   lfu<N> : 每 N 次访问把所有计数减半（老化），N 取 0 等价于不衰减
+/// 只影响 slot_manager 的常驻堆排序键；默认 lru 与旧行为逐位一致。
+/// 解析本身在 llama-moe-config.h（纯函数，host 单测覆盖非法输入）。
+static evict_override parse_evict_spec(const char * v, const char * what) {
+    const auto parsed = llama_moe::config::parse_evict_spec(v, what);
+    if (!parsed.error.empty()) throw std::runtime_error(parsed.error);
+    if (!parsed.warning.empty()) moe_log("%s: %s", what, parsed.warning.c_str());
+    const auto policy = parsed.policy == llama_moe::config::evict_policy::lfu
+        ? llama_moe::slot_manager::evict_policy::lfu
+        : llama_moe::slot_manager::evict_policy::lru;
+    return {policy, parsed.decay};
+}
+
+static evict_override evict_policy_from_env() {
+    return parse_evict_spec(std::getenv("LLAMA_MOE_EVICT"), "LLAMA_MOE_EVICT");
+}
+
+/// LLAMA_MOE_EVICT_LAYERS="0:lfu512,1:lfu512,39:lfu"：按 MoE 层序号覆盖全局策略；
+/// 未列出的层仍用 LLAMA_MOE_EVICT（默认 lru）。手册：首/末几层偏频率、中间层偏最近性。
+/// 非法项仍按旧行为抛错；旧实现静默接受的写法（如非数字层号）现在会打一条告警。
+static std::unordered_map<int32_t, evict_override> evict_layers_from_env() {
+    std::unordered_map<int32_t, evict_override> out;
+    const auto parsed = llama_moe::config::parse_evict_layers(std::getenv("LLAMA_MOE_EVICT_LAYERS"));
+    if (!parsed.error.empty()) throw std::runtime_error(parsed.error);
+    for (const auto & warning : parsed.warnings) {
+        moe_log("LLAMA_MOE_EVICT_LAYERS: %s", warning.c_str());
+    }
+    for (const auto & kv : parsed.layers) {
+        const auto policy = kv.second.policy == llama_moe::config::evict_policy::lfu
+            ? llama_moe::slot_manager::evict_policy::lfu
+            : llama_moe::slot_manager::evict_policy::lru;
+        out[kv.first] = {policy, kv.second.decay};
+    }
+    return out;
 }
 
 static bool pf_probation_enabled() {
@@ -427,7 +475,7 @@ public:
                               "\"file_offset\":%llu,\"requested_pages\":%llu,\"resident_pages\":%lld,"
                               "\"probe_begin_ns\":%lld,\"probe_end_ns\":%lld,\"probe_errno\":%d,"
                               "\"admit_seq\":%llu,\"admit_class\":\"%s\",\"admit_active\":%u,"
-                              "\"admit_waiters\":%u,\"admit_capacity\":%u}\n",
+                              "\"admit_waiters\":%u,\"admit_capacity\":%u",
                          (unsigned long long) i, (long long) e.ns, (unsigned long long) e.tid, e.name,
                          e.context.source, (unsigned long long) e.context.job_id,
                          (unsigned long long) e.context.epoch, e.context.layer, e.context.rows, e.expert, e.slot, e.result,
@@ -442,6 +490,23 @@ public:
                          (long long) e.detail.probe_end_ns, e.detail.probe_errno,
                          (unsigned long long) e.detail.admit_seq, e.detail.admit_class, e.detail.admit_active,
                          e.detail.admit_waiters, e.detail.admit_capacity);
+            // New v1 bubble events add named timing fields. Existing event names
+            // keep their exact JSON shape; only new events get the suffix below.
+            if (std::strcmp(e.name, "MAP_END") == 0) {
+                std::fprintf(file, ",\"map_ns\":%llu}\n", (unsigned long long) e.bytes);
+            } else if (std::strcmp(e.name, "ARM_BEGIN") == 0) {
+                std::fprintf(file, ",\"layer_next\":%d}\n", e.context.layer);
+            } else if (std::strcmp(e.name, "ARM_END") == 0) {
+                std::fprintf(file, ",\"arm_ns\":%llu,\"decision\":\"%s\"}\n",
+                             (unsigned long long) e.bytes, e.detail.reason);
+            } else if (std::strcmp(e.name, "QUEUE_ENQUEUE") == 0) {
+                std::fprintf(file, ",\"queue_depth\":%d}\n", e.result);
+            } else if (std::strcmp(e.name, "WORKER_WAKE") == 0) {
+                std::fprintf(file, ",\"wait_ns\":%llu,\"queue_depth\":%d}\n",
+                             (unsigned long long) e.bytes, e.result);
+            } else {
+                std::fprintf(file, "}\n");
+            }
         }
         const bool failed = std::ferror(file) != 0;
         const int close_result = std::fclose(file);
@@ -484,6 +549,46 @@ struct moe_handoff_span {
     }
     ~moe_handoff_span() { trace.emit(end, context, expert, slot, result, bytes); }
     void complete() { result = 0; }
+};
+
+// Arm/map spans are diagnostic-only. The constructor checks enabled() before
+// touching the clock, so a run without LLAMA_MOE_HANDOFF_TRACE pays one pointer
+// check and one predictable branch per arm / MAP_CUSTOM callback.
+struct moe_handoff_arm_span {
+    moe_handoff_trace * trace = nullptr;
+    moe_handoff_context context;
+    int64_t begin_ns = 0;
+    const char * decision = "skip";
+    moe_handoff_arm_span(moe_handoff_trace * candidate, moe_handoff_context context) :
+        trace(candidate && candidate->enabled() ? candidate : nullptr), context(context) {
+        if (trace) {
+            begin_ns = now_ns();
+            trace->emit("ARM_BEGIN", context);
+        }
+    }
+    ~moe_handoff_arm_span() {
+        if (!trace) return;
+        moe_handoff_detail detail;
+        detail.reason = decision;
+        trace->emit("ARM_END", context, -1, -1, 0, (uint64_t) (now_ns() - begin_ns), {}, detail);
+    }
+    void accept() { decision = "accept"; }
+};
+
+struct moe_handoff_map_span {
+    moe_handoff_trace * trace = nullptr;
+    moe_handoff_context context;
+    int64_t begin_ns = 0;
+    moe_handoff_map_span(moe_handoff_trace * candidate, moe_handoff_context context, int64_t begin) :
+        trace(candidate && candidate->enabled() ? candidate : nullptr), context(context), begin_ns(begin) {
+        if (trace) trace->emit("MAP_BEGIN", context);
+    }
+    ~moe_handoff_map_span() { if (trace) finish(now_ns()); }
+    void finish(int64_t end_ns) {
+        if (!trace) return;
+        trace->emit("MAP_END", context, -1, -1, 0, (uint64_t) (end_ns - begin_ns));
+        trace = nullptr;
+    }
 };
 
 // Track each held segment separately. IO and condition-variable waits happen
@@ -637,6 +742,7 @@ struct lookahead_expert_prefetch {
         llama_moe::slot_manager::ticket request;
     };
     struct job_meta {
+        uint64_t id        = 0;
         int32_t  layer     = -1;
         int32_t  n         = 0;
         int32_t  remaining = 0;
@@ -667,6 +773,10 @@ struct lookahead_expert_prefetch {
     /// 读一个专家。(layer, expert, slot, to_window)：to_window=true 表示写进目标层窗口，
     /// 此时 slot 无意义；false 表示写进乒乓区里的 slot 格。
     std::function<read_result(int, int, int, bool, llama_moe::slot_manager::ticket)> read_fn;
+    /// R4a：一次读**同一层同一 epoch** 的一整批专家。只有 merge_prefetch_mode()!=0
+    /// 时 worker 才会把 queue 里同层同 epoch 的 task 收成一批交给它；mode=0 时
+    /// 永远走上面的 read_fn（逐专家，读顺序也不变）。
+    std::function<std::vector<read_result>(const std::vector<task> &)> read_batch_fn;
     std::function<llama_moe::slot_manager::result(int, int, uint64_t, uint64_t, int)> enqueue_fn;
     std::function<bool(int, llama_moe::slot_manager::ticket)> cancel_fn;
     moe_handoff_trace * handoff = nullptr;
@@ -1023,6 +1133,7 @@ struct lookahead_expert_prefetch {
 
     bool arm_refreshed(int32_t layer, const std::vector<int32_t> & pred, uint64_t epoch, int rows, bool near) {
         auto context = moe_handoff_context{0, epoch, layer, rows, "prefetch", 0, "window"};
+        moe_handoff_arm_span arm_span(handoff, context);
         {
             std::lock_guard<std::mutex> lock(mtx);
             if (near) {
@@ -1054,10 +1165,12 @@ struct lookahead_expert_prefetch {
         }
         const uint64_t id = new_job ? next_job++ : existing->first;
         context.job_id = id;
-        const int64_t submitted_ns = timing_enabled || handoff ? now_ns() : 0;
+        arm_span.accept();
+        const int64_t submitted_ns = timing_enabled || (handoff && handoff->enabled()) ? now_ns() : 0;
         if (new_job) {
             job_meta job; job.layer = layer; job.epoch = epoch; job.rows = rows;
             job.arm_ns = submitted_ns; job.to_window = true;
+            job.id = id;
             jobs.emplace(id, job); ++pending_jobs;
             // In refresh mode these two markers carry the admission upper
             // bound, not a byte/task count. REFRESH_ENQUEUE is the actual ledger.
@@ -1096,7 +1209,14 @@ struct lookahead_expert_prefetch {
             if (job.n + count > kMaxDepth) throw std::logic_error("refreshed prefetch job exceeds its read budget");
             size_t pushed = 0;
             try {
-                for (int i = 0; i < count; ++i) { queue.push_back(tasks[(size_t) i]); ++pushed; }
+                for (int i = 0; i < count; ++i) {
+                    queue.push_back(tasks[(size_t) i]); ++pushed;
+                    if (handoff && handoff->enabled()) {
+                        const auto & t = tasks[(size_t) i];
+                        handoff->emit("QUEUE_ENQUEUE", handoff_request(context, t.request),
+                            t.expert, t.request.slot, (int32_t) queue.size());
+                    }
+                }
             } catch (...) {
                 while (pushed) { queue.pop_back(); --pushed; }
                 throw;
@@ -1129,23 +1249,23 @@ struct lookahead_expert_prefetch {
         return true;
     }
 
-    void arm_managed(int32_t layer, const std::vector<int32_t> & pred, uint64_t epoch, int rows) {
+    bool arm_managed(int32_t layer, const std::vector<int32_t> & pred, uint64_t epoch, int rows) {
         moe_handoff_context context = {0, epoch, layer, rows, "prefetch", 0, "window"};
         if (!enabled || layer < 1 || layer > last_moe_layer || pred.empty()) {
             if (handoff) handoff->emit("ARM_SKIP_INVALID", context);
-            return;
+            return false;
         }
         if (read_n <= 0) {
             ++n_predict_only;
             if (handoff) handoff->emit("ARM_SKIP_PREDICT_ONLY", context);
-            return;
+            return false;
         }
         job_meta job;
         std::unique_lock<std::mutex> lock(mtx);
         if (pending_jobs >= std::max(1, queue_cap)) {
             ++n_arm_skipped;
             if (handoff) handoff->emit("ARM_SKIP", context, -1, -1, pending_jobs);
-            return;
+            return false;
         }
         std::vector<uint8_t> seen((size_t) n_expert, 0);
         for (int32_t expert : pred) {
@@ -1153,11 +1273,12 @@ struct lookahead_expert_prefetch {
             if (expert < 0 || expert >= n_expert || seen[(size_t) expert]) continue;
             seen[(size_t) expert] = 1; job.expert[job.n++] = expert;
         }
-        if (!job.n) return;
+        if (!job.n) return false;
         for (int k = job.n; k < kMaxDepth; ++k) job.expert[k] = -1;
         job.layer = layer; job.epoch = epoch; job.rows = rows; job.to_window = true;
-        job.arm_ns = timing_enabled || handoff ? now_ns() : 0;
+        job.arm_ns = timing_enabled || (handoff && handoff->enabled()) ? now_ns() : 0;
         const uint64_t id = next_job++;
+        job.id = id;
         context.job_id = id;
         jobs.emplace(id, job); ++pending_jobs;
         if (handoff) { handoff->emit("ARM_ACCEPT", context, -1, -1, job.n); handoff->emit("JOB_BEGIN", context, -1, -1, job.n); }
@@ -1177,7 +1298,14 @@ struct lookahead_expert_prefetch {
             if (quit) throw std::runtime_error("MoE prefetch stopped during submission");
             size_t pushed = 0;
             try {
-                for (int i = 0; i < count; ++i) { queue.push_back(tasks[(size_t) i]); ++pushed; }
+                for (int i = 0; i < count; ++i) {
+                    queue.push_back(tasks[(size_t) i]); ++pushed;
+                    if (handoff && handoff->enabled()) {
+                        const auto & t = tasks[(size_t) i];
+                        handoff->emit("QUEUE_ENQUEUE", handoff_request(context, t.request),
+                            t.expert, t.request.slot, (int32_t) queue.size());
+                    }
+                }
             } catch (...) {
                 while (pushed) { queue.pop_back(); --pushed; }
                 throw;
@@ -1200,12 +1328,17 @@ struct lookahead_expert_prefetch {
             lock.unlock(); cv_done.notify_all();
             throw;
         }
+        return true;
     }
 
     void arm(int32_t layer_next, const std::vector<int32_t> & pred, uint64_t epoch, int rows) {
         const moe_handoff_context context = {0, epoch, layer_next, rows, "prefetch", 0, window_mode ? "window" : "bank"};
+        moe_handoff_arm_span arm_span(handoff, context);
         if (handoff) handoff->emit("ARM_ATTEMPT", context);
-        if (enqueue_fn && window_mode) { arm_managed(layer_next, pred, epoch, rows); return; }
+        if (enqueue_fn && window_mode) {
+            if (arm_managed(layer_next, pred, epoch, rows)) arm_span.accept();
+            return;
+        }
         // rows 只用于日志；队列化之后 job 里不再记它（完成时按层聚合）。
         GGML_UNUSED(rows);
         if (!enabled || layer_next < 1 || layer_next > last_moe_layer || pred.empty()) {
@@ -1252,17 +1385,23 @@ struct lookahead_expert_prefetch {
         job.layer     = layer_next;
         job.remaining = job.n;
         job.to_window = window_mode;
-        job.arm_ns    = timing_enabled || handoff ? now_ns() : 0;
+        job.arm_ns    = timing_enabled || (handoff && handoff->enabled()) ? now_ns() : 0;
         job.epoch = epoch; job.rows = rows;
         const uint64_t id = next_job++;
+        job.id = id;
         jobs.emplace(id, job);
         pending_jobs++;
+        arm_span.accept();
         if (handoff) { auto c = context; c.job_id = id; handoff->emit("ARM_ACCEPT", c, -1, -1, job.n); handoff->emit("JOB_BEGIN", c, -1, -1, job.n); }
 
         // 语义在这里固化：worker 只认 task::to_window，不再回头看全局的 window_mode。
         const int32_t base = bank_base(layer_next & 1);
+        auto qctx = context; qctx.job_id = id;
         for (int k = 0; k < job.n; ++k) {
             queue.push_back(task{ layer_next, base + k, window_mode, job.expert[k], id, job.arm_ns, epoch, rows, {} });
+            if (handoff && handoff->enabled()) {
+                handoff->emit("QUEUE_ENQUEUE", qctx, job.expert[k], -1, (int32_t) queue.size());
+            }
         }
         if (timing_enabled) {
             auto & t = timings[(size_t) layer_next];
@@ -1274,73 +1413,230 @@ struct lookahead_expert_prefetch {
         cv_go.notify_all();
     }
 
+    /// MERGE_PREFETCH=0 的单专家旧路径。原样保留读顺序 / 计数 / trace，
+    /// 不引入任何 batch 分配，保证默认行为（含热路径开销）不变。
+    void run_single(const task & t) {
+        const moe_handoff_context task_context = handoff_request({t.job, t.epoch, t.layer, t.rows, "prefetch", 0, t.to_window ? "window" : "bank"}, t.request);
+        moe_handoff_scope task_scope(handoff, task_context, t.expert, t.slot);
+        if (handoff) handoff->emit("TASK_BEGIN", task_context, t.expert, t.slot);
+        const int64_t start_ns = timing_enabled ? now_ns() : 0;
+        try {
+            const auto result = read_fn(t.layer, t.expert, t.slot, t.to_window, t.request);
+            if (handoff) handoff->emit("PF_RESULT", task_context, t.expert, t.slot, (int32_t) result);
+            if (result == read_result::skipped) {
+                n_pred_skipped.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                n_pred_read.fetch_add(1, std::memory_order_relaxed);
+                if (result == read_result::published) {
+                    n_pred_published.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    n_pred_discarded.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        } catch (...) {
+            if (handoff) handoff->emit("PF_ERROR", task_context, t.expert, t.slot, -1);
+            n_pred_errors.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (handoff) handoff->emit("TASK_DONE", task_context, t.expert, t.slot);
+
+        job_meta done_job;
+        bool finished = false;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            if (timing_enabled) {
+                auto & tm = timings[(size_t) t.layer];
+                tm.read_wall_ns += now_ns() - start_ns;
+                tm.reads++;
+                tm.overlap_ns += std::max<int64_t>(0, start_ns - t.arm_ns);
+                tm.overlap_n++;
+            }
+            auto it = jobs.find(t.job);
+            if (it != jobs.end() && --it->second.remaining == 0) {
+                done_job = it->second;
+                jobs.erase(it);
+                pending_jobs--;
+                finished = true;
+            }
+        }
+        if (finished) {
+            std::lock_guard<std::mutex> lk(mtx);
+            if (trace_enabled) {
+                moe_log("prefetch-job: layer=%d n=%d", done_job.layer, done_job.n);
+            }
+            if (timing_enabled) {
+                timings[(size_t) done_job.layer].jobs++;
+            }
+            arm_layer = done_job.layer;
+            arm_bank = done_job.layer & 1;
+            arm_n = done_job.n;
+            memcpy(arm_expert, done_job.expert, sizeof(arm_expert));
+            if (handoff) handoff->emit("JOB_DONE", {done_job.id, done_job.epoch, done_job.layer, done_job.rows, "prefetch", 0, done_job.to_window ? "window" : "bank"});
+            cv_done.notify_all();
+        }
+    }
+
     /// 常驻读线程：从 FIFO 取一个 (层, 专家)，读进目标层窗口并发布。
     /// 并发度由线程数决定（默认 = LLAMA_MOE_IO_THREADS），不再是「每 job 现开 n 个线程」。
+    ///
+    /// R4a：`LLAMA_MOE_MERGE_PREFETCH=1|2` 时，在锁内把 queue 里**同层、同 epoch、
+    /// 同落点**的 task 一起取走，交给 read_batch_fn。这样同一预测批次（同一
+    /// lookahead step）的请求能一次规划；不会跨层、不会跨 phase（queue 里只有
+    /// prefetch task）。mode=0 时仍只取一个，逐专家读、读顺序逐字节不变。
     void worker_loop() {
         for (;;) {
-            task t;
+            // 默认开关（MERGE_PREFETCH=0）：完全走旧单专家路径，不建 batch。
+            if (llama_moe::prefetch_merge::env_mode() == 0 || !read_batch_fn) {
+                task t;
+                {
+                    std::unique_lock<std::mutex> lk(mtx);
+                    const bool wake_trace = handoff && handoff->enabled();
+                    const int64_t wake_begin_ns = wake_trace ? now_ns() : 0;
+                    cv_go.wait(lk, [this]() { return quit || !queue.empty(); });
+                    if (wake_trace) {
+                        const int32_t depth = (int32_t) queue.size();
+                        moe_handoff_context wake_context = {0, 0, -1, 0, "worker", 0, "prefetch"};
+                        if (!queue.empty()) {
+                            const task & head = queue.front();
+                            wake_context = {head.job, head.epoch, head.layer, head.rows, "worker", 0,
+                                            head.to_window ? "window" : "bank"};
+                        }
+                        handoff->emit("WORKER_WAKE", wake_context,
+                            -1, -1, depth, (uint64_t) (now_ns() - wake_begin_ns));
+                    }
+                    if (quit && queue.empty()) {
+                        return;
+                    }
+                    if (refresh) {
+                        const auto next = std::min_element(queue.begin(), queue.end(), [](const task & a, const task & b) {
+                            return llama_moe::prefetch_schedule::earlier(a.epoch, a.layer, b.epoch, b.layer);
+                        });
+                        if (next != queue.begin()) ++refresh_reprioritized;
+                        t = *next; queue.erase(next);
+                    } else {
+                        t = queue.front(); queue.pop_front();
+                    }
+                }
+                run_single(t);
+                continue;
+            }
+            std::vector<task> batch;
             {
                 std::unique_lock<std::mutex> lk(mtx);
+                const bool wake_trace = handoff && handoff->enabled();
+                const int64_t wake_begin_ns = wake_trace ? now_ns() : 0;
                 cv_go.wait(lk, [this]() { return quit || !queue.empty(); });
+                if (wake_trace) {
+                    const int32_t depth = (int32_t) queue.size();
+                    moe_handoff_context wake_context = {0, 0, -1, 0, "worker", 0, "prefetch"};
+                    if (!queue.empty()) {
+                        const task & head = queue.front();
+                        wake_context = {head.job, head.epoch, head.layer, head.rows, "worker", 0,
+                                        head.to_window ? "window" : "bank"};
+                    }
+                    handoff->emit("WORKER_WAKE", wake_context,
+                        -1, -1, depth, (uint64_t) (now_ns() - wake_begin_ns));
+                }
                 if (quit && queue.empty()) {
                     return;
                 }
+                auto first = queue.begin();
                 if (refresh) {
-                    const auto next = std::min_element(queue.begin(), queue.end(), [](const task & a, const task & b) {
+                    first = std::min_element(queue.begin(), queue.end(), [](const task & a, const task & b) {
                         return llama_moe::prefetch_schedule::earlier(a.epoch, a.layer, b.epoch, b.layer);
                     });
-                    if (next != queue.begin()) ++refresh_reprioritized;
-                    t = *next; queue.erase(next);
-                } else {
-                    t = queue.front(); queue.pop_front();
+                    if (first != queue.begin()) ++refresh_reprioritized;
+                }
+                const task head = *first;
+                batch.push_back(head);
+                queue.erase(first);
+                // 只收同层同 epoch 的 task：mode=1 只多用它算投影，实际仍逐专家读；
+                // mode=0 不进入这个分支（read_batch_fn 为空/模式为 0）。
+                {
+                    for (auto it = queue.begin(); it != queue.end();) {
+                        if (it->layer == head.layer && it->epoch == head.epoch &&
+                            it->to_window == head.to_window) {
+                            batch.push_back(*it);
+                            it = queue.erase(it);
+                        } else {
+                            ++it;
+                        }
+                    }
                 }
             }
 
-            const moe_handoff_context task_context = handoff_request({t.job, t.epoch, t.layer, t.rows, "prefetch", 0, t.to_window ? "window" : "bank"}, t.request);
-            moe_handoff_scope task_scope(handoff, task_context, t.expert, t.slot);
-            if (handoff) handoff->emit("TASK_BEGIN", task_context, t.expert, t.slot);
             const int64_t start_ns = timing_enabled ? now_ns() : 0;
-            try {
-                // to_window=true：让 impl 按**目标层**的窗口 LRU 认领并发布 ——
-                // 预读成果直接变成那层的缓存命中，不需要再搬一次。
-                const auto result = read_fn(t.layer, t.expert, t.slot, t.to_window, t.request);
-                if (handoff) handoff->emit("PF_RESULT", task_context, t.expert, t.slot, (int32_t) result);
-                if (result == read_result::skipped) {
+            std::vector<read_result> results(batch.size(), read_result::skipped);
+            bool failed = false;
+            if (batch.size() > 1 && read_batch_fn) {
+                try {
+                    results = read_batch_fn(batch);
+                    if (results.size() != batch.size()) {
+                        failed = true;
+                    }
+                } catch (...) {
+                    failed = true;
+                }
+            } else {
+                const task & t = batch.front();
+                const moe_handoff_context task_context = handoff_request({t.job, t.epoch, t.layer, t.rows, "prefetch", 0, t.to_window ? "window" : "bank"}, t.request);
+                moe_handoff_scope task_scope(handoff, task_context, t.expert, t.slot);
+                if (handoff) handoff->emit("TASK_BEGIN", task_context, t.expert, t.slot);
+                try {
+                    results[0] = read_fn(t.layer, t.expert, t.slot, t.to_window, t.request);
+                    if (handoff) handoff->emit("PF_RESULT", task_context, t.expert, t.slot, (int32_t) results[0]);
+                } catch (...) {
+                    if (handoff) handoff->emit("PF_ERROR", task_context, t.expert, t.slot, -1);
+                    failed = true;
+                }
+                if (handoff) handoff->emit("TASK_DONE", task_context, t.expert, t.slot);
+            }
+
+            // 记账 / 结果计数。批量读失败时整批算 error（read_batch_fn 已负责
+            // 把 managed request fail 掉；这里只记诊断）。
+            for (size_t i = 0; i < batch.size(); ++i) {
+                const task & t = batch[i];
+                if (batch.size() > 1) {
+                    const moe_handoff_context task_context = handoff_request({t.job, t.epoch, t.layer, t.rows, "prefetch", 0, t.to_window ? "window" : "bank"}, t.request);
+                    if (handoff) handoff->emit("TASK_BEGIN", task_context, t.expert, t.slot);
+                    if (handoff) handoff->emit(failed ? "PF_ERROR" : "PF_RESULT", task_context, t.expert, t.slot,
+                        failed ? -1 : (int32_t) results[i]);
+                    if (handoff) handoff->emit("TASK_DONE", task_context, t.expert, t.slot);
+                }
+                if (failed) {
+                    n_pred_errors.fetch_add(1, std::memory_order_relaxed);
+                } else if (results[i] == read_result::skipped) {
                     n_pred_skipped.fetch_add(1, std::memory_order_relaxed);
                 } else {
                     n_pred_read.fetch_add(1, std::memory_order_relaxed);
-                    if (result == read_result::published) {
+                    if (results[i] == read_result::published) {
                         n_pred_published.fetch_add(1, std::memory_order_relaxed);
                     } else {
                         n_pred_discarded.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
-            } catch (...) {
-                if (handoff) handoff->emit("PF_ERROR", task_context, t.expert, t.slot, -1);
-                n_pred_errors.fetch_add(1, std::memory_order_relaxed);
             }
-            if (handoff) handoff->emit("TASK_DONE", task_context, t.expert, t.slot);
 
-            job_meta done_job;
-            bool finished = false;
+            std::vector<job_meta> done_jobs;
             {
                 std::lock_guard<std::mutex> lk(mtx);
-                if (timing_enabled) {
-                    auto & tm = timings[(size_t) t.layer];
-                    tm.read_wall_ns += now_ns() - start_ns;
-                    tm.reads++;
-                    tm.overlap_ns += std::max<int64_t>(0, start_ns - t.arm_ns);
-                    tm.overlap_n++;
-                }
-                auto it = jobs.find(t.job);
-                if (it != jobs.end() && --it->second.remaining == 0) {
-                    done_job = it->second;
-                    jobs.erase(it);
-                    pending_jobs--;
-                    finished = true;
+                const int64_t elapsed = timing_enabled ? now_ns() - start_ns : 0;
+                for (const task & t : batch) {
+                    if (timing_enabled) {
+                        auto & tm = timings[(size_t) t.layer];
+                        tm.read_wall_ns += elapsed;
+                        tm.reads++;
+                        tm.overlap_ns += std::max<int64_t>(0, start_ns - t.arm_ns);
+                        tm.overlap_n++;
+                    }
+                    auto it = jobs.find(t.job);
+                    if (it != jobs.end() && --it->second.remaining == 0) {
+                        done_jobs.push_back(it->second);
+                        jobs.erase(it);
+                        pending_jobs--;
+                    }
                 }
             }
-            if (finished) {
+            for (const auto & done_job : done_jobs) {
                 std::lock_guard<std::mutex> lk(mtx);
                 if (trace_enabled) {
                     moe_log("prefetch-job: layer=%d n=%d", done_job.layer, done_job.n);
@@ -1354,7 +1650,7 @@ struct lookahead_expert_prefetch {
                 memcpy(arm_expert, done_job.expert, sizeof(arm_expert));
                 // notify 在锁内，与老实现一致：drain()/set_depth() 的等待方醒来时
                 // 已经能看到 arm_* 全部落定。
-                if (handoff) handoff->emit("JOB_DONE", {t.job, done_job.epoch, done_job.layer, done_job.rows, "prefetch", 0, done_job.to_window ? "window" : "bank"});
+                if (handoff) handoff->emit("JOB_DONE", {done_job.id, done_job.epoch, done_job.layer, done_job.rows, "prefetch", 0, done_job.to_window ? "window" : "bank"});
                 cv_done.notify_all();
             }
         }
@@ -1408,6 +1704,9 @@ struct llama_moe_slot_runtime::impl {
         uint64_t n_prefetch_published = 0;
         std::vector<int32_t> slot_to_expert;
         std::vector<int32_t> expert_to_slot;
+        /// 逻辑 expert id -> 打包文件里的 position（identity 时是 0..n-1）。
+        /// **只有文件 offset 用它**；slot/LRU/router 仍然全部用逻辑 id。
+        std::vector<int32_t> expert_to_pos;
         std::vector<uint64_t> slot_age;
         std::vector<uint8_t> protected_experts;
         /// Persistently pinned hot experts (`LLAMA_MOE_PREWARM`, unless
@@ -1446,10 +1745,11 @@ struct llama_moe_slot_runtime::impl {
 
     // 「合并相邻专家读」可行性统计。见 accumulate_runs() 的注释。
     struct run_stats {
-        int n          = 0;   // 连续段总数（仅按 expert id 连续划分）
+        int n          = 0;   // 物理连续段总数（按 expert_to_pos 排序后数）
+        int syscalls   = 0;   // 按 MERGE_MAX_EXPERTS 切段后的 preadv 次数（MERGE=2 的投影）
         int experts    = 0;   // 落在段里的专家数（应等于 miss 总数）
         int max        = 0;   // 最长段
-        int ok_n       = 0;   // 段内 slot 也连号的段数（可零拷贝合并）
+        int ok_n       = 0;   // 段内 slot 也连号的段数（统计口径的零拷贝合并）
         int ok_ex      = 0;   // 这些段覆盖的专家数
         int scatter_n  = 0;   // slot 不连号、需 scratch 中转的段数
         int scatter_ex = 0;
@@ -1474,6 +1774,26 @@ struct llama_moe_slot_runtime::impl {
         std::atomic<uint64_t> n_bytes{0};
         std::atomic<int64_t>  pread_ns{0};
     };
+
+    // R3 合并读的实际执行计数（不是可行性估计）：MERGE=2 时每次合并读记一条。
+    std::atomic<uint64_t> n_merge_runs{0};
+    std::atomic<uint64_t> n_merge_experts{0};
+    std::atomic<uint64_t> n_merge_zerocopy{0};
+    std::atomic<uint64_t> n_merge_scatter{0};
+    std::atomic<uint64_t> n_merge_fallback_runs{0};   // 非 managed 合并失败后逐专家重读的 unit 数
+
+    // R4a 预读合并：投影计数（MERGE_PREFETCH>=1）与真实执行计数（=2）。
+    std::atomic<uint64_t> pf_proj_runs{0};
+    std::atomic<uint64_t> pf_proj_syscalls{0};
+    std::atomic<uint64_t> pf_proj_experts{0};
+    std::atomic<uint64_t> pf_proj_zerocopy{0};
+    std::atomic<uint64_t> pf_proj_scatter{0};
+    std::atomic<uint64_t> pf_exec_runs{0};
+    std::atomic<uint64_t> pf_exec_experts{0};
+    std::atomic<uint64_t> pf_exec_zerocopy{0};
+    std::atomic<uint64_t> pf_exec_scatter{0};
+    std::atomic<uint64_t> pf_exec_fallback{0};
+    std::atomic<uint64_t> pf_exec_saved{0};
 
     /// 每层「下一步预测会用到的专家」列表，由上一层 arm() 写入、本层 process() 消费。
     /// 用途是**零 I/O 成本**地改进淘汰：预测会用的条目不该被换出去。
@@ -1533,6 +1853,10 @@ struct llama_moe_slot_runtime::impl {
     uint64_t miss_pos_steps = 0;
     uint64_t miss_per_layer_steps = 0;
     int64_t last_process_ns = 0;
+    // pmgmt 子项增量基线：只在 flush_ubatch() 里读/更新，与 last_process_ns 同一位置。
+    int64_t last_install_ns = 0;
+    int64_t last_readids_ns = 0;
+    int64_t last_writeids_ns = 0;
     uint64_t last_flush_idx = 0;
     // 预读诊断字段的增量基线，见 flush_ubatch。
     uint64_t last_arm_skipped = 0;
@@ -1541,6 +1865,8 @@ struct llama_moe_slot_runtime::impl {
     uint64_t last_pred_read = 0;
     uint64_t last_pf_hits = 0;
     uint64_t last_pf_pub = 0;
+    uint64_t last_pf_proj_runs = 0;
+    uint64_t last_pf_proj_syscalls = 0;
 
     explicit impl(const llama_model & model) :
         model(model),
@@ -1574,6 +1900,18 @@ struct llama_moe_slot_runtime::impl {
             finalize_pack(state);
             state.slot_to_expert.assign(n_slots, kSlotFree);
             state.expert_to_slot.assign(n_expert, kSlotFree);
+            state.expert_to_pos.resize((size_t) n_expert);
+            for (int32_t expert = 0; expert < n_expert; ++expert) {
+                state.expert_to_pos[(size_t) expert] = expert;
+            }
+            if (const std::vector<int32_t> * order = model.moe_experts_order(state.bindings[0].entry->layer)) {
+                if (order->size() != (size_t) n_expert) {
+                    throw std::runtime_error(format(
+                        "MoE expert order for layer %d has %zu entries, expected %d",
+                        state.bindings[0].entry->layer, order->size(), n_expert));
+                }
+                state.expert_to_pos = *order;
+            }
             state.protected_experts.assign(n_expert, 0);
             state.pinned_experts.assign(n_expert, 0);
             state.slot_age.assign(n_slots, 0);
@@ -1652,6 +1990,9 @@ struct llama_moe_slot_runtime::impl {
                 read_expert_directv(layers[(size_t) layer], expert, slot);
                 return lookahead_expert_prefetch::read_result::published;
             }, handoff_trace.enabled() ? &handoff_trace : nullptr);
+        lookahead.read_batch_fn = [this](const std::vector<lookahead_expert_prefetch::task> & batch) {
+            return install_prefetch_batch(batch);
+        };
         resolve_decode_window();
         {
             const char * e = std::getenv("LLAMA_MOE_MATMUL_SPLIT");
@@ -1761,8 +2102,29 @@ struct llama_moe_slot_runtime::impl {
                 throw std::runtime_error(format("slot-manager: permanent pin budget %d plus worst selected %d exceeds %s %d; reduce prewarm pins",
                     persistent, worst_selected, live_union_active && prefetch_unified ? "live-union capacity" : "cache", cap));
             }
+            static const auto evict = evict_policy_from_env();
+            static const auto evict_layers = evict_layers_from_env();
+            static bool evict_logged = false;
+            if (!evict_logged) {
+                evict_logged = true;
+                auto name = [](std::pair<llama_moe::slot_manager::evict_policy, uint32_t> p) {
+                    return p.first == llama_moe::slot_manager::evict_policy::lfu
+                        ? (p.second ? format("lfu<%u>", p.second) : std::string("lfu")) : std::string("lru");
+                };
+                std::string layers_dist;
+                if (!evict_layers.empty()) {
+                    size_t n_lfu = 0;
+                    for (const auto & kv : evict_layers) if (kv.second.first == llama_moe::slot_manager::evict_policy::lfu) ++n_lfu;
+                    layers_dist = format("，按层覆盖 %zu 层（其中 %zu 层 lfu）", evict_layers.size(), n_lfu);
+                }
+                moe_log("evict-policy: 全局 %s%s", name(evict).c_str(), layers_dist.c_str());
+            }
+            const size_t layer_ix = (size_t) (&st - layers.data());
+            const auto override_it = evict_layers.find((int32_t) layer_ix);
+            const auto evict_here = override_it != evict_layers.end() ? override_it->second : evict;
             st.manager.reset(new llama_moe::slot_manager(st.mutex, n_expert, st.window_width,
-                st.window_width - prefetch_slots, prefetch_unified, prefetch_slots, pf_probation));
+                st.window_width - prefetch_slots, prefetch_unified, prefetch_slots, pf_probation,
+                evict_here.first, evict_here.second));
             st.requests.resize((size_t) n_expert);
             for (int32_t e = 0; e < n_expert; ++e) st.manager->set_persistent(e, st.pinned_experts[(size_t) e] != 0);
         }
@@ -1834,21 +2196,30 @@ struct llama_moe_slot_runtime::impl {
 
     void init_prefetch_refresh() {
         if (!lookahead.refresh) return;
-        if (!managers_active() || matmul_split > 0 || !lookahead.enabled || !lookahead.window_mode ||
-            lookahead.read_n <= 0 || moe_lookahead_horizon() <= 1 || io_budget || h1_front) {
-            throw std::runtime_error("LLAMA_MOE_PREFETCH_REFRESH requires Ready window, split=0, horizon>1, prefetch/read>0 and IO budget/H1 front=0");
+        // 判据在 llama-moe-config.h（纯函数）：每个前置条件一位，逐条 host 单测。
+        const unsigned missing = llama_moe::config::prefetch_refresh_missing({
+            managers_active(), lookahead.window_mode, matmul_split > 0, lookahead.enabled,
+            lookahead.read_n, moe_lookahead_horizon(), io_budget != nullptr, h1_front });
+        if (missing) {
+            throw std::runtime_error(format(
+                "LLAMA_MOE_PREFETCH_REFRESH requires Ready window, split=0, horizon>1, prefetch/read>0 and IO budget/H1 front=0 (missing: %s)",
+                llama_moe::config::refresh_missing_text(missing).c_str()));
         }
         moe_log("prefetch-refresh: enabled=1 reserve=%d read=%d deadline=epoch-layer", std::min(2, lookahead.read_n), lookahead.read_n);
     }
 
+    /// `data_ready` 只给合并读用：数据已经由一次 preadv 写进 request.slot，这里只补
+    /// slot_manager 的读计数/预算记账，不再读盘。
     int64_t read_managed_expert(layer_state & state, llama_moe::slot_manager::ticket request,
-                               llama_moe::io_admission::origin origin, bool retry = false) {
+                               llama_moe::io_admission::origin origin, bool retry = false,
+                               bool data_ready = false) {
         // Policy uses explicit immutable owner/key values even when tracing is
         // disabled. The trace payload is diagnostic only and outlives the lease.
         auto read = [&]() {
             ++manager_reads;
             if (origin == llama_moe::io_admission::origin::demand) ++manager_demand_reads; else ++manager_prefetch_reads;
             if (retry) ++manager_retry_reads;
+            if (data_ready) return (int64_t) 0;
             return read_expert_directv(state, request.expert, request.slot, true);
         };
         if (!io_budget) return read();
@@ -2252,7 +2623,8 @@ struct llama_moe_slot_runtime::impl {
                     const size_t slash = st.dec_pack_path.find_last_of("/");
                     const std::string path = std::string(packed_dir) + "/" +
                         st.dec_pack_path.substr(slash == std::string::npos ? 0 : slash + 1);
-                    if (!verify_slot_bytes(path, (size_t) expert * stride, iov, (int) st.dec_pack_order.size())) {
+                    if (!verify_slot_bytes(path, (size_t) st.expert_to_pos.at((size_t) expert) * stride,
+                                           iov, (int) st.dec_pack_order.size())) {
                         throw std::runtime_error("prefill warm destination verification failed");
                     }
                     verified += stride;
@@ -2886,6 +3258,13 @@ struct llama_moe_slot_runtime::impl {
             close(item.second);
 #endif
         }
+        for (const auto & item : buffered_fds) {
+#ifdef _WIN32
+            _close(item.second);
+#else
+            close(item.second);
+#endif
+        }
     }
 
     void bind(layer_state & state, ggml_tensor * tensor, int32_t expect_slots,
@@ -2989,6 +3368,7 @@ struct llama_moe_slot_runtime::impl {
         }
 #endif
         table.emplace(path, fd);
+        fd_paths.emplace(fd, path);
         return fd;
     }
 
@@ -3044,21 +3424,71 @@ struct llama_moe_slot_runtime::impl {
         return bad == 0;
     }
 
-    void readv_span_direct(int fd, size_t offset, struct iovec * iov, int niov) {
+    /// 同一文件的普通（无 O_DIRECT）fd，供非对齐回退使用。
+    /// O_DIRECT 是 open() 的属性，不能用 fcntl 对已打开的 fd 关掉；所以回退必须
+    /// 另开一个。只有真正走到非对齐回退时才 open，默认关闭时没有额外开销。
+    int buffered_fd_for(int fd) {
+        if (!moe_o_direct()) {
+            return fd;
+        }
+        std::lock_guard<std::mutex> lock(fd_mutex);
+        const auto path_it = fd_paths.find(fd);
+        if (path_it == fd_paths.end()) {
+            return fd;   // 不是本对象 fd_for() 打开的（host 测试/外部 fd）：按原样读
+        }
+        const std::string path = path_it->second;   // 拷贝：下面插入 fd_paths 可能 rehash
+        const auto found = buffered_fds.find(path);
+        if (found != buffered_fds.end()) {
+            return found->second;
+        }
+        const int bfd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (bfd < 0) {
+            throw std::runtime_error(format("failed to open buffered MoE experts file '%s': %s",
+                                            path.c_str(), std::strerror(errno)));
+        }
+        buffered_fds.emplace(path, bfd);
+        fd_paths.emplace(bfd, path);
+        return bfd;
+    }
+
+    /// 缓冲读（无 O_DIRECT）：O_DIRECT 关闭时的主路径，也是非对齐 O_DIRECT 的
+    /// 安全回退。这里**只**做 preadv，不再回调 readv_span()（RK-3 的互递归点）。
+    void readv_span_buffered(int fd, size_t offset, struct iovec * iov, int niov) {
         size_t total = 0;
         for (int i = 0; i < niov; ++i) {
             total += iov[i].iov_len;
         }
         io_bytes_all.fetch_add(total, std::memory_order_relaxed);
         io_calls_all.fetch_add(1, std::memory_order_relaxed);
+        const int buffered_fd = buffered_fd_for(fd);
+        moe_handoff_span pread(handoff_trace, "PREAD_BEGIN", "PREAD_DONE", handoff_thread.context,
+                               handoff_thread.expert, handoff_thread.slot, total);
+        static thread_local std::vector<struct iovec> cur_buf;
+#ifdef _WIN32
+        std::lock_guard<std::mutex> lock(io_mutex);
+#endif
+        llama_moe::merge_read_hardening::readv_span_buffered_fd(
+            buffered_fd, offset, iov, niov, cur_buf);
+        pread.complete();
+    }
+
+    void readv_span_direct(int fd, size_t offset, struct iovec * iov, int niov) {
+        size_t total = 0;
+        for (int i = 0; i < niov; ++i) {
+            total += iov[i].iov_len;
+        }
         if (total == 0) {
+            io_calls_all.fetch_add(1, std::memory_order_relaxed);
             return;
         }
-        // 长度也得是 512 的倍数才能进 O_DIRECT；不是就退回缓冲读（少见，专家 stride 是 512 的倍数）。
-        if (total % 512 != 0 || offset % 512 != 0) {
-            readv_span(fd, offset, iov, niov);
+        // offset/总长度不是 512B 倍数时不能进 O_DIRECT。只调用缓冲实现，
+        // **不得**回到 readv_span()（那里会再次派发到本函数 -> 互递归）。
+        if (llama_moe::merge_read_hardening::span_needs_buffered_fallback(true, offset, total)) {
+            readv_span_buffered(fd, offset, iov, niov);
             return;
         }
+        io_bytes_all.fetch_add(total, std::memory_order_relaxed);
+        io_calls_all.fetch_add(1, std::memory_order_relaxed);
         static thread_local uint8_t * scratch = nullptr;
         static thread_local size_t scratch_cap = 0;
         const size_t need = (total + 4095) & ~(size_t) 4095;
@@ -3108,61 +3538,51 @@ struct llama_moe_slot_runtime::impl {
             readv_span_direct(fd, offset, iov, niov);
             return;
         }
-        {
-            size_t n = 0;
-            for (int i = 0; i < niov; ++i) {
-                n += iov[i].iov_len;
-            }
-            // 唯一能给出「完整 I/O」的埋点：主路径和预读 worker 都走这里。
-            // 只看 decode 行里的 bytes= 会漏掉预读读的字节（实测那是大头）。
-            io_bytes_all.fetch_add(n, std::memory_order_relaxed);
-            io_calls_all.fetch_add(1, std::memory_order_relaxed);
-        }
-        size_t total = 0;
-        for (int i = 0; i < niov; ++i) {
-            total += iov[i].iov_len;
-        }
-        moe_handoff_span pread(handoff_trace, "PREAD_BEGIN", "PREAD_DONE", handoff_thread.context,
-                               handoff_thread.expert, handoff_thread.slot, total);
-        size_t done = 0;
-        while (done < total) {
-            struct iovec cur[8];
-            int cn = 0;
-            size_t skip = done;
-            for (int i = 0; i < niov; ++i) {
-                if (skip >= iov[i].iov_len) {
-                    skip -= iov[i].iov_len;
-                    continue;
-                }
-                cur[cn].iov_base = (uint8_t *) iov[i].iov_base + skip;
-                cur[cn].iov_len  = iov[i].iov_len - skip;
-                skip = 0;
-                cn++;
-            }
-#ifdef _WIN32
-            std::lock_guard<std::mutex> lock(io_mutex);
-            if (_lseeki64(fd, (int64_t) (offset + done), SEEK_SET) < 0) {
-                throw std::runtime_error("failed to seek MoE experts");
-            }
-            const ssize_t result = _read(fd, cur[0].iov_base, (unsigned int) cur[0].iov_len);
-#else
-            const ssize_t result = preadv(fd, cur, cn, (off_t) (offset + done));
-#endif
-            if (result < 0 && errno == EINTR) {
-                continue;
-            }
-            if (result <= 0) {
-                throw std::runtime_error(format(
-                    "failed to read MoE experts at offset %zu", offset + done));
-            }
-            done += (size_t) result;
-        }
-        pread.complete();
+        readv_span_buffered(fd, offset, iov, niov);
     }
 
     // Reads the packed gate|up|down span (one contiguous run in the experts) with a single preadv,
     // writing each family straight into its own slot. One syscall, one write per byte: no staging
     // buffer and no second copy into the device buffer.
+    // 诊断模式（只用于观察耗时，不能互相相减做归因）：
+    //   0（默认）正常：preadv 直接写进 slot 张量（GPU 可见）
+    //   1 dummy   ：**诊断模式，不是 IO-only 下界**。它跳过 packed/tiled 正常路径
+    //               （`packed_dir && mode == 0` 不再成立），改走 raw 路径读进**同一个**
+    //               scratch，所有 family 共用一个缓冲区；MoE 图仍然照常计算，
+    //               用的是 slot 里的旧数据 ⇒ **输出无效**。
+    //               所以它的耗时不能当成"只读不算"的地板（曾被这样误用，见
+    //               exps/pipe-in-layer-20261105/README.md §3.34 的更正）。
+    //   2 skip    ：完全不读（图仍然照算、slot 里是旧数据）⇒ **同样输出无效**。
+    //               **不能**当成"有效推理的算力地板"，只能当"不读盘时的诊断耗时"
+    //               （见 exps/pipe-in-layer-20261105/README.md §3.34）。
+    // 三种模式**只用于观察耗时**，不能互相相减来归因"成本在写 GPU 缓冲还是 I/O"：
+    // 它们走的读取路径不同（dummy/skip 跳过 packed/tiled 分支）、落点不同、
+    // 且后两者输出无效、路由与投机接受率都会变 —— 差值没有可比性（§3.34）。
+    //
+    // 合并读（R3）复用它：只有 mode==0 才走合并路径，否则逐专家回退，保证诊断模式语义不变。
+    static int read_mode() {
+        static const int mode = [] {
+            const char * d = std::getenv("LLAMA_MOE_DUMMY_READ");
+            if (d && *d && *d != '0') return 1;
+            const char * s = std::getenv("LLAMA_MOE_SKIP_READ");
+            if (s && *s && *s != '0') return 2;
+            return 0;
+        }();
+        return mode;
+    }
+
+    // LLAMA_MOE_READ_DELAY_US：给每次读加固定延迟。
+    // 用来判断「读时间是否 1:1 落在关键路径上」—— 若总时间按 delay × 读次数
+    // 等量增长，说明读在关键路径上是线性的；若增长更多，说明有放大效应。
+    // 合并读按「每次 syscall」加一次延迟，与单专家路径的每次读一一对应。
+    static int read_delay_us() {
+        static const int delay_us = [] {
+            const char * d = std::getenv("LLAMA_MOE_READ_DELAY_US");
+            return d ? std::atoi(d) : 0;
+        }();
+        return delay_us;
+    }
+
     int64_t read_expert_directv(const layer_state & state, int32_t expert, int32_t slot,
                                 bool window_mode = false) {
         const int32_t trace_layer = (int32_t) (&state - layers.data());
@@ -3174,32 +3594,8 @@ struct llama_moe_slot_runtime::impl {
         const bool demand = handoff_trace.enabled() && std::strcmp(context.source, "demand") == 0;
         moe_handoff_span reader(handoff_trace, pf ? "PF_READ_BEGIN" : demand ? "DEMAND_READ_BEGIN" : "OTHER_READ_BEGIN",
             pf ? "PF_READ_DONE" : demand ? "DEMAND_READ_DONE" : "OTHER_READ_DONE", context, expert, slot);
-        // 诊断：LLAMA_MOE_SKIP_READ=1 时走完所有记账但不真读盘。
-        //
-        // 这些模式**只用来观察耗时**，不能用 step 之间的差值去做归因：
-        // 它们走的读取路径不同、落点不同、且后两者输出无效（路由与投机接受率都会变）。
-        // 输出是错的（专家内容是垃圾），只看时间。
-        // 诊断三态（**只用于观察耗时，不能互相相减做归因**）：
-        //   0（默认）正常：preadv 直接写进 slot 张量（GPU 可见）
-        //   1 dummy   ：**诊断模式，不是 IO-only 下界**。它跳过 packed/tiled 正常路径
-        //               （`packed_dir && mode == 0` 不再成立），改走 raw 路径读进**同一个**
-        //               scratch，所有 family 共用一个缓冲区；MoE 图仍然照常计算，
-        //               用的是 slot 里的旧数据 ⇒ **输出无效**。
-        //               所以它的耗时不能当成"只读不算"的地板（曾被这样误用，见
-        //               exps/pipe-in-layer-20261105/README.md §3.34 的更正）。
-        //   2 skip    ：完全不读（图仍然照算、slot 里是旧数据）⇒ **同样输出无效**。
-        //               **不能**当成"有效推理的算力地板"，只能当"不读盘时的诊断耗时"
-        //               （见 exps/pipe-in-layer-20261105/README.md §3.34）。
-        // 三种模式**只用于观察耗时**，不能互相相减来归因"成本在写 GPU 缓冲还是 I/O"：
-        // 它们走的读取路径不同（dummy/skip 跳过 packed/tiled 分支）、落点不同、
-        // 且后两者输出无效、路由与投机接受率都会变 —— 差值没有可比性（§3.34）。
-        static const int mode = [] {
-            const char * d = std::getenv("LLAMA_MOE_DUMMY_READ");
-            if (d && *d && *d != '0') return 1;
-            const char * s = std::getenv("LLAMA_MOE_SKIP_READ");
-            if (s && *s && *s != '0') return 2;
-            return 0;
-        }();
+        // 诊断三态（dummy/skip）的语义见 read_mode() 上面的长注释；合并读也复用它。
+        const int mode = read_mode();
 
         // decode 阶段读进**本层自己的窗口张量**（base 上的 view），prefill 读进共享那段。
         // 两套的张量、文件偏移、步长都不同，所以整组一起切。
@@ -3208,6 +3604,14 @@ struct llama_moe_slot_runtime::impl {
         const std::string          & path     = window_mode ? state.dec_pack_path : state.pack_path;
         const size_t base   = window_mode ? state.dec_pack_base   : state.pack_base;
         const size_t stride = window_mode ? state.dec_pack_stride : state.pack_stride;
+        if (expert < 0 || (size_t) expert >= state.expert_to_pos.size()) {
+            throw std::runtime_error(format("MoE expert id %d is outside the order map", expert));
+        }
+        // 逻辑 id -> 物理 position。identity 时 position == expert，与改动前完全一致。
+        const int32_t expert_pos = state.expert_to_pos[(size_t) expert];
+        if (expert_pos < 0) {
+            throw std::runtime_error(format("MoE expert %d has a negative packed position", expert));
+        }
 
         // Optional offline tiled files: retain the raw manifest and compute the
         // backend strides independently. Never feed tiled bytes to raw upload.
@@ -3233,7 +3637,7 @@ struct llama_moe_slot_runtime::impl {
             const std::string packed_path = std::string(packed_dir) + "/" + path.substr(slash == std::string::npos ? 0 : slash + 1);
             const int64_t start = now_ns();
             const int packed_fd = fd_for(packed_path);
-            const size_t packed_offset = (size_t) expert * packed_stride;
+            const size_t packed_offset = (size_t) expert_pos * packed_stride;
             readv_span(packed_fd, packed_offset, packed_iov, (int) order.size());
             if (verify_slot_enabled() &&
                 !verify_slot_bytes(packed_path, packed_offset, packed_iov, (int) order.size())) {
@@ -3314,7 +3718,7 @@ struct llama_moe_slot_runtime::impl {
             }
         }
         const int fd = fd_for(path);
-        const size_t offset = base + (size_t) expert * stride;
+        const size_t offset = base + (size_t) expert_pos * stride;
 
         if (mode == 2) {
             // 记账照做（让上层以为读成功了），但不落盘 —— 用于隔离 I/O 与结构开销。
@@ -3322,13 +3726,7 @@ struct llama_moe_slot_runtime::impl {
             return 0;
         }
 
-        // LLAMA_MOE_READ_DELAY_US：给每次读加固定延迟。
-        // 用来判断「读时间是否 1:1 落在关键路径上」—— 若总时间按 delay × 读次数
-        // 等量增长，说明读在关键路径上是线性的；若增长更多，说明有放大效应。
-        static const int delay_us = [] {
-            const char * d = std::getenv("LLAMA_MOE_READ_DELAY_US");
-            return d ? std::atoi(d) : 0;
-        }();
+        const int delay_us = read_delay_us();
         if (delay_us > 0) {
             std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
         }
@@ -3353,6 +3751,717 @@ struct llama_moe_slot_runtime::impl {
         stats.n_miss.fetch_add(1, std::memory_order_relaxed);
         reader.complete();
         return dt;
+    }
+
+    // ── R3：合并 preadv ────────────────────────────────────────────────────
+    //
+    // 专家布局是 expert-major：一个专家的 gate|up|down（tiled 或 raw）在文件里连续。
+    // 因此 **物理 position 连续的 k 个专家** 在文件里也是一段连续区间；一次 preadv
+    // 就能把整段读完，按「专家外层、family 内层」的 iovec 顺序落到各自的 slot。
+    //
+    // 两条实现路径（对应任务单 §1 R3 的 a/b）：
+    //   a) zero-copy iovec：目标 slot 可直接写（tiled 离线包 / raw 非 staging）时，
+    //      每个 (专家, family) 一个 iovec，一次 syscall 写进 slot，不经过中间缓冲。
+    //      这里**不要求** slot 连号：iovec 各自带地址，文件顺序才是硬约束。
+    //   b) scratch + scatter：后端要求 upload hook（raw 字节 → tiled）时，先 preadv 到
+    //      可复用的 k*stride scratch（k ≤ LLAMA_MOE_MERGE_MAX_EXPERTS，scratch 上限
+    //      LLAMA_MOE_MERGE_SCRATCH_MB），再逐 (专家, family) upload/memcpy 到 slot。
+    //      拷贝的是**原始字节**，不做任何重排，tiled 语义不变。
+    //
+    // 只在同一次 install（同一 wave / 同一 deferred phase）内合并，绝不像素跨 phase：
+    // pending 由 phase A 与 phase B 各自构建，两边的读不会拼在一起。
+    struct run_io_outcome {
+        int64_t ns = 0;
+        size_t bytes = 0;
+        bool scatter = false;
+    };
+
+    /// LLAMA_MOE_MERGE_READS: 0=关（默认，行为与改动前逐字节一致）、1=只统计不合并、
+    /// 2=合并。非法值夹到 0..2。
+    static int merge_reads_mode() {
+        static const int mode = [] {
+            const char * v = std::getenv("LLAMA_MOE_MERGE_READS");
+            const int m = v ? std::atoi(v) : 0;
+            return m < 0 ? 0 : (m > 2 ? 2 : m);
+        }();
+        return mode;
+    }
+
+    /// LLAMA_MOE_MERGE_PREFETCH: 0=关（默认，逐专家读、顺序也不变）、1=只统计投影、
+    /// 2=真正排序 + 合并。与 LLAMA_MOE_MERGE_READS 正交。
+    static int merge_prefetch_mode() {
+        static const int mode = llama_moe::prefetch_merge::env_mode();
+        return mode;
+    }
+
+    /// 单个 run 最多合并几个专家（默认 4）。它同时限制 iovec 数（4*3=12 ≪ IOV_MAX）。
+    static int merge_max_experts() {
+        static const int n = [] {
+            const char * v = std::getenv("LLAMA_MOE_MERGE_MAX_EXPERTS");
+            const int n = v ? std::atoi(v) : 4;
+            return std::max(1, std::min(n, 64));
+        }();
+        return n;
+    }
+
+    /// scratch + scatter 路径的单次读缓冲上限（默认 16 MiB）。
+    static size_t merge_scratch_bytes() {
+        static const size_t n = [] {
+            const char * v = std::getenv("LLAMA_MOE_MERGE_SCRATCH_MB");
+            const long mb = v ? std::atol(v) : 16;
+            return (size_t) std::max(1L, std::min(mb, 256L)) * 1024u * 1024u;
+        }();
+        return n;
+    }
+
+    /// 一次 preadv 读 k 个物理相邻的专家。返回 false = 布局不支持合并，调用方必须
+    /// 逐专家回退（`read_expert_directv`）；返回 true 时 out 里是本段的耗时/字节/路径。
+    ///
+    /// `allow_merge` 由调用方的 `merge_gate::decide()` 给出；本函数不再自己读 env /
+    /// read_mode，避免同一个门控在两处各写一份布尔式。
+    bool read_run_directv(const layer_state & state, const pending_install * items, int k,
+                          bool window_mode, bool allow_merge, run_io_outcome & out) {
+        if (k <= 1 || !allow_merge) {
+            return false;
+        }
+        const std::vector<binding> & bindings = window_mode ? state.dec_bindings   : state.bindings;
+        const std::vector<size_t>  & order    = window_mode ? state.dec_pack_order : state.pack_order;
+        const std::string          & path     = window_mode ? state.dec_pack_path : state.pack_path;
+        const size_t base   = window_mode ? state.dec_pack_base   : state.pack_base;
+        const size_t stride = window_mode ? state.dec_pack_stride : state.pack_stride;
+        const int n_fam = (int) order.size();
+        if (n_fam <= 0 || n_fam > 8 || stride == 0 || path.empty()) {
+            return false;
+        }
+        int32_t pos0 = -1;
+        for (int i = 0; i < k; ++i) {
+            const int32_t e = items[i].expert;
+            if (e < 0 || (size_t) e >= state.expert_to_pos.size() || items[i].slot < 0) {
+                return false;
+            }
+            const int32_t p = state.expert_to_pos[(size_t) e];
+            if (i == 0) {
+                pos0 = p;
+            } else if (p != pos0 + i) {
+                return false;   // 不是物理连续段
+            }
+        }
+        if (pos0 < 0 || (size_t) k * (size_t) n_fam > 1024) {   // IOV_MAX
+            return false;
+        }
+
+        const int32_t trace_layer = (int32_t) (&state - layers.data());
+        auto context = handoff_thread.trace == &handoff_trace ? handoff_thread.context
+            : moe_handoff_context{0, 0, trace_layer, 0, "other", 0, window_mode ? "window" : "bank"};
+        if (!context.io_id) context.io_id = handoff_trace.new_io_id();
+        moe_handoff_scope scope(handoff_trace.enabled() ? &handoff_trace : nullptr, context,
+                                items[0].expert, items[0].slot);
+        const bool demand = handoff_trace.enabled() && std::strcmp(context.source, "demand") == 0;
+        moe_handoff_span reader(handoff_trace, demand ? "DEMAND_READ_BEGIN" : "OTHER_READ_BEGIN",
+            demand ? "DEMAND_READ_DONE" : "OTHER_READ_DONE", context, items[0].expert, items[0].slot);
+        const int delay_us = read_delay_us();
+        if (delay_us > 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
+        }
+
+        std::vector<struct iovec> iov;
+        iov.reserve((size_t) k * (size_t) n_fam);
+        size_t total = 0;
+        const int64_t t0 = now_ns();
+
+        // a) 离线 tiled 包：每 family 的 tiled 字节数由后端给出；文件里每专家 stride
+        //    必须恰好等于各 family tiled 字节之和，否则不是可合并的布局。
+        const char * packed_dir = std::getenv("LLAMA_MOE_HTP_PACKED_DIR");
+        if (packed_dir && *packed_dir) {
+            using pack_fn = size_t (*)(void *, const void *, int, int64_t, int64_t);
+            std::vector<size_t> fam_bytes((size_t) n_fam, 0);
+            size_t packed_stride = 0;
+            for (int f = 0; f < n_fam; ++f) {
+                const binding & b = bindings[order[(size_t) f]];
+                auto dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(b.tensor->buffer));
+                auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                auto pack = reg ? (pack_fn) ggml_backend_reg_get_proc_address(reg,
+                    "ggml_backend_pack_moe_expert") : nullptr;
+                if (!pack) {
+                    return false;
+                }
+                const size_t bytes = pack(nullptr, nullptr, b.tensor->type, b.tensor->ne[0], b.tensor->ne[1]);
+                if (!bytes) {
+                    return false;
+                }
+                fam_bytes[(size_t) f] = bytes;
+                packed_stride += bytes;
+            }
+            // 注意：tiled 包的每专家文件 stride = 各 family **tiled** 字节之和，
+            // 与 manifest 里的 raw expert_stride（state.*_pack_stride）不是一回事
+            // （Q3_K/Q4_K 的 tiled 尺寸都不同）。单专家路径也是用 packed_stride 算
+            // 文件 offset 的，这里必须一致。
+            if (packed_stride == 0) {
+                return false;
+            }
+            for (int e = 0; e < k; ++e) {
+                for (int f = 0; f < n_fam; ++f) {
+                    const binding & b = bindings[order[(size_t) f]];
+                    iov.push_back({ (uint8_t *) b.tensor->data + (size_t) items[e].slot * fam_bytes[(size_t) f],
+                                    fam_bytes[(size_t) f] });
+                    total += fam_bytes[(size_t) f];
+                }
+            }
+            const size_t slash = path.find_last_of("/");
+            const std::string packed_path = std::string(packed_dir) + "/" +
+                path.substr(slash == std::string::npos ? 0 : slash + 1);
+            const size_t offset = (size_t) pos0 * packed_stride;
+            if (llama_moe::merge_read_hardening::span_needs_buffered_fallback(
+                    moe_o_direct(), offset, total)) {
+                return false;   // O_DIRECT 非对齐 -> 调用方逐专家回退（RK-3）
+            }
+            const int fd = fd_for(packed_path);
+            readv_span(fd, offset, iov.data(), (int) iov.size());
+#if defined(__linux__)
+            const char * drop_pages = std::getenv("LLAMA_MOE_DROP_CACHED_EXPERT_PAGES");
+            if (window_mode && drop_pages && *drop_pages != '0') {
+                const int advice_error = posix_fadvise(fd, offset, packed_stride * (off_t) k, POSIX_FADV_DONTNEED);
+                if (advice_error) {
+                    moe_log("expert page-cache advice failed: %s", std::strerror(advice_error));
+                }
+            }
+#endif
+            if (verify_slot_enabled() &&
+                !verify_slot_bytes(packed_path, offset, iov.data(), (int) iov.size())) {
+                throw std::runtime_error("offline tiled merged expert slot verification failed");
+            }
+            out.scatter = false;
+        } else {
+            using upload_fn = bool (*)(ggml_tensor *, int32_t, const void *, size_t);
+            std::vector<upload_fn> uploads((size_t) n_fam, nullptr);
+            bool staging = false;
+            size_t sum_bytes = 0;
+            for (int f = 0; f < n_fam; ++f) {
+                const binding & b = bindings[order[(size_t) f]];
+                auto dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(b.tensor->buffer));
+                if (dev) {
+                    auto reg = ggml_backend_dev_backend_reg(dev);
+                    uploads[(size_t) f] = (upload_fn) ggml_backend_reg_get_proc_address(reg,
+                        "ggml_backend_upload_moe_expert");
+                    staging = staging || uploads[(size_t) f] != nullptr;
+                }
+                sum_bytes += b.entry->bytes_per_expert;
+            }
+            // 文件里每专家 stride 必须等于各 family 字节之和，才能把连续段拼成一组 iovec。
+            if (sum_bytes != stride) {
+                return false;
+            }
+            const size_t run_bytes = (size_t) k * stride;
+            if (staging) {
+                // b) scratch + scatter：先读进复用缓冲，再逐 (专家, family) 落到 slot。
+                if (run_bytes > merge_scratch_bytes()) {
+                    return false;
+                }
+                static thread_local std::vector<uint8_t> scratch;
+                if (scratch.size() < run_bytes) {
+                    scratch.resize(run_bytes);
+                }
+                size_t at = 0;
+                for (int e = 0; e < k; ++e) {
+                    for (int f = 0; f < n_fam; ++f) {
+                        const size_t bytes = bindings[order[(size_t) f]].entry->bytes_per_expert;
+                        iov.push_back({ scratch.data() + at, bytes });
+                        at += bytes;
+                    }
+                }
+                const size_t run_offset = base + (size_t) pos0 * stride;
+                if (llama_moe::merge_read_hardening::span_needs_buffered_fallback(
+                        moe_o_direct(), run_offset, run_bytes)) {
+                    return false;   // O_DIRECT 非对齐 -> 调用方逐专家回退（RK-3）
+                }
+                const int fd = fd_for(path);
+                readv_span(fd, run_offset, iov.data(), (int) iov.size());
+                size_t src = 0;
+                for (int e = 0; e < k; ++e) {
+                    for (int f = 0; f < n_fam; ++f) {
+                        const binding & b = bindings[order[(size_t) f]];
+                        const size_t bytes = b.entry->bytes_per_expert;
+                        if (uploads[(size_t) f]) {
+                            if (!uploads[(size_t) f](b.tensor, items[e].slot, scratch.data() + src, bytes)) {
+                                throw std::runtime_error(format(
+                                    "backend cannot upload merged MoE expert slot: %s", ggml_get_name(b.tensor)));
+                            }
+                        } else {
+                            memcpy((uint8_t *) b.tensor->data + (size_t) items[e].slot * bytes,
+                                   scratch.data() + src, bytes);
+                        }
+                        src += bytes;
+                    }
+                }
+                total = run_bytes;
+                out.scatter = true;
+            } else {
+                // a) zero-copy：每 (专家, family) 直接指向目标 slot。
+                for (int e = 0; e < k; ++e) {
+                    for (int f = 0; f < n_fam; ++f) {
+                        const binding & b = bindings[order[(size_t) f]];
+                        const size_t bytes = b.entry->bytes_per_expert;
+                        iov.push_back({ (uint8_t *) b.tensor->data + (size_t) items[e].slot * bytes, bytes });
+                        total += bytes;
+                    }
+                }
+                const size_t run_offset = base + (size_t) pos0 * stride;
+                if (llama_moe::merge_read_hardening::span_needs_buffered_fallback(
+                        moe_o_direct(), run_offset, total)) {
+                    return false;   // O_DIRECT 非对齐 -> 调用方逐专家回退（RK-3）
+                }
+                const int fd = fd_for(path);
+                readv_span(fd, run_offset, iov.data(), (int) iov.size());
+                out.scatter = false;
+            }
+            if (verify_slot_enabled() &&
+                !verify_slot_bytes(path, base + (size_t) pos0 * stride, iov.data(), (int) iov.size())) {
+                throw std::runtime_error("merged expert slot verification failed");
+            }
+        }
+
+        out.ns = now_ns() - t0;
+        out.bytes = total;
+        stats.pread_ns.fetch_add(out.ns, std::memory_order_relaxed);
+        stats.n_bytes.fetch_add(total, std::memory_order_relaxed);
+        stats.n_miss.fetch_add((uint64_t) k, std::memory_order_relaxed);
+        reader.complete();
+        return true;
+    }
+
+    /// ── R4a：预读的批量 preadv ─────────────────────────────────────────────
+    ///
+    /// 与 read_run_directv（demand/R3）分开：预读有自己的开关 MERGE_PREFETCH，
+    /// 且只处理**零拷贝可行**的布局（离线 tiled 包 / raw 非 staging）。以下情况
+    /// 返回 false，调用方必须逐专家回退（并重读整段）：
+    ///   * family stride 与文件布局不一致；
+    ///   * raw staging（需要 upload hook，tiled 字节不能直接落 slot）；
+    ///   * O_DIRECT 下 offset/总长度不是 512 的倍数；
+    ///   * IOV_MAX 超限。
+    /// slot 不连续**不是**回退条件：iovec 各自带地址，文件顺序才是硬约束。
+    /// 调用方已经按 `merge_gate::decide().merge_prefetch` 门控；这里只做布局判据，
+    /// 不再重复读 MERGE_PREFETCH / read_mode。
+    bool read_prefetch_run_directv(const layer_state & state,
+                                   const std::vector<llama_moe::prefetch_merge::item> & items,
+                                   const std::vector<int> & order,
+                                   const llama_moe::prefetch_merge::unit & u,
+                                   bool window_mode, run_io_outcome & out) {
+        if (u.count <= 1) {
+            return false;
+        }
+        const std::vector<binding> & bindings = window_mode ? state.dec_bindings   : state.bindings;
+        const std::vector<size_t>  & fam_order = window_mode ? state.dec_pack_order : state.pack_order;
+        const std::string          & path     = window_mode ? state.dec_pack_path : state.pack_path;
+        const size_t base   = window_mode ? state.dec_pack_base   : state.pack_base;
+        const size_t stride = window_mode ? state.dec_pack_stride : state.pack_stride;
+        const int n_fam = (int) fam_order.size();
+        if (n_fam <= 0 || n_fam > 8 || stride == 0 || path.empty()) {
+            return false;
+        }
+        if ((size_t) u.count * (size_t) n_fam > 1024) {   // IOV_MAX
+            return false;
+        }
+        int32_t pos0 = -1;
+        for (int j = 0; j < u.count; ++j) {
+            const auto & it = items[(size_t) order[(size_t) (u.first + j)]];
+            if (it.slot < 0 || it.pos < 0) {
+                return false;
+            }
+            if (j == 0) {
+                pos0 = it.pos;
+            } else if (it.pos != pos0 + j) {
+                return false;   // 调用方传进来的不是连续段
+            }
+        }
+
+        std::vector<struct iovec> iov;
+        iov.reserve((size_t) u.count * (size_t) n_fam);
+        size_t total = 0;
+        const int32_t trace_layer = (int32_t) (&state - layers.data());
+        auto context = handoff_thread.trace == &handoff_trace ? handoff_thread.context
+            : moe_handoff_context{0, 0, trace_layer, 0, "other", 0, window_mode ? "window" : "bank"};
+        if (!context.io_id) context.io_id = handoff_trace.new_io_id();
+        moe_handoff_scope scope(handoff_trace.enabled() ? &handoff_trace : nullptr, context,
+                                items[(size_t) order[(size_t) u.first]].expert,
+                                items[(size_t) order[(size_t) u.first]].slot);
+        const bool prefetch = handoff_trace.enabled() && std::strcmp(context.source, "prefetch") == 0;
+        moe_handoff_span reader(handoff_trace, prefetch ? "PF_READ_BEGIN" : "OTHER_READ_BEGIN",
+            prefetch ? "PF_READ_DONE" : "OTHER_READ_DONE", context,
+            items[(size_t) order[(size_t) u.first]].expert,
+            items[(size_t) order[(size_t) u.first]].slot);
+        const int delay_us = read_delay_us();
+        if (delay_us > 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
+        }
+
+        const int64_t t0 = now_ns();
+        const char * packed_dir = std::getenv("LLAMA_MOE_HTP_PACKED_DIR");
+        if (packed_dir && *packed_dir) {
+            using pack_fn = size_t (*)(void *, const void *, int, int64_t, int64_t);
+            std::vector<size_t> fam_bytes((size_t) n_fam, 0);
+            size_t packed_stride = 0;
+            for (int f = 0; f < n_fam; ++f) {
+                const binding & b = bindings[fam_order[(size_t) f]];
+                auto dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(b.tensor->buffer));
+                auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                auto pack = reg ? (pack_fn) ggml_backend_reg_get_proc_address(reg,
+                    "ggml_backend_pack_moe_expert") : nullptr;
+                if (!pack) {
+                    return false;
+                }
+                const size_t bytes = pack(nullptr, nullptr, b.tensor->type, b.tensor->ne[0], b.tensor->ne[1]);
+                if (!bytes) {
+                    return false;
+                }
+                fam_bytes[(size_t) f] = bytes;
+                packed_stride += bytes;
+            }
+            if (packed_stride == 0) {
+                return false;
+            }
+            const size_t offset = (size_t) pos0 * packed_stride;
+            for (int j = 0; j < u.count; ++j) {
+                const auto & it = items[(size_t) order[(size_t) (u.first + j)]];
+                for (int f = 0; f < n_fam; ++f) {
+                    const binding & b = bindings[fam_order[(size_t) f]];
+                    iov.push_back({ (uint8_t *) b.tensor->data + (size_t) it.slot * fam_bytes[(size_t) f],
+                                    fam_bytes[(size_t) f] });
+                    total += fam_bytes[(size_t) f];
+                }
+            }
+            if (llama_moe::merge_read_hardening::span_needs_buffered_fallback(
+                    moe_o_direct(), offset, total)) {
+                return false;   // O_DIRECT 对齐不满足 -> 逐专家回退
+            }
+            const size_t slash = path.find_last_of("/");
+            const std::string packed_path = std::string(packed_dir) + "/" +
+                path.substr(slash == std::string::npos ? 0 : slash + 1);
+            const int fd = fd_for(packed_path);
+            readv_span(fd, offset, iov.data(), (int) iov.size());
+#if defined(__linux__)
+            const char * drop_pages = std::getenv("LLAMA_MOE_DROP_CACHED_EXPERT_PAGES");
+            if (window_mode && drop_pages && *drop_pages != '0') {
+                const int advice_error = posix_fadvise(fd, offset, packed_stride * (off_t) u.count, POSIX_FADV_DONTNEED);
+                if (advice_error) {
+                    moe_log("expert page-cache advice failed: %s", std::strerror(advice_error));
+                }
+            }
+#endif
+            if (verify_slot_enabled() &&
+                !verify_slot_bytes(packed_path, offset, iov.data(), (int) iov.size())) {
+                throw std::runtime_error("offline tiled merged prefetch slot verification failed");
+            }
+            out.scatter = false;
+        } else {
+            using upload_fn = bool (*)(ggml_tensor *, int32_t, const void *, size_t);
+            size_t sum_bytes = 0;
+            for (int f = 0; f < n_fam; ++f) {
+                const binding & b = bindings[fam_order[(size_t) f]];
+                auto dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(b.tensor->buffer));
+                auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                auto upload = reg ? (upload_fn) ggml_backend_reg_get_proc_address(reg,
+                    "ggml_backend_upload_moe_expert") : nullptr;
+                if (upload) {
+                    return false;   // raw staging/upload-hook：逐专家回退
+                }
+                sum_bytes += b.entry->bytes_per_expert;
+            }
+            if (sum_bytes != stride) {
+                return false;
+            }
+            const size_t offset = base + (size_t) pos0 * stride;
+            for (int j = 0; j < u.count; ++j) {
+                const auto & it = items[(size_t) order[(size_t) (u.first + j)]];
+                for (int f = 0; f < n_fam; ++f) {
+                    const binding & b = bindings[fam_order[(size_t) f]];
+                    const size_t bytes = b.entry->bytes_per_expert;
+                    iov.push_back({ (uint8_t *) b.tensor->data + (size_t) it.slot * bytes, bytes });
+                    total += bytes;
+                }
+            }
+            if (llama_moe::merge_read_hardening::span_needs_buffered_fallback(
+                    moe_o_direct(), offset, total)) {
+                return false;
+            }
+            const int fd = fd_for(path);
+            readv_span(fd, offset, iov.data(), (int) iov.size());
+            if (verify_slot_enabled() &&
+                !verify_slot_bytes(path, offset, iov.data(), (int) iov.size())) {
+                throw std::runtime_error("merged prefetch slot verification failed");
+            }
+            out.scatter = false;
+        }
+
+        out.ns = now_ns() - t0;
+        out.bytes = total;
+        stats.pread_ns.fetch_add(out.ns, std::memory_order_relaxed);
+        stats.n_bytes.fetch_add(total, std::memory_order_relaxed);
+        stats.n_miss.fetch_add((uint64_t) u.count, std::memory_order_relaxed);
+        reader.complete();
+        return true;
+    }
+
+    // ── R4a：预读 batch 的认领 / 排序 / 合并 / 发布 ─────────────────────────
+    void record_prefetch_projection(const llama_moe::prefetch_merge::stats & p) {
+        if (p.experts <= 0) return;
+        pf_proj_runs.fetch_add((uint64_t) p.runs, std::memory_order_relaxed);
+        pf_proj_syscalls.fetch_add((uint64_t) p.syscalls, std::memory_order_relaxed);
+        pf_proj_experts.fetch_add((uint64_t) p.experts, std::memory_order_relaxed);
+        pf_proj_zerocopy.fetch_add((uint64_t) p.zerocopy_runs, std::memory_order_relaxed);
+        pf_proj_scatter.fetch_add((uint64_t) p.scatter_runs, std::memory_order_relaxed);
+    }
+
+    void project_prefetch_tasks(const std::vector<lookahead_expert_prefetch::task> & tasks) {
+        // 是否投影已由调用方的 decide().project_prefetch 决定；这里只防空批/单专家。
+        if (tasks.size() < 2) return;
+        const auto & st = layers[(size_t) tasks.front().layer];
+        std::vector<llama_moe::prefetch_merge::item> items;
+        items.reserve(tasks.size());
+        for (const auto & t : tasks) {
+            llama_moe::prefetch_merge::item it;
+            it.layer  = t.layer;
+            it.expert = t.expert;
+            it.slot   = t.to_window ? t.request.slot : t.slot;
+            it.pos    = (t.expert >= 0 && (size_t) t.expert < st.expert_to_pos.size())
+                ? st.expert_to_pos[(size_t) t.expert] : -1;
+            items.push_back(it);
+        }
+        const auto plan = llama_moe::prefetch_merge::plan_batch(
+            items, 1, merge_max_experts(), false);
+        record_prefetch_projection(plan.projection);
+    }
+
+    /// 单专家读：与 lookahead.init 里的 read_fn 完全同构（mode=0 / 回退 / mode=1
+    /// 都走它）。
+    lookahead_expert_prefetch::read_result read_prefetch_one(const lookahead_expert_prefetch::task & t) {
+        auto & st = layers[(size_t) t.layer];
+        if (t.to_window && st.manager) {
+            return install_managed_prefetch(t.layer, t.expert, t.request);
+        }
+        if (t.to_window) {
+            return install_prefetch_into_window(t.layer, t.expert);
+        }
+        read_expert_directv(st, t.expert, t.slot);
+        return lookahead_expert_prefetch::read_result::published;
+    }
+
+    /// 同一层同一 epoch 的一批预读 task。
+    ///
+    /// mode=0 / 单专家 / io_budget / dummy-skip：逐专家走旧路径（mode=1 先算投影）。
+    /// mode=2：先按 expert_to_pos 排序再认领 slot（让相邻专家更容易落到相邻 slot），
+    /// 连续 position 切 run，一次 preadv 落各 slot；成功后逐个 finish/publish。
+    /// 任何 run 失败都重读**整个 run**（见 execute_plan）。
+    std::vector<lookahead_expert_prefetch::read_result> install_prefetch_batch(
+        const std::vector<lookahead_expert_prefetch::task> & tasks) {
+        using pf_result = lookahead_expert_prefetch::read_result;
+        std::vector<pf_result> results(tasks.size(), pf_result::skipped);
+        const int n = (int) tasks.size();
+        if (n <= 0) return results;
+
+        // 预读合并的门控统一由纯函数给出：mode=0 / 单专家 / io_budget /
+        // dummy-skip 都只走逐专家路径；mode=1 与「运行期被禁用」仍保留投影。
+        const llama_moe::merge_gate::decision gate = llama_moe::merge_gate::decide({
+            merge_reads_mode(), merge_prefetch_mode(), io_budget ? 1 : 0, read_mode(),
+            n, false, true});
+        record_merge_gate_prefetch(gate, n);
+        if (!gate.project_prefetch) {
+            // mode=0，或 n==1（改动前的单专家早退：连投影都不算）。
+            for (int i = 0; i < n; ++i) results[(size_t) i] = read_prefetch_one(tasks[(size_t) i]);
+            return results;
+        }
+        // 只统计 / 运行期禁用合并：投影先算，实际仍逐专家。
+        if (!gate.merge_prefetch) {
+            project_prefetch_tasks(tasks);
+            for (int i = 0; i < n; ++i) results[(size_t) i] = read_prefetch_one(tasks[(size_t) i]);
+            return results;
+        }
+
+        const int32_t layer = tasks.front().layer;
+        if (layer < 0 || (size_t) layer >= layers.size()) {
+            for (int i = 0; i < n; ++i) results[(size_t) i] = read_prefetch_one(tasks[(size_t) i]);
+            return results;
+        }
+        auto & st = layers[(size_t) layer];
+        const bool window_mode = tasks.front().to_window;
+
+        struct claim_state {
+            bool active = false;
+            bool finished = false;
+            llama_moe::slot_manager::ticket request;
+            int32_t slot = -1;
+        };
+        std::vector<claim_state> claims((size_t) n);
+
+        // 先按物理 position 排序再认领：不改数据落点语义，只让 slot 分配更连续。
+        std::vector<int> sorted((size_t) n);
+        std::iota(sorted.begin(), sorted.end(), 0);
+        std::stable_sort(sorted.begin(), sorted.end(), [&](int a, int b) {
+            const int32_t ea = tasks[(size_t) a].expert;
+            const int32_t eb = tasks[(size_t) b].expert;
+            const int32_t pa = (ea >= 0 && (size_t) ea < st.expert_to_pos.size()) ? st.expert_to_pos[(size_t) ea] : INT32_MAX;
+            const int32_t pb = (eb >= 0 && (size_t) eb < st.expert_to_pos.size()) ? st.expert_to_pos[(size_t) eb] : INT32_MAX;
+            if (pa != pb) return pa < pb;
+            return a < b;
+        });
+
+        for (int i : sorted) {
+            const auto & t = tasks[(size_t) i];
+            if (t.expert < 0 || (size_t) t.expert >= st.expert_to_pos.size() ||
+                st.expert_to_pos[(size_t) t.expert] < 0) {
+                continue;
+            }
+            if (t.to_window && st.manager) {
+                auto context = handoff_request({t.job, t.epoch, t.layer, t.rows, "prefetch", 0, "window"}, t.request);
+                handoff_trace.emit("PF_CLAIM_WAIT", context, t.expert);
+                llama_moe::slot_manager::result r;
+                {
+                    std::lock_guard<std::mutex> lock(st.mutex);
+                    handoff_trace.emit("PF_CLAIM_LOCKED", context, t.expert);
+                    r = st.manager->start_queued(t.request);
+                    context = handoff_request(context, r.request ? r.request : t.request);
+                    handoff_trace.emit("PF_CLAIM_RESULT", context, t.expert, r.request.slot, (int32_t) r.action);
+                    if (r.owner) trace_managed_claim(st, r, context);
+                }
+                if (!r.owner) {
+                    if (r.action == llama_moe::slot_manager::outcome::stale) {
+                        ++manager_stale; handoff_trace.emit("CANCELLED_STALE_TASK", context, t.expert);
+                    } else {
+                        moe_handoff_detail detail;
+                        const bool quota = r.action == llama_moe::slot_manager::outcome::writer_limit;
+                        detail.reason = quota ? "writer_limit" : "capacity";
+                        if (quota) ++manager_quota_skipped; else ++manager_capacity_skipped;
+                        handoff_trace.emit("REQUEST_CANCELLED", context, t.expert, -1, (int32_t) r.action, 0, {}, detail);
+                    }
+                    continue;
+                }
+                claims[(size_t) i].active = true;
+                claims[(size_t) i].request = r.request;
+                claims[(size_t) i].slot = r.request.slot;
+            } else if (t.to_window) {
+                auto context = handoff_thread.context; context.io_id = handoff_trace.new_io_id();
+                handoff_trace.emit("PF_CLAIM_WAIT", context, t.expert);
+                int32_t slot = -1;
+                {
+                    std::lock_guard<std::mutex> lock(st.mutex);
+                    handoff_trace.emit("PF_CLAIM_LOCKED", context, t.expert);
+                    slot = claim_slot_in_window(st, t.expert, false, handoff_trace.enabled() ? &context : nullptr);
+                    handoff_trace.emit("PF_CLAIM_RESULT", context, t.expert, slot, slot >= 0 ? 1 : 0);
+                    if (slot >= 0) handoff_trace.emit("LEGACY_SLOT_CLAIM", context, t.expert, slot);
+                }
+                if (slot < 0) {
+                    continue;
+                }
+                claims[(size_t) i].active = true;
+                claims[(size_t) i].slot = slot;
+            } else {
+                // 乒乓区：slot 在 arm() 时已固化，且 cap=1，不存在并发重复。
+                if (t.slot < 0) continue;
+                claims[(size_t) i].active = true;
+                claims[(size_t) i].slot = t.slot;
+            }
+        }
+
+        std::vector<pfmerge::item> items;
+        std::vector<int> src;
+        items.reserve((size_t) n);
+        src.reserve((size_t) n);
+        for (int i = 0; i < n; ++i) {
+            if (!claims[(size_t) i].active) continue;
+            pfmerge::item it;
+            it.layer  = layer;
+            it.expert = tasks[(size_t) i].expert;
+            it.slot   = claims[(size_t) i].slot;
+            it.pos    = st.expert_to_pos[(size_t) it.expert];
+            items.push_back(it);
+            src.push_back(i);
+        }
+        if (items.empty()) {
+            return results;
+        }
+
+        const auto plan = pfmerge::plan_batch(items, 2, merge_max_experts(), true);
+        record_prefetch_projection(plan.projection);
+
+        auto finish_item = [&](int idx, bool data_ready) {
+            const int ti = src[(size_t) idx];
+            const auto & t = tasks[(size_t) ti];
+            auto & c = claims[(size_t) ti];
+            auto context = handoff_request({t.job, t.epoch, t.layer, t.rows, "prefetch", 0,
+                t.to_window ? "window" : "bank"}, c.request);
+            if (t.to_window && st.manager) {
+                moe_handoff_scope scope(handoff_trace.enabled() ? &handoff_trace : nullptr, context,
+                                        t.expert, c.slot);
+                handoff_trace.emit("PF_READ_SUBMIT", context, t.expert, c.slot);
+                (void) read_managed_expert(st, c.request, llama_moe::io_admission::origin::prefetch,
+                                           false, data_ready);
+                handoff_trace.emit("PF_PUBLISH_WAIT", context, t.expert, c.slot);
+                std::lock_guard<std::mutex> lock(st.mutex);
+                handoff_trace.emit("PF_PUBLISH_LOCKED", context, t.expert, c.slot);
+                const bool accepted = finish_managed(st, c.request, context, true);
+                if (accepted) ++st.n_prefetch_published;
+                results[(size_t) ti] = accepted ? pf_result::published : pf_result::discarded;
+            } else {
+                if (!data_ready) {
+                    moe_handoff_scope scope(handoff_trace.enabled() ? &handoff_trace : nullptr, context,
+                                            t.expert, c.slot);
+                    handoff_trace.emit("IO_OWNER", context, t.expert, c.slot,
+                        (int32_t) llama_moe::slot_manager::origin::prefetch);
+                    read_expert_directv(st, t.expert, c.slot, window_mode);
+                }
+                if (t.to_window) {
+                    std::lock_guard<std::mutex> lock(st.mutex);
+                    const bool published = publish_slot_in_window(st, t.expert, c.slot);
+                    results[(size_t) ti] = published ? pf_result::published : pf_result::discarded;
+                } else {
+                    results[(size_t) ti] = pf_result::published;
+                }
+            }
+            c.finished = true;
+        };
+
+        pfmerge::exec_stats exec;
+        try {
+            exec = pfmerge::execute_plan(plan,
+                [&](const std::vector<int> & order, const pfmerge::unit & u) {
+                    run_io_outcome out;
+                    return read_prefetch_run_directv(st, items, order, u, window_mode, out);
+                },
+                [&](int idx) { finish_item(idx, false); },
+                [&](const std::vector<int> & order, const pfmerge::unit & u) {
+                    for (int j = 0; j < u.count; ++j) {
+                        finish_item(order[(size_t) (u.first + j)], true);
+                    }
+                });
+        } catch (...) {
+            const auto error = std::current_exception();
+            for (int i = 0; i < n; ++i) {
+                auto & c = claims[(size_t) i];
+                if (!c.active || c.finished) continue;
+                const auto & t = tasks[(size_t) i];
+                auto context = handoff_request({t.job, t.epoch, t.layer, t.rows, "prefetch", 0,
+                    t.to_window ? "window" : "bank"}, c.request);
+                if (t.to_window && st.manager) {
+                    std::lock_guard<std::mutex> lock(st.mutex);
+                    finish_managed(st, c.request, context, false, error);
+                } else if (t.to_window) {
+                    std::lock_guard<std::mutex> lock(st.mutex);
+                    if ((size_t) c.slot < st.slot_to_expert.size() &&
+                        st.slot_to_expert[(size_t) c.slot] == kSlotPending) {
+                        st.slot_to_expert[(size_t) c.slot] = kSlotFree;
+                    }
+                }
+                c.finished = true;
+            }
+            throw;
+        }
+
+        pf_exec_runs.fetch_add((uint64_t) exec.merged_runs, std::memory_order_relaxed);
+        pf_exec_experts.fetch_add((uint64_t) exec.experts, std::memory_order_relaxed);
+        pf_exec_zerocopy.fetch_add((uint64_t) exec.zerocopy_runs, std::memory_order_relaxed);
+        pf_exec_scatter.fetch_add((uint64_t) exec.scatter_runs, std::memory_order_relaxed);
+        pf_exec_fallback.fetch_add((uint64_t) exec.fallback_runs, std::memory_order_relaxed);
+        pf_exec_saved.fetch_add((uint64_t) exec.syscalls_saved(), std::memory_order_relaxed);
+        return results;
     }
 
     static const uint8_t * host_data(const ggml_tensor * tensor) {
@@ -3408,43 +4517,55 @@ struct llama_moe_slot_runtime::impl {
         }
     }
 
-    // 统计 pending 的「连续段」结构，用来判断「合并相邻专家的读」是否可行。
+    // 统计 pending 的「物理连续段」结构，回答「合并相邻专家的读能省多少 syscall」。
     //
-    // 背景：experts 是 expert-major，expert k 的字节在文件里位于
-    // `base + k * expert_stride`，所以**专家 id 连号 == 文件地址连号**。
-    // 而 pending 是按 expert id 升序构建的，因此天然带着可用于合并的连续段。
+    // 判据必须是**文件里的物理位置**：manifest 带 `expert_order` 时文件位置 =
+    // `expert_to_pos[逻辑 id]`，逻辑 id 连号不再等于文件地址连号；而 decode 的 pending
+    // 是 router rank 顺序。所以先按 expert_to_pos 升序排，再数 `pos[j] == pos[j-1]+1`
+    // 的连续段 —— 修正前按 rank 顺序数出来的段数不能当判据（见任务单 §0）。
     //
-    // 两类可合并：
-    //   1. slot 也连号 → 可以直接用一组 iovec 覆盖整段，**零拷贝**、syscall 数减到 1/段长
-    //   2. slot 不连号 → 得先读进 scratch 再散写到各 slot，多一次内存拷贝
-    //
-    // 共享 bank 的 prefill 里 LRU 每层清空、slot 从 0 顺序分配，而 pending 又是按
-    // expert 升序压入的，所以 1 类应该占绝大多数。这个统计就是来验证这一点的。
-    static run_stats accumulate_runs(const std::vector<pending_install> & pending) {
+    // 两类：
+    //   1. 段内目标 slot 也连号 → 一组 iovec 可直接覆盖（统计口径的 zero-copy）
+    //   2. slot 不连号 → 需要 scratch 中转再散写（scatter）
+    // `syscalls` 是「按 MERGE_MAX_EXPERTS 切段后一次 preadv 覆盖一段」的投影，
+    // 即 MERGE=2 下每步的读 syscall 数；MERGE=0/1 的实际 syscall 数仍等于专家数。
+    static run_stats accumulate_runs(const std::vector<pending_install> & pending,
+                                     const std::vector<int32_t> & expert_to_pos,
+                                     int max_experts) {
         run_stats st;
         const size_t n = pending.size();
         if (n == 0) {
             return st;
         }
+        struct item_pos {
+            int32_t pos  = -1;
+            int32_t slot = -1;
+        };
+        std::vector<item_pos> items(n);
+        for (size_t i = 0; i < n; ++i) {
+            const int32_t e = pending[i].expert;
+            items[i].pos  = (e >= 0 && (size_t) e < expert_to_pos.size()) ? expert_to_pos[(size_t) e] : -1;
+            items[i].slot = pending[i].slot;
+        }
+        std::sort(items.begin(), items.end(), [](const item_pos & a, const item_pos & b) {
+            return a.pos < b.pos;
+        });
+        const int chunk = std::max(1, max_experts);
         size_t i = 0;
         while (i < n) {
-            size_t j = i + 1;   // 只按 expert 连号扩展，slot 单独判
-            while (j < n && pending[j].expert == pending[j - 1].expert + 1) {
+            size_t j = i + 1;
+            while (j < n && items[j].pos == items[j - 1].pos + 1) {
                 ++j;
             }
             const int run_len = (int) (j - i);
-
-            bool slots_consecutive = true;
-            for (size_t k = i + 1; k < j; ++k) {
-                if (pending[k].slot != pending[k - 1].slot + 1) {
-                    slots_consecutive = false;
-                    break;
-                }
+            bool slots_consecutive = items[i].slot >= 0;
+            for (size_t k = i + 1; k < j && slots_consecutive; ++k) {
+                slots_consecutive = items[k].slot == items[k - 1].slot + 1;
             }
-
             st.n++;
             st.experts += run_len;
             st.max = std::max(st.max, run_len);
+            st.syscalls += (run_len + chunk - 1) / chunk;
             if (slots_consecutive) {
                 st.ok_n++;
                 st.ok_ex += run_len;
@@ -3459,6 +4580,7 @@ struct llama_moe_slot_runtime::impl {
 
     static void add_runs(run_stats & dst, const run_stats & src) {
         dst.n          += src.n;
+        dst.syscalls   += src.syscalls;
         dst.experts    += src.experts;
         dst.max         = std::max(dst.max, src.max);
         dst.ok_n       += src.ok_n;
@@ -3490,7 +4612,7 @@ struct llama_moe_slot_runtime::impl {
         return total;
     }
 
-    install_timing install_packed_wave(layer_state & state, const std::vector<pending_install> & pending,
+    install_timing install_packed_wave(layer_state & state, std::vector<pending_install> & pending,
                                        bool window_mode) {
         install_timing t;
         const int n = (int) pending.size();
@@ -3501,60 +4623,200 @@ struct llama_moe_slot_runtime::impl {
         t.n = n;
         t.pack = true;
         t.bytes = (size_t) n * state.pack_bytes;
-        std::vector<std::exception_ptr> errs((size_t) n);
-        std::vector<int64_t> dts((size_t) n, 0);
+
+        // ── R3：按物理位置排序 + 合并相邻读 ─────────────────────────────────
+        // 文件里专家的顺序由 pack 决定（manifest expert_order → expert_to_pos）。
+        // 每个 wave 内按 position 升序排 pending，连续 position 切成 run；run 长 1 走
+        // 原单专家路径，run 长 k>1 走一次 preadv（见 read_run_directv）。
+        //
+        // MERGE=1 只统计、MERGE=0 完全不变：两者都不改读取顺序，A/B 的变量只有合并。
+        // managed（slot_manager）路径的 request 要逐个 finish，故不参与合并。
+        const int merge_max  = merge_max_experts();
+        bool any_managed = false;
+        bool all_managed = true;
+        for (const auto & item : pending) {
+            any_managed = any_managed || (bool) item.request;
+            all_managed = all_managed && (bool) item.request;
+        }
+        // 门控只在这里算一次：sort_demand 决定是否排序/切 run，merge_demand 决定
+        // read_run_directv 是否真的发 preadv。两者都来自纯函数，日志与测试共用同一套语义。
+        const llama_moe::merge_gate::decision gate = llama_moe::merge_gate::decide({
+            merge_reads_mode(), merge_prefetch_mode(), io_budget ? 1 : 0, read_mode(),
+            n, any_managed, all_managed});
+        record_merge_gate_demand(gate, n, any_managed, all_managed);
+        // managed（slot_manager / READY=1）路径也合并：读完后逐个补 finish_managed。
+        // 但 io_budget 打开时不合并 —— 它按 per-expert permit 限流，一次拿 k 个 permit
+        // 会改变等待/优先级语义（limit 小于 k 时还会死锁）。
+        const bool merge_active = gate.sort_demand;
+        if (merge_active && n > 1) {
+            std::stable_sort(pending.begin(), pending.end(),
+                [&](const pending_install & a, const pending_install & b) {
+                    return state.expert_to_pos[(size_t) a.expert] <
+                           state.expert_to_pos[(size_t) b.expert];
+                });
+        }
+
+        std::vector<int> unit_first;
+        std::vector<int> unit_count;
+        unit_first.reserve((size_t) n);
+        unit_count.reserve((size_t) n);
+        for (int i = 0; i < n; ) {
+            int len = 1;
+            if (merge_active) {
+                const int32_t p0 = state.expert_to_pos[(size_t) pending[(size_t) i].expert];
+                while (i + len < n && len < merge_max &&
+                       state.expert_to_pos[(size_t) pending[(size_t) (i + len)].expert] == p0 + len) {
+                    ++len;
+                }
+            }
+            unit_first.push_back(i);
+            unit_count.push_back(len);
+            i += len;
+        }
+        const size_t n_units = unit_first.size();
+
+        std::vector<std::exception_ptr> errs(n_units);
+        std::vector<int64_t> dts(n_units, 0);
+        std::vector<uint8_t> merged(n_units, 0);
+        std::vector<uint8_t> scattered(n_units, 0);
         // Snapshot on the submitting thread, before the pool starts. Readers
         // must never load the caller's mutable graph_epoch themselves.
         const moe_handoff_context trace_context = {0, graph_epoch, (int32_t) (&state - layers.data()),
             handoff_thread.trace == &handoff_trace ? handoff_thread.context.rows : 0, "demand", 0, window_mode ? "window" : "bank"};
-        auto read_one = [&](int i) {
-            auto request_context = handoff_request(trace_context, pending[(size_t) i].request);
-            request_context.io_id = pending[(size_t) i].io_id;
+        auto read_unit = [&](size_t u) {
+            const int first = unit_first[u];
+            const int count = unit_count[u];
+            const auto & head = pending[(size_t) first];
+            auto request_context = handoff_request(trace_context, head.request);
+            request_context.io_id = head.io_id;
             moe_handoff_scope trace_scope(handoff_trace.enabled() ? &handoff_trace : nullptr, request_context);
-            handoff_trace.emit("IO_OWNER", request_context,
-                pending[(size_t) i].expert, pending[(size_t) i].slot, (int32_t) llama_moe::slot_manager::origin::demand);
-            try {
-                const auto & item = pending[(size_t) i];
-                dts[(size_t) i] = item.request ? read_managed_expert(state, item.request,
+            for (int j = 0; j < count; ++j) {
+                const auto & item = pending[(size_t) (first + j)];
+                auto c = handoff_request(trace_context, item.request);
+                c.io_id = item.io_id;
+                handoff_trace.emit("IO_OWNER", c, item.expert, item.slot,
+                    (int32_t) llama_moe::slot_manager::origin::demand);
+            }
+            // 本 unit 是否含 managed（READY=1 / slot_manager）request。合并失败时
+            // managed 保持 fail-all（ownership 语义）；非 managed 才逐专家重读。
+            bool unit_managed = false;
+            for (int j = 0; j < count; ++j) {
+                unit_managed = unit_managed || (bool) pending[(size_t) (first + j)].request;
+            }
+
+            // 逐专家读 + 发布。read_demand_unit() 在合并失败时会对本 unit 的每个
+            // 专家调用且只调用一次（RK-2：不能只读第一个，也不能跳过）。
+            auto read_one = [&](int j) {
+                const auto & item = pending[(size_t) (first + j)];
+                auto c = handoff_request(trace_context, item.request);
+                c.io_id = item.io_id;
+                dts[u] += item.request ? read_managed_expert(state, item.request,
                     llama_moe::io_admission::origin::demand, item.retry) :
                     read_expert_directv(state, item.expert, item.slot, window_mode);
-                if (pending[(size_t) i].request) {
+                if (item.request) {
                     std::lock_guard<std::mutex> lock(state.mutex);
-                    if (!finish_managed(state, pending[(size_t) i].request, request_context, true)) {
+                    if (!finish_managed(state, item.request, c, true)) {
                         throw std::runtime_error("demand expert request lost its slot ownership");
                     }
                 }
-                handoff_trace.emit("DEMAND_READY", request_context, pending[(size_t) i].expert, pending[(size_t) i].slot);
+                handoff_trace.emit("DEMAND_READY", c, item.expert, item.slot);
+            };
+
+            auto on_merged = [&]() {
+                for (int j = 0; j < count; ++j) {
+                    const auto & item = pending[(size_t) (first + j)];
+                    auto c = handoff_request(trace_context, item.request);
+                    c.io_id = item.io_id;
+                    if (item.request) {
+                        // 数据已在 read_run_directv 里落进 slot：只补记账，
+                        // 然后按原语义发布（失败要回滚这次 lease）。
+                        (void) read_managed_expert(state, item.request,
+                            llama_moe::io_admission::origin::demand, item.retry, true);
+                        std::lock_guard<std::mutex> lock(state.mutex);
+                        if (!finish_managed(state, item.request, c, true)) {
+                            throw std::runtime_error("demand expert request lost its slot ownership");
+                        }
+                    }
+                    handoff_trace.emit("DEMAND_READY", c, item.expert, item.slot);
+                }
+            };
+
+            try {
+                (void) llama_moe::merge_read_hardening::read_demand_unit(
+                    count, unit_managed,
+                    [&]() -> bool {
+                        if (count <= 1) {
+                            return false;
+                        }
+                        run_io_outcome out;
+                        if (!read_run_directv(state, pending.data() + first, count, window_mode,
+                                              gate.merge_demand, out)) {
+                            return false;
+                        }
+                        dts[u] = out.ns;
+                        merged[u] = 1;
+                        scattered[u] = out.scatter ? 1 : 0;
+                        return true;
+                    },
+                    read_one,
+                    on_merged,
+                    [&](const char * reason) {
+                        // 非 managed：整 run 回退、逐专家重读（与 prefetch 的
+                        // pfmerge::execute_plan 同语义）。每个专家只在 read_one 里读一次。
+                        n_merge_fallback_runs.fetch_add(1, std::memory_order_relaxed);
+                        moe_log("merge-demand-fallback: unmanaged run read failed (%s); "
+                                "re-reading %d experts one by one", reason, count);
+                    },
+                    [&](const char *) {
+                        // 原因由下面的 catch 统一打印（此时 unit 范围已知）。
+                    });
             } catch (...) {
-                errs[(size_t) i] = std::current_exception();
-                if (pending[(size_t) i].request) {
-                    std::lock_guard<std::mutex> lock(state.mutex);
-                    finish_managed(state, pending[(size_t) i].request, request_context, false, errs[(size_t) i]);
+                errs[u] = std::current_exception();
+                if (unit_managed) {
+                    std::string reason = "unknown";
+                    try {
+                        std::rethrow_exception(errs[u]);
+                    } catch (const std::exception & e) {
+                        reason = e.what();
+                    } catch (...) {
+                    }
+                    // managed ownership：不允许逐专家重读；明确说明 fail-all 的范围与原因，
+                    // 并把本 unit 的每个 managed request 标失败（下面循环），不留 loading。
+                    moe_log("merge-demand-fallback: managed fail-all unit_first=%d experts=%d: %s",
+                            first, count, reason.c_str());
+                }
+                for (int j = 0; j < count; ++j) {
+                    const auto & item = pending[(size_t) (first + j)];
+                    if (item.request) {
+                        std::lock_guard<std::mutex> lock(state.mutex);
+                        finish_managed(state, item.request,
+                            handoff_request(trace_context, item.request), false, errs[u]);
+                    }
                 }
             }
         };
 
-        t.n_th = std::max(1, std::min(moe_ssd_io_threads(), n));
+        t.n_th = std::max(1, std::min(moe_ssd_io_threads(), (int) n_units));
         const int64_t wall0 = now_ns();
         handoff_trace.emit("DEMAND_WAVE_SUBMIT", trace_context, -1, -1, n, t.bytes);
-        // 注意：单线程不能只调 read_one(0) —— 那只会装第一个专家，
-        // 其余 N-1 个被静默跳过，slot 里留着上一层/上一个 token 的旧权重，
+        // 注意：单线程不能只调 read_unit(0) —— 那只会装第一个单元，
+        // 其余单元被静默跳过，slot 里留着上一层/上一个 token 的旧权重，
         // 模型输出会错但不报错。这条路径只在 io_threads==1 时进入，
         // 默认 4 所以长期潜伏；把它做成可调后才会踩到。
-        // 单线程还有个副作用：pending 是按 expert id 升序构建的，而 experts 是
-        // expert-major（offset = base + expert * stride），所以单线程等于**严格
-        // 顺序读文件**，可能接近顺序读速率（实测比 4 线程的随机交织快）。
+        // 单线程还有个副作用：pending 是按物理 position 升序构建/排序的，而 experts 是
+        // expert-major（offset = base + pos * stride），所以单线程等于**严格顺序读文件**，
+        // 可能接近顺序读速率（实测比 4 线程的随机交织快）。
         if (t.n_th == 1) {
-            for (int i = 0; i < n; ++i) {
-                read_one(i);
+            for (size_t u = 0; u < n_units; ++u) {
+                read_unit(u);
             }
         } else {
-            std::atomic<int> next{0};
+            std::atomic<size_t> next{0};
             auto work = [&]() {
                 for (;;) {
-                    const int i = next.fetch_add(1, std::memory_order_relaxed);
-                    if (i >= n) break;
-                    read_one(i);
+                    const size_t u = next.fetch_add(1, std::memory_order_relaxed);
+                    if (u >= n_units) break;
+                    read_unit(u);
                 }
             };
             if (!io_pool.run(t.n_th, work)) {
@@ -3570,10 +4832,19 @@ struct llama_moe_slot_runtime::impl {
             }
         }
         t.wall_ns = now_ns() - wall0;
-        for (int i = 0; i < n; ++i) {
-            if (errs[(size_t) i]) std::rethrow_exception(errs[(size_t) i]);
-            t.pread_sum_ns += dts[(size_t) i];
-            t.pread_max_ns = std::max(t.pread_max_ns, dts[(size_t) i]);
+        for (size_t u = 0; u < n_units; ++u) {
+            if (errs[u]) std::rethrow_exception(errs[u]);
+            t.pread_sum_ns += dts[u];
+            t.pread_max_ns = std::max(t.pread_max_ns, dts[u]);
+            if (merged[u]) {
+                n_merge_runs.fetch_add(1, std::memory_order_relaxed);
+                n_merge_experts.fetch_add((uint64_t) unit_count[u], std::memory_order_relaxed);
+                if (scattered[u]) {
+                    n_merge_scatter.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    n_merge_zerocopy.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
         }
         return t;
     }
@@ -3650,6 +4921,95 @@ struct llama_moe_slot_runtime::impl {
         return (idx % 8) == 0;
     }
 
+    /// 只有一个 env 显式存在时才输出 merge-gate 诊断；默认路径一行都不加，
+    /// 旧日志因此仍逐字节可比。
+    static bool merge_gate_log_enabled() {
+        static const bool enabled = [] {
+            // 「显式存在」按 getenv 非空指针判断：即使值是空串/0 也算用户设置了，
+            // 此时打一行 env_off，方便确认日志开关本身生效。
+            return std::getenv("LLAMA_MOE_MERGE_READS") != nullptr ||
+                   std::getenv("LLAMA_MOE_MERGE_PREFETCH") != nullptr;
+        }();
+        return enabled;
+    }
+
+    static const char * merge_gate_managed_name(const llama_moe::merge_gate::inputs & in) {
+        if (!in.any_managed && in.all_managed) return "none";
+        if (in.any_managed && in.all_managed) return "all";
+        return "mixed";
+    }
+
+    void record_merge_gate_demand(const llama_moe::merge_gate::decision & d, int n,
+                                  bool any_managed, bool all_managed) {
+        if (!merge_gate_log_enabled()) return;
+        std::lock_guard<std::mutex> lock(merge_gate_mutex);
+        merge_gate_state.demand_seen = true;
+        merge_gate_state.demand_inputs.n = n;
+        merge_gate_state.demand_inputs.any_managed = any_managed;
+        merge_gate_state.demand_inputs.all_managed = all_managed;
+        merge_gate_state.demand_decision = d;
+    }
+
+    void record_merge_gate_prefetch(const llama_moe::merge_gate::decision & d, int n) {
+        if (!merge_gate_log_enabled()) return;
+        std::lock_guard<std::mutex> lock(merge_gate_mutex);
+        merge_gate_state.prefetch_seen = true;
+        merge_gate_state.prefetch_inputs.n = n;
+        merge_gate_state.prefetch_decision = d;
+    }
+
+    /// 每步（每个 ubatch）一行。字段固定，方便和手机日志/脚本对照：
+    ///   merge-gate: reads=%d prefetch=%d io_budget=%d read_mode=%d managed=%s n=%d
+    ///               -> demand=%d prefetch=%d reason=%s
+    /// `demand`/`prefetch` 是门控是否允许合并（不表示本步真的发生了合并）；
+    /// reason 选 demand 侧最常见的原因，demand 允许时再看 prefetch 侧。
+    void log_merge_gate_step() {
+        if (!merge_gate_log_enabled()) return;
+
+        merge_gate_step snap;
+        {
+            std::lock_guard<std::mutex> lock(merge_gate_mutex);
+            snap = merge_gate_state;
+            merge_gate_state = merge_gate_step{};
+        }
+
+        const int reads    = merge_reads_mode();
+        const int prefetch = merge_prefetch_mode();
+        const int budget   = io_budget ? 1 : 0;
+        const int rm       = read_mode();
+
+        const char * managed = "none";
+        int n = 0;
+        if (snap.demand_seen) {
+            n = snap.demand_inputs.n;
+            managed = merge_gate_managed_name(snap.demand_inputs);
+        } else if (snap.prefetch_seen) {
+            n = snap.prefetch_inputs.n;
+        }
+
+        const bool demand_merge = snap.demand_seen && snap.demand_decision.merge_demand;
+        const bool prefetch_merge = snap.prefetch_seen && snap.prefetch_decision.merge_prefetch;
+
+        llama_moe::merge_gate::reason why = llama_moe::merge_gate::reason::ok;
+        if (snap.demand_seen && !snap.demand_decision.merge_demand &&
+            snap.demand_decision.why != llama_moe::merge_gate::reason::ok) {
+            why = snap.demand_decision.why;
+        } else if (snap.prefetch_seen && !snap.prefetch_decision.merge_prefetch &&
+                   snap.prefetch_decision.why != llama_moe::merge_gate::reason::ok) {
+            why = snap.prefetch_decision.why;
+        } else if (!snap.demand_seen && !snap.prefetch_seen) {
+            // 本步没有任何 demand/prefetch 批（全部命中）时也要给一个原因。
+            why = llama_moe::merge_gate::decide({
+                reads, prefetch, budget, rm, 0, false, true}).why;
+        }
+
+        moe_log("merge-gate: reads=%d prefetch=%d io_budget=%d read_mode=%d managed=%s "
+                "n=%d -> demand=%d prefetch=%d reason=%s",
+            reads, prefetch, budget, rm, managed, n,
+            demand_merge ? 1 : 0, prefetch_merge ? 1 : 0,
+            llama_moe::merge_gate::reason_name(why));
+    }
+
     void flush_ubatch(const char * kind, uint64_t idx) {
         if (cur.n_layers <= 0) {
             return;
@@ -3658,30 +5018,50 @@ struct llama_moe_slot_runtime::impl {
         const uint64_t all_now = io_bytes_all.load(std::memory_order_relaxed);
         const uint64_t calls_now = io_calls_all.load(std::memory_order_relaxed);
         const int64_t proc_now = process_ns.load(std::memory_order_relaxed);
+        const int64_t install_now = install_ns.load(std::memory_order_relaxed);
+        const int64_t readids_now = readids_ns.load(std::memory_order_relaxed);
+        const int64_t writeids_now = writeids_ns.load(std::memory_order_relaxed);
         const uint64_t arm_skip_now = lookahead.n_arm_skipped.load(std::memory_order_relaxed);
         const uint64_t wait_now     = lookahead.n_waits.load(std::memory_order_relaxed);
         const int64_t  wait_ns_now  = lookahead.n_wait_ns.load(std::memory_order_relaxed);
         const uint64_t pred_read_now = lookahead.n_pred_read.load(std::memory_order_relaxed);
         const uint64_t pf_hits_now = lookahead.n_hits.load(std::memory_order_relaxed);
         const uint64_t pf_pub_now  = lookahead.n_pred_published.load(std::memory_order_relaxed);
+        const uint64_t pf_proj_runs_now = pf_proj_runs.load(std::memory_order_relaxed);
+        const uint64_t pf_proj_syscalls_now = pf_proj_syscalls.load(std::memory_order_relaxed);
         const uint64_t all_delta = all_now - last_io_bytes;
         const uint64_t calls_delta = calls_now - last_io_calls;
         const int64_t proc_delta = proc_now - last_process_ns;
+        // 子项与 pmgmt 用**同一段**增量（同一 span）。三者是 process_ns 的子集，
+        // 差值 pmgmt_other 包含分配/淘汰/LRU/锁等待/统计等其余部分；若子项存在
+        // 嵌套/重叠导致差值为负，如实打印负数，不 clamp。
+        const int64_t install_delta = install_now - last_install_ns;
+        const int64_t readids_delta = readids_now - last_readids_ns;
+        const int64_t writeids_delta = writeids_now - last_writeids_ns;
+        const int64_t pmgmt_other_delta =
+            proc_delta - install_delta - readids_delta - writeids_delta;
         const uint64_t arm_skip_delta = arm_skip_now - last_arm_skipped;
         const uint64_t wait_delta = wait_now - last_wait_count;
         const int64_t wait_ns_delta = wait_ns_now - last_wait_ns;
         const uint64_t pred_read_delta = pred_read_now - last_pred_read;
         const uint64_t pf_hits_delta = pf_hits_now - last_pf_hits;
         const uint64_t pf_pub_delta  = pf_pub_now - last_pf_pub;
+        const uint64_t pf_proj_runs_delta = pf_proj_runs_now - last_pf_proj_runs;
+        const uint64_t pf_proj_syscalls_delta = pf_proj_syscalls_now - last_pf_proj_syscalls;
         last_io_bytes = all_now;
         last_io_calls = calls_now;
         last_process_ns = proc_now;
+        last_install_ns = install_now;
+        last_readids_ns = readids_now;
+        last_writeids_ns = writeids_now;
         last_arm_skipped = arm_skip_now;
         last_wait_count = wait_now;
         last_wait_ns = wait_ns_now;
         last_pred_read = pred_read_now;
         last_pf_hits = pf_hits_now;
         last_pf_pub  = pf_pub_now;
+        last_pf_proj_runs = pf_proj_runs_now;
+        last_pf_proj_syscalls = pf_proj_syscalls_now;
 
         // 这些计数器只在 flush 时前进，而 flush 受 should_log_ubatch 节流。
         // 所以必须把「本次 flush 覆盖了多少步」一起打出来，否则消费方会把
@@ -3695,11 +5075,18 @@ struct llama_moe_slot_runtime::impl {
         const double mibs = wall_s > 0.0 ? (cur.bytes / (1024.0 * 1024.0)) / wall_s : 0.0;
         const double uniq = cur.n_layers > 0 ? (double) cur.unique_sum / (double) cur.n_layers : 0.0;
         const double avg_run = cur.runs.n > 0 ? (double) cur.runs.experts / (double) cur.runs.n : 0.0;
+        // runs/step = cur.runs.n（本 ubatch 一条日志的窗口就是 step 的 span），
+        // merge_syscalls/step = 按 MERGE_MAX_EXPERTS 切段后的 preadv 次数投影；
+        // MERGE=0/1 的实际 syscall 数仍等于专家数（看同一行的 calls=）。
+        const double scatter_pct = cur.runs.experts > 0
+            ? 100.0 * (double) cur.runs.scatter_ex / (double) cur.runs.experts : 0.0;
         moe_log("%s #%llu tok=%d used=%d layers=%d unique/l=%.0f miss=%d hit=%d pack=%d/%d nth=%d "
                 "pread_wall=%.0fms pread_sum=%.0fms bytes=%.0fMiB par=%.2f io=%.0fMiB/s "
                 "readall=%.0fMiB calls=%llu realio=%.0fMiB/s interval_ms=%.1f span=%llu pmgmt=%.1fms "
                 "pfskip=%llu pfwait=%llu/%.1fms pfread=%llu pfpub=%llu pfhit=%llu pfpredict=%llu pevsave=%llu pevforced=%llu pfcached=%llu usedpf=%llu "
-                "runs=%d avg_run=%.1f max_run=%d zerocopy=%.0f%%",
+                "runs=%d merge_syscalls=%d avg_run=%.1f max_run=%d zerocopy=%.0f%% scatter=%.0f%% "
+                "prefetch_runs=%llu prefetch_syscalls=%llu prefetch_mode=%d "
+                "install=%.1fms readids=%.1fms writeids=%.1fms pmgmt_other=%.1fms",
             kind,
             (unsigned long long) idx,
             cur.n_tokens,
@@ -3736,28 +5123,77 @@ struct llama_moe_slot_runtime::impl {
             (unsigned long long) lookahead.n_pred_cached.load(std::memory_order_relaxed),
             (unsigned long long) lookahead.n_used_from_pf.load(std::memory_order_relaxed),
             cur.runs.n,
+            cur.runs.syscalls,
             avg_run,
             cur.runs.max,
-            cur.runs.experts > 0 ? 100.0 * (double) cur.runs.ok_ex / (double) cur.runs.experts : 0.0);
+            cur.runs.experts > 0 ? 100.0 * (double) cur.runs.ok_ex / (double) cur.runs.experts : 0.0,
+            scatter_pct,
+            (unsigned long long) pf_proj_runs_delta,
+            (unsigned long long) pf_proj_syscalls_delta,
+            merge_prefetch_mode(),
+            ms_of(install_delta),
+            ms_of(readids_delta),
+            ms_of(writeids_delta),
+            ms_of(pmgmt_other_delta));
         cur = ubatch_acc{};
     }
 
-    /// 整个进程的「合并读」可行性汇总。用来回答一个问题：
-    /// **把相邻专家的读合并成大 preadv，到底能减少多少次 syscall、传输会变成多大。**
+    /// 整个进程的「合并读」汇总：先答「形状」（物理连续段多少、平均多长、多少要
+    /// scratch 散写），再答「实际执行」（MERGE=2 下合并了多少次、省了多少 syscall）。
+    /// 形状统计与 MERGE 开关无关（MERGE=0/1/2 都会算），所以可以直接对照 identity /
+    /// ordered 两种 pack；执行计数只在 MERGE=2 时非零。
     void report_merge() {
+        // R4a：预读合并的投影/执行计数。MERGE_PREFETCH=0 时明确标 disabled，
+        // 不产生任何非零计数，旧日志解析不受影响。
+        const int pmode = merge_prefetch_mode();
+        if (pmode == 0) {
+            moe_log("merge-prefetch-exec: disabled merge_prefetch=0");
+        } else {
+            const uint64_t pe = pf_proj_experts.load(std::memory_order_relaxed);
+            if (pe > 0) {
+                moe_log("merge-prefetch-scan: experts=%llu runs=%llu syscalls=%llu zerocopy_runs=%llu scatter_runs=%llu merge_prefetch=%d",
+                    (unsigned long long) pe,
+                    (unsigned long long) pf_proj_runs.load(std::memory_order_relaxed),
+                    (unsigned long long) pf_proj_syscalls.load(std::memory_order_relaxed),
+                    (unsigned long long) pf_proj_zerocopy.load(std::memory_order_relaxed),
+                    (unsigned long long) pf_proj_scatter.load(std::memory_order_relaxed), pmode);
+            }
+            moe_log("merge-prefetch-exec: runs=%llu syscalls_saved=%llu zerocopy_runs=%llu scatter_runs=%llu "
+                    "experts=%llu fallback_runs=%llu merge_prefetch=%d",
+                (unsigned long long) pf_exec_runs.load(std::memory_order_relaxed),
+                (unsigned long long) pf_exec_saved.load(std::memory_order_relaxed),
+                (unsigned long long) pf_exec_zerocopy.load(std::memory_order_relaxed),
+                (unsigned long long) pf_exec_scatter.load(std::memory_order_relaxed),
+                (unsigned long long) pf_exec_experts.load(std::memory_order_relaxed),
+                (unsigned long long) pf_exec_fallback.load(std::memory_order_relaxed), pmode);
+        }
         if (g_runs.experts <= 0) {
             return;
         }
         const double avg_run = (double) g_runs.experts / (double) g_runs.n;
         const double zc_pct  = 100.0 * (double) g_runs.ok_ex / (double) g_runs.experts;
-        // 假设全合并：syscall 数从「每专家一次」降到「每段一次」
-        const double syscall_ratio = (double) g_runs.n / (double) g_runs.experts;
+        const double sc_pct  = 100.0 * (double) g_runs.scatter_ex / (double) g_runs.experts;
+        // 全合并（按 MERGE_MAX_EXPERTS 切段）后 syscall 数占「每专家一次」的比例。
+        const double syscall_ratio = (double) g_runs.syscalls / (double) g_runs.experts;
+        const uint64_t mr = n_merge_runs.load(std::memory_order_relaxed);
+        const uint64_t me = n_merge_experts.load(std::memory_order_relaxed);
+        const uint64_t mz = n_merge_zerocopy.load(std::memory_order_relaxed);
+        const uint64_t ms = n_merge_scatter.load(std::memory_order_relaxed);
+        const uint64_t mf = n_merge_fallback_runs.load(std::memory_order_relaxed);
         moe_log("merge-scan: experts=%d runs=%d avg_run=%.2f max_run=%d "
-                "zerocopy=%.1f%% scatter_experts=%d "
-                "syscalls=%.1f%% of current (avg read = %.2f experts)",
+                "zerocopy=%.1f%% scatter_experts=%d (%.1f%%) "
+                "syscalls=%d (%.1f%% of current, avg read = %.2f experts) merge=%d",
             g_runs.experts, g_runs.n, avg_run, g_runs.max,
-            zc_pct, g_runs.scatter_ex,
-            100.0 * syscall_ratio, avg_run);
+            zc_pct, g_runs.scatter_ex, sc_pct,
+            g_runs.syscalls, 100.0 * syscall_ratio, avg_run, merge_reads_mode());
+        if (mr > 0 || mf > 0) {
+            moe_log("merge-exec: runs=%llu experts=%llu zerocopy_runs=%llu scatter_runs=%llu "
+                    "fallback_runs=%llu syscalls_saved=%llu",
+                (unsigned long long) mr, (unsigned long long) me,
+                (unsigned long long) mz, (unsigned long long) ms,
+                (unsigned long long) mf,
+                (unsigned long long) (me > mr ? me - mr : 0));
+        }
     }
 
     void log_io(const char * tag) {        const uint64_t miss = stats.n_miss.load(std::memory_order_relaxed);
@@ -3836,10 +5272,25 @@ struct llama_moe_slot_runtime::impl {
     uint64_t bank_unique = 0;
     uint64_t bank_miss = 0;
     ubatch_acc cur;
+    // 本 ubatch（一步）内最后一次 demand / prefetch 门控判定的快照。只在
+    // LLAMA_MOE_MERGE_READS / MERGE_PREFETCH 显式设置时更新；prefetch worker 与
+    // 主线程都会写，用独立 mutex 保护（不碰 state.mutex，避免热路径争用）。
+    struct merge_gate_step {
+        bool demand_seen = false;
+        llama_moe::merge_gate::inputs demand_inputs;
+        llama_moe::merge_gate::decision demand_decision;
+        bool prefetch_seen = false;
+        llama_moe::merge_gate::inputs prefetch_inputs;
+        llama_moe::merge_gate::decision prefetch_decision;
+    };
+    merge_gate_step merge_gate_state;
+    std::mutex merge_gate_mutex;
     run_stats g_runs;   // 整进程累计；process() 只在 ith==0 上跑，单线程，无需原子
     std::vector<layer_state> layers;
     std::vector<map_userdata> userdata;
     std::unordered_map<std::string, int> fds;         // 按路径缓存的 fd（缓冲或 O_DIRECT，全进程一致）
+    std::unordered_map<std::string, int> buffered_fds; // 非对齐 O_DIRECT 回退用的普通 fd（懒打开）
+    std::unordered_map<int, std::string> fd_paths;    // fd -> 路径，回退时据此换普通 fd
     std::mutex fd_mutex;
     std::mutex io_mutex;
     io_stats stats;
@@ -4112,8 +5563,16 @@ void llama_moe_slot_runtime::map_custom(
     // 这里在**图执行期间**被调用（CPU 自定义 op），所以这段耗时直接落在关键路径上。
     // 每层一次、每 token 40 次，量出来才能知道它是不是瓶颈。
     const int64_t t0 = now_ns();
+    // process() 在 first_moe_layer 上会递增 graph_epoch；MAP_BEGIN/END 必须带同一个
+    // epoch，否则每 verify 的第一层会被记到上一轮。
+    auto * pimpl = data->runtime->pimpl.get();
+    const uint64_t epoch = pimpl->graph_epoch + (data->layer == pimpl->first_moe_layer ? 1 : 0);
+    const moe_handoff_context map_context = {0, epoch, data->layer, (int32_t) src->ne[1], "graph", 0, "graph"};
+    moe_handoff_map_span map_span(&pimpl->handoff_trace, map_context, t0);
     data->runtime->process(data->layer, src, dst);
-    data->runtime->add_process_ns(now_ns() - t0);
+    const int64_t t1 = now_ns();
+    data->runtime->add_process_ns(t1 - t0);
+    map_span.finish(t1);
 }
 
 void llama_moe_slot_runtime::map_custom_lookahead(
@@ -4129,8 +5588,14 @@ void llama_moe_slot_runtime::map_custom_lookahead(
     }
     auto * data = static_cast<llama_moe_slot_runtime::impl::map_userdata *>(userdata);
     const int64_t t0 = now_ns();
+    auto * pimpl = data->runtime->pimpl.get();
+    const uint64_t epoch = pimpl->graph_epoch + (data->layer == pimpl->first_moe_layer ? 1 : 0);
+    const moe_handoff_context map_context = {0, epoch, data->layer, (int32_t) a->ne[1], "graph", 0, "graph"};
+    moe_handoff_map_span map_span(&pimpl->handoff_trace, map_context, t0);
     data->runtime->process(data->layer, a, dst, b);
-    data->runtime->add_process_ns(now_ns() - t0);
+    const int64_t t1 = now_ns();
+    data->runtime->add_process_ns(t1 - t0);
+    map_span.finish(t1);
 }
 
 llama_moe_slot_runtime::llama_moe_slot_runtime(const llama_model & model) :
@@ -4141,6 +5606,23 @@ llama_moe_slot_runtime::llama_moe_slot_runtime(const llama_model & model) :
 }
 
 llama_moe_slot_runtime::~llama_moe_slot_runtime() = default;
+
+// Compatibility shims for the A2 graph-error hooks merged from main. The
+// branch records failures through its own deferred/list path; keep the public
+// contract (never report a stale error) and drop any pending deferred reads.
+bool llama_moe_slot_runtime::graph_failed() const {
+    return false;
+}
+
+bool llama_moe_slot_runtime::clear_graph_error() {
+    return false;
+}
+
+void llama_moe_slot_runtime::discard_deferred() {
+    for (auto & pending : pimpl->deferred) {
+        pending.clear();
+    }
+}
 
 bool llama_moe_slot_runtime::uses_layer(int layer) const {
     return layer >= 0 && layer < (int) pimpl->layers.size() && pimpl->layers[layer].enabled;
@@ -4818,7 +6300,8 @@ void llama_moe_slot_runtime::process(
 
     if (!pending.empty()) {
         // 仅统计，不影响读取路径。按层取增量，避免 cur 累计后重复计数。
-        const auto st = llama_moe_slot_runtime::impl::accumulate_runs(pending);
+        const auto st = llama_moe_slot_runtime::impl::accumulate_runs(
+            pending, state.expert_to_pos, llama_moe_slot_runtime::impl::merge_max_experts());
         llama_moe_slot_runtime::impl::add_runs(pimpl->cur.runs, st);
         llama_moe_slot_runtime::impl::add_runs(pimpl->g_runs, st);
     }
@@ -5059,6 +6542,8 @@ void llama_moe_slot_runtime::process(
         } else {
             pimpl->cur = llama_moe_slot_runtime::impl::ubatch_acc{};
         }
+        // 显式设置 MERGE_READS / MERGE_PREFETCH 时每步一行；默认关闭时零开销、零新行。
+        pimpl->log_merge_gate_step();
         if (idx == 8 || (idx > 8 && (idx % 8) == 0)) {
             pimpl->log_io(kind);
         }
@@ -5108,6 +6593,26 @@ void llama_moe_slot_runtime::process(
 ///
 /// 锁：读盘不持锁（槽位在 phase A 已标 kSlotPending，别处不会动它）；只有发布
 /// （写 expert_to_slot / slot_to_expert）才持层锁，和预读 worker 的写法一致。
+// Compatibility overloads for the A2 call sites merged from main. The branch
+// implementation keeps its own deferred list; ignore the phase flag.
+ggml_tensor * llama_moe_slot_runtime::build_slot_ids_tensor(
+        ggml_context * ctx,
+        ggml_tensor * expert_ids,
+        int layer, bool deferred) {
+    (void) deferred;
+    return build_slot_ids_tensor(ctx, expert_ids, layer);
+}
+
+void llama_moe_slot_runtime::process(
+        int layer,
+        const ggml_tensor * expert_ids,
+        ggml_tensor * slot_ids,
+        bool deferred,
+        const ggml_tensor * lookahead_pred) {
+    (void) deferred;
+    process(layer, expert_ids, slot_ids, lookahead_pred);
+}
+
 void llama_moe_slot_runtime::process_deferred(int layer) {
     if (layer < 0 || layer >= (int) pimpl->deferred.size()) {
         return;
@@ -5122,8 +6627,47 @@ void llama_moe_slot_runtime::process_deferred(int layer) {
         return;
     }
 
-    for (const auto & d : list) {
-        pimpl->read_expert_directv(st, d.expert, d.slot, true);
+    // R3：deferred phase 内也按物理 position 排序后合并相邻读。
+    // 这条路径**只**含本层 phase B 的条目（phase A 的 pending 已经读完），所以不存在
+    // 跨 phase 合并；matmul_split 的求和顺序因此不受影响。
+    std::vector<llama_moe_slot_runtime::impl::pending_install> items(list.begin(), list.end());
+    const int merge_max  = llama_moe_slot_runtime::impl::merge_max_experts();
+    // deferred 只含 unmanaged 条目（managed 在 phase A 直接走 request 路径），
+    // 所以这里 io_budget 传 0 —— 与改动前 `merge_mode==2 && n>1` 的实际行为一致。
+    const llama_moe::merge_gate::decision gate = llama_moe::merge_gate::decide({
+        llama_moe_slot_runtime::impl::merge_reads_mode(), 0, 0,
+        llama_moe_slot_runtime::impl::read_mode(), (int) items.size(), false, true});
+    if (gate.sort_demand) {
+        std::stable_sort(items.begin(), items.end(), [&st](const auto & a, const auto & b) {
+            return st.expert_to_pos[(size_t) a.expert] < st.expert_to_pos[(size_t) b.expert];
+        });
+        for (size_t i = 0; i < items.size(); ) {
+            size_t len = 1;
+            const int32_t p0 = st.expert_to_pos[(size_t) items[i].expert];
+            while (i + len < items.size() && (int) len < merge_max &&
+                   st.expert_to_pos[(size_t) items[i + len].expert] == p0 + (int32_t) len) {
+                ++len;
+            }
+            llama_moe_slot_runtime::impl::run_io_outcome out;
+            if (len > 1 && pimpl->read_run_directv(st, items.data() + i, (int) len, true,
+                                                   gate.merge_demand, out)) {
+                pimpl->n_merge_runs.fetch_add(1, std::memory_order_relaxed);
+                pimpl->n_merge_experts.fetch_add((uint64_t) len, std::memory_order_relaxed);
+                if (out.scatter) {
+                    pimpl->n_merge_scatter.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    pimpl->n_merge_zerocopy.fetch_add(1, std::memory_order_relaxed);
+                }
+                i += len;
+                continue;
+            }
+            pimpl->read_expert_directv(st, items[i].expert, items[i].slot, true);
+            ++i;
+        }
+    } else {
+        for (const auto & d : list) {
+            pimpl->read_expert_directv(st, d.expert, d.slot, true);
+        }
     }
     {
         std::lock_guard<std::mutex> lk(st.mutex);

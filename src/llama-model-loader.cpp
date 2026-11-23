@@ -1324,7 +1324,8 @@ void llama_model_loader::virtualize_expert_tensor(        ggml_tensor * tensor,
         int64_t n_expert,
         int64_t n_slots,
         ggml_type experts_type,
-        size_t bytes_per_expert) {
+        size_t bytes_per_expert,
+        bool compact_q3k) {
     if (!tensor) {
         return;
     }
@@ -1354,6 +1355,18 @@ void llama_model_loader::virtualize_expert_tensor(        ggml_tensor * tensor,
 
     if (ggml_nbytes(tensor) != bytes_per_expert * (size_t) n_slots) {
         throw std::runtime_error(format("virtual expert tensor '%s' has unexpected size", name.c_str()));
+    }
+
+    if (compact_q3k) {
+        const auto it = std::find_if(ctx_map.begin(), ctx_map.end(),
+            [this](const auto & item) { return item.second.get() == expert_ctx; });
+        auto dev = it != ctx_map.end() ? ggml_backend_buft_get_device(it->first) : nullptr;
+        auto reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        using mark_fn = bool (*)(ggml_backend_buffer_type_t, ggml_tensor *);
+        auto mark = reg ? (mark_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_mark_moe_expert_compact") : nullptr;
+        if (!mark || !mark(it->first, tensor)) {
+            throw std::runtime_error(format("backend cannot allocate compact Q3_K expert tensor '%s'", name.c_str()));
+        }
     }
     // 把张量从 weights_map 摘掉，这样 load_all_data 不会去 gguf 里找它 —— 专家的
     // 内容来自 experts，由 preadv 运行时写入。
