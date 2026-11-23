@@ -1,0 +1,7 @@
+# 编译产物与采集数据不进 git（见 AGENTS.md §2）
+shared/build/
+artifacts/
+
+# Python 缓存
+__pycache__/
+*.pyc

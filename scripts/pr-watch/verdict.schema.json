@@ -1,0 +1,28 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "conclusion": {
+      "type": "string",
+      "enum": ["approve", "request_changes", "blocked"]
+    },
+    "blocking": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "non_blocking": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "policy_violations": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "needs_full_diff": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "summary": { "type": "string" }
+  },
+  "required": ["conclusion", "blocking", "non_blocking", "policy_violations", "summary"]
+}
