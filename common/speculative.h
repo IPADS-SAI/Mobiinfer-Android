@@ -20,6 +20,12 @@ enum common_speculative_type common_speculative_type_from_name(const std::string
 // convert type to string
 std::string common_speculative_type_to_str(enum common_speculative_type type);
 
+// Validate an A4 (DSpark) target/draft model pair before creating the draft context. The draft
+// context reserve graph already links target token embeddings into the draft Q/K/V weights, so a
+// hidden-width/arch mismatch must be rejected here rather than as a ggml dimension assert.
+void common_speculative_validate_a4_models(const common_params_speculative & params,
+        const struct llama_model * model_tgt, const struct llama_model * model_dft);
+
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
 
 void common_speculative_free(common_speculative * spec);
@@ -64,6 +70,9 @@ void common_speculative_draft(common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+// Record the number of proposals actually sent to the verifier after all caller-side truncation.
+// Must be called before common_speculative_accept(); A4 uses it for stats and pool admission.
+void common_speculative_set_verified(common_speculative * spec, llama_seq_id, uint16_t n_verified);
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);

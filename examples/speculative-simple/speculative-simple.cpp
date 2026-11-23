@@ -5,10 +5,12 @@
 #include "log.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <clocale>
 #include <cstdio>
 #include <cstring>
 #include <cinttypes>
+#include <memory>
 #include <string>
 #include <vector>
 #include <utility>
@@ -40,8 +42,11 @@ int main(int argc, char ** argv) {
     // load the target model
     auto llama_init_tgt = common_init_from_params(params);
 
-    model_tgt = llama_init_tgt->model();
-    ctx_tgt   = llama_init_tgt->context();
+    if (!llama_init_tgt || (model_tgt = llama_init_tgt->model()) == nullptr ||
+            (ctx_tgt = llama_init_tgt->context()) == nullptr) {
+        LOG_ERR("%s: failed to initialize the target model/context\n", __func__);
+        return 1;
+    }
 
     const llama_vocab * vocab = llama_model_get_vocab(model_tgt);
 
@@ -66,6 +71,15 @@ int main(int argc, char ** argv) {
 
         params_dft.tensor_buft_overrides = params.speculative.draft.tensor_buft_overrides;
 
+        // draft models (DFlash/DSpark/EAGLE3) are dense, not the qwen35moe target;
+        // inheriting --moe-experts would try to open the target expert bank on the draft GGUF
+        params_dft.moe_experts.clear();
+        params_dft.moe_slot_bank = 0;
+        params_dft.moe_k_prefill = 0;
+        params_dft.moe_k_decode  = 0;
+        params_dft.moe_k_decode_cycle.clear();
+        params_dft.moe_k_decode_schedule.clear();
+
         auto mparams_dft = common_model_params_to_llama(params_dft);
 
         model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
@@ -74,8 +88,26 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
+        try {
+            common_speculative_validate_a4_models(params.speculative, model_tgt, model_dft.get());
+        } catch (const std::exception & err) {
+            LOG_ERR("%s: A4 draft/target model pairing rejected: %s\n", __func__, err.what());
+            return 1;
+        }
+
         auto cparams = common_context_params_to_llama(params_dft);
+        // DFlash/DSpark drafts share the target token embeddings and lm_head (and the target's
+        // output scale), so the draft context needs the target context: without it the draft
+        // context fails to initialise with "requires ctx_other to be set".
+        cparams.ctx_other = ctx_tgt;
+        if (params.speculative.a4_selected()) {
+            cparams.pooling_type = LLAMA_POOLING_TYPE_NONE;
+        }
         ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
+        if (!ctx_dft) {
+            LOG_ERR("%s: failed to initialize the draft context\n", __func__);
+            return 1;
+        }
 
         params.speculative.draft.ctx_tgt = ctx_tgt;
         params.speculative.draft.ctx_dft = ctx_dft.get();
@@ -92,6 +124,13 @@ int main(int argc, char ** argv) {
     // Tokenize the prompt
     std::vector<llama_token> inp;
     inp = common_tokenize(ctx_tgt, params.prompt, true, true);
+
+    if (inp.empty()) {
+        // a tokenizer without add_bos turns an empty prompt into zero tokens; there is no token to
+        // seed the generation loop with (the BOS-only case below is inp.size() == 1, not this)
+        LOG_ERR("%s: the tokenized prompt is empty (no BOS token was added) - nothing to evaluate\n", __func__);
+        return 1;
+    }
 
     if (llama_n_ctx(ctx_tgt) < (uint32_t) inp.size()) {
         LOG_ERR("%s: the prompt exceeds the context size (%d tokens, ctx %d)\n", __func__, (int) inp.size(), llama_n_ctx(ctx_tgt));
@@ -129,10 +168,6 @@ int main(int argc, char ** argv) {
     // target model sampling context
     common_sampler_ptr smpl(common_sampler_init(model_tgt, params.sampling));
 
-    // eval the prompt
-    llama_decode(ctx_tgt,       llama_batch_get_one(inp.data(), inp.size() - 1));
-    llama_decode(ctx_dft.get(), llama_batch_get_one(inp.data(), inp.size() - 1));
-
     // note: keep the last token separate!
     llama_token id_last = inp.back();
 
@@ -145,9 +180,54 @@ int main(int argc, char ** argv) {
     // init the speculator
     const auto & params_spec = params.speculative;
 
-    struct common_speculative * spec = common_speculative_init(params.speculative, 1);
+    struct common_speculative * spec = nullptr;
+    try {
+        spec = common_speculative_init(params.speculative, 1);
+    } catch (const std::exception & err) {
+        LOG_ERR("%s: failed to initialize speculative decoding: %s\n", __func__, err.what());
+        return 1;
+    }
+    if (!spec) {
+        LOG_ERR("%s: failed to initialize speculative decoding\n", __func__);
+        return 1;
+    }
+    // Own the speculator so every error path below destroys it before the contexts are released.
+    auto spec_guard = std::unique_ptr<common_speculative, decltype(&common_speculative_free)>(
+            spec, common_speculative_free);
 
     common_speculative_begin(spec, seq_id, prompt_tgt);
+
+    // eval the prompt
+    // note: the speculator must be initialised first - DFlash/DSpark enable the target layer-input
+    //       extraction in their constructor and inject the target features into the draft KV here
+    //
+    // BOS-only prompts (add_bos tokenizers turn an empty -p '' into exactly one token) leave
+    // prompt_tgt empty. There is nothing to prefill in that case: llama_decode() rejects a
+    // zero-token batch, and the generation loop below correctly starts from id_last alone.
+    if (!prompt_tgt.empty()) {
+        // note: build the batch explicitly (with positions) - common_speculative_process() reads
+        //       batch.pos and batch.seq_id, which llama_batch_get_one() leaves unset
+        llama_batch batch_prompt = llama_batch_init(prompt_tgt.size(), 0, 1);
+
+        for (size_t i = 0; i < prompt_tgt.size(); ++i) {
+            common_batch_add(batch_prompt, prompt_tgt[i], (llama_pos) i, { seq_id }, i + 1 == prompt_tgt.size());
+        }
+
+        if (llama_decode(ctx_tgt, batch_prompt) != 0) {
+            LOG_ERR("%s: failed to eval the prompt\n", __func__);
+            llama_batch_free(batch_prompt);
+            return 1;
+        }
+        // common_speculative_process() is the single owner of draft-batch consumption: draft-simple
+        // decodes the batch, while DFlash/DSpark consume only its target features and inject them.
+        if (!common_speculative_process(spec, batch_prompt)) {
+            LOG_ERR("%s: common_speculative_process() failed on the prompt\n", __func__);
+            llama_batch_free(batch_prompt);
+            return 1;
+        }
+
+        llama_batch_free(batch_prompt);
+    }
 
     llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
 
@@ -203,13 +283,26 @@ int main(int argc, char ** argv) {
             {
                 ckpt.load_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
 
-                llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), seq_id, ckpt.pos_max + 1, -1);
+                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), seq_id, ckpt.pos_max + 1, -1)) {
+                    LOG_ERR("%s: failed to roll back the draft context to checkpoint pos %d\n",
+                            __func__, (int) ckpt.pos_max + 1);
+                    return 1;
+                }
             }
         } else {
             // we have a previous (partial) draft to reuse from checkpoint restoration
             if (use_ckpt_tgt) {
                 GGML_ASSERT(!ckpt.empty());
             }
+        }
+
+        // cap the verify batch by the target's batch capacity (id_last + proposals)
+        const size_t max_verify = llama_n_batch(ctx_tgt) > 0 ? (size_t) llama_n_batch(ctx_tgt) - 1 : 0;
+        if (draft.size() > max_verify) {
+            LOG_WRN("%s: draft size %zu exceeds target batch capacity %zu - truncating\n",
+                    __func__, draft.size(), max_verify);
+            draft.resize(max_verify);
+            n_draft = draft.size();
         }
 
         // always have a token to evaluate from before - id_last
@@ -224,13 +317,20 @@ int main(int argc, char ** argv) {
 
             //LOG_DBG("target batch: %s\n", string_from(ctx_tgt, batch_tgt).c_str());
 
-            llama_decode(ctx_tgt, batch_tgt);
+            const int ret_verify = llama_decode(ctx_tgt, batch_tgt);
+            if (ret_verify != 0) {
+                LOG_ERR("%s: failed to decode the verify batch (ret=%d) - not sampling or injecting\n",
+                        __func__, ret_verify);
+                llama_batch_free(batch_tgt);
+                return 1;
+            }
         }
 
-        // evaluate the same batch with the draft model
-        {
-            // TODO: extend to support MTP, Eagle, etc. See server code for reference
-            llama_decode(ctx_dft.get(), batch_tgt);
+        // let the speculator consume the batch we just decoded (draft-simple decodes it;
+        // DFlash/DSpark inject the target features into the draft KV)
+        if (!common_speculative_process(spec, batch_tgt)) {
+            LOG_ERR("%s: common_speculative_process() failed on the verify batch\n", __func__);
+            return 1;
         }
 
         // only save the sampler sampler state if we use checkpoints
@@ -248,6 +348,20 @@ int main(int argc, char ** argv) {
         //
         auto ids = common_sampler_sample_and_accept_n(smpl.get(), ctx_tgt, draft);
 
+        // task-22 debug: dump the committed ids + the proposals of every cycle so two arms can be
+        // diffed cycle-by-cycle (env LLAMA_GREEDY_DBG=1)
+        static const bool greedy_dbg = [] {
+            const char * v = std::getenv("LLAMA_GREEDY_DBG");
+            return v && *v && *v != '0';
+        }();
+        if (greedy_dbg) {
+            std::string s_draft, s_ids;
+            for (auto t : draft) { s_draft += std::to_string((int) t) + " "; }
+            for (auto t : ids)   { s_ids   += std::to_string((int) t) + " "; }
+            LOG_INF("GREEDYDBG n_draft=%d draft=[%s] ids=[%s]\n",
+                    (int) draft.size(), s_draft.c_str(), s_ids.c_str());
+        }
+
         //LOG_DBG("ids: %s\n", string_from(ctx_tgt, ids).c_str());
 
         GGML_ASSERT(ids.size() > 0); // there will always be at least one accepted token
@@ -263,13 +377,21 @@ int main(int argc, char ** argv) {
             {
                 ckpt.load_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
 
-                llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, ckpt.pos_max + 1, -1);
+                if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, ckpt.pos_max + 1, -1)) {
+                    LOG_ERR("%s: failed to roll back the target context to checkpoint pos %d\n",
+                            __func__, (int) ckpt.pos_max + 1);
+                    return 1;
+                }
             }
 
             {
                 ckpt.load_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ON_DEVICE);
 
-                llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), seq_id, ckpt.pos_max + 1, -1);
+                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), seq_id, ckpt.pos_max + 1, -1)) {
+                    LOG_ERR("%s: failed to roll back the draft context to checkpoint pos %d\n",
+                            __func__, (int) ckpt.pos_max + 1);
+                    return 1;
+                }
             }
 
             prompt_tgt.resize(ckpt.n_tokens);
@@ -280,7 +402,13 @@ int main(int argc, char ** argv) {
             continue;
         }
 
-        common_speculative_accept(spec, seq_id, ids.size() - 1);
+        // A4 can legitimately return an empty draft (e.g. the block did not fit in one ubatch).
+        // In that case nothing was sent to the target verifier and impl_last is still unset, so
+        // do not call accept(): ids.size() == 1 is the plain single-token decode.
+        if (!draft.empty()) {
+            common_speculative_set_verified(spec, seq_id, (uint16_t) draft.size());
+            common_speculative_accept(spec, seq_id, ids.size() - 1);
+        }
 
         // full acceptance: consume the draft and commit accepted tokens
         n_past    += ids.size() - 1;
@@ -320,8 +448,15 @@ int main(int argc, char ** argv) {
         {
             LOG_DBG("clear kv cache from any extra tokens, n_past = %d\n", n_past);
 
-            llama_memory_seq_rm(llama_get_memory(ctx_tgt),       seq_id, n_past, -1);
-            llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), seq_id, n_past, -1);
+            if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, n_past, -1)) {
+                LOG_ERR("%s: failed to roll back the target context to n_past = %d (recurrent "
+                        "rollback ring too shallow for this draft depth?)\n", __func__, n_past);
+                return 1;
+            }
+            if (!llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), seq_id, n_past, -1)) {
+                LOG_ERR("%s: failed to roll back the draft context to n_past = %d\n", __func__, n_past);
+                return 1;
+            }
         }
 
         if ((params.n_predict >= 0 && n_predict > params.n_predict) || has_eos) {
@@ -354,7 +489,8 @@ int main(int argc, char ** argv) {
 
     llama_batch_free(batch_tgt);
 
-    common_speculative_free(spec);
+    // destroy the speculator while its target/draft contexts are still alive
+    spec_guard.reset();
 
     llama_backend_free();
 

@@ -943,6 +943,8 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             common_params_print_completion(ctx_arg);
             exit(0);
         }
+        // Reject impossible A4 shapes during argument parsing, before model/context allocation.
+        ctx_arg.params.speculative.validate_a4_params();
         params.lr.init();
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
@@ -3698,6 +3700,93 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_min = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
+
+    // G2-A4 (draft-pool): the draft block / proposal / head sizes used to be all derived from n_max
+    add_opt(common_arg(
+        {"--spec-block-rows"}, "N",
+        string_format("G2-A4: draft block rows [anchor, MASK x (N-1)] decoded in one ubatch (default: %d = derived from n_max)", params.speculative.draft.block_rows),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.block_rows = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_BLOCK_ROWS"));
+    add_opt(common_arg(
+        {"--spec-proposal-k"}, "N",
+        string_format("G2-A4: draft tokens proposed to the target per cycle (default: %d = derived from n_max)", params.speculative.draft.proposal_k),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.proposal_k = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_PROPOSAL_K"));
+    add_opt(common_arg(
+        {"--spec-head-k"}, "N",
+        string_format("G2-A4: draft block rows that go through the draft LM head + Markov chain (default: %d = derived)", params.speculative.draft.head_k),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.head_k = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_HEAD_K"));
+    add_opt(common_arg(
+        {"--spec-aux-rows"}, "N",
+        string_format("G2-A4: lookahead draft rows sent to the target aux head (default: %d)", params.speculative.draft.aux_rows),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.aux_rows = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_AUX_ROWS"));
+    add_opt(common_arg(
+        {"--spec-pool-size"}, "N",
+        string_format("G2-A4: vocab rows kept per candidate pool (only used with --spec-block-rows > 0); "
+                      "0 disables the pool arm (default: %d)", params.speculative.draft.pool_size),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.pool_size = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_POOL_SIZE"));
+    add_opt(common_arg(
+        {"--spec-pool-mode"}, "auto|pool|full",
+        string_format("G2-A4: draft head mode - auto = pool iff the previous verify was fully accepted (default: %s)",
+                      params.speculative.draft.pool_mode == COMMON_SPECULATIVE_POOL_MODE_POOL ? "pool" :
+                      params.speculative.draft.pool_mode == COMMON_SPECULATIVE_POOL_MODE_FULL ? "full" : "auto"),
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.speculative.draft.pool_mode = COMMON_SPECULATIVE_POOL_MODE_AUTO;
+            } else if (value == "pool") {
+                params.speculative.draft.pool_mode = COMMON_SPECULATIVE_POOL_MODE_POOL;
+            } else if (value == "full") {
+                params.speculative.draft.pool_mode = COMMON_SPECULATIVE_POOL_MODE_FULL;
+            } else {
+                throw std::invalid_argument("expected 'auto', 'pool' or 'full'");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_POOL_MODE"));
+    add_opt(common_arg(
+        {"--spec-pool-src"}, "auto|target|draft",
+        string_format("G2-A4: pool logits source - 'target' = target aux head (real arm), 'draft' = DEV ONLY fallback (default: %s)",
+                      params.speculative.draft.pool_src == COMMON_SPECULATIVE_POOL_SRC_TARGET ? "target" :
+                      params.speculative.draft.pool_src == COMMON_SPECULATIVE_POOL_SRC_DRAFT  ? "draft" : "auto"),
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.speculative.draft.pool_src = COMMON_SPECULATIVE_POOL_SRC_AUTO;
+            } else if (value == "target") {
+                params.speculative.draft.pool_src = COMMON_SPECULATIVE_POOL_SRC_TARGET;
+            } else if (value == "draft") {
+                params.speculative.draft.pool_src = COMMON_SPECULATIVE_POOL_SRC_DRAFT;
+            } else {
+                throw std::invalid_argument("expected 'auto', 'target' or 'draft'");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_POOL_SRC"));
 
     add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",
