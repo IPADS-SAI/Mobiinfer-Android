@@ -22,11 +22,7 @@
 
 ## News
 
-- [2026.11.23] 🚀 **MobiInfer-Android v0.4.6: the Q2 tiled expert pack lifts MiniCPM-V 4.7 decode to 31.1 tok/s**
-  - 📦 **Q2 tiled experts**: routed experts are stored in Q2_K tiled, so on the same SoC decode goes from 23.3 tok/s with Q3 tiled to **31.1 tok/s**, with prefill at 24.57 tok/s on a 41-token prompt.
-  - 🧵 **Still runs alongside other apps**: 29.2 tok/s with other apps in the foreground, against 21.3–21.8 with Q3 tiled.
-  - 🔀 **MoE runtime sync**: LRU/LFU window eviction, shared expert cache, prefetch merging with read hardening, and the A4 draft pool (opt-in through `LLAMA_MOE_*`).
-  - 🧮 **Hexagon backend sync**: compact Q3_K slab, HVX-first dispatch for small-batch MUL_MAT / MUL_MAT_ID, and elementwise chain fusion.
+- [2026.11.23] 🚀 **MobiInfer-Android v0.4.6: the Q2 tiled expert pack lifts 35B-A3B decode to 31.1 tok/s**
 - [2026.11.11] 🚀 **MobiInfer-Android v0.4.5: MiniCPM-V 4.7 MoE decode peaks at 23.3 tok/s**
   - ⚡ **Cross-layer expert pipeline**: O_DIRECT expert reads, gate predictions submitted two layers ahead (H+2), one FIFO task per expert with resident reader threads — the I/O is hidden under compute. Same device, same prompt: 23.3 tok/s.
   - 🧵 **Runs alongside other apps**: MoE inference no longer needs exclusive access; generation keeps going while other apps are in the foreground, at 21.3–21.8 tok/s.

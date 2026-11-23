@@ -22,11 +22,7 @@
 
 ## 最新动态
 
-- [2026.11.23] 🚀 **发布 MobiInfer-Android v0.4.6，Q2 tiled 专家包把 MiniCPM-V 4.7 解码推到 31.1 tok/s**
-  - 📦 **Q2 tiled 专家包**：专家权重压到 Q2_K tiled，同 SoC 下解码从 Q3 tiled 的 23.3 tok/s 提到 **31.1 tok/s**；41-token prompt 下 prefill 24.57 tok/s。
-  - 🧵 **App 前台仍在跑**：其他应用在前台运行时解码 29.2 tok/s（Q3 tiled 同期为 21.3–21.8）。
-  - 🔀 **MoE 运行时同步**：窗口淘汰支持 LRU/LFU、共享专家缓存、预读合并与读加固、A4 draft-pool 投机解码（按需用 `LLAMA_MOE_*` 开启）。
-  - 🧮 **Hexagon 后端同步**：Q3_K compact slab、小 batch MUL_MAT / MUL_MAT_ID 的 HVX-first 派发、SUM_ROWS+CLAMP+DIV 等小算子链融合。
+- [2026.11.23] 🚀 **发布 MobiInfer-Android v0.4.6，Q2 tiled 专家包把 35B-A3B 解码推到 31.1 tok/s**
 - [2026.11.11] 🚀 **发布 MobiInfer-Android v0.4.5，MiniCPM-V 4.7 MoE 解码峰值 23.3 tok/s**
   - ⚡ **跨层专家流水**：专家读盘改走 O_DIRECT，提前 2 层提交 gate 预测（H+2），每专家独立任务队列 + 常驻读线程，把 I/O 藏进计算里；同机同 prompt 解码 23.3 tok/s。
   - 🧵 **可与其他 App 并行推理**：MoE 推理不要求独占设备，其他应用在前台运行时仍可持续生成，吞吐保持 21.3–21.8 tok/s。
