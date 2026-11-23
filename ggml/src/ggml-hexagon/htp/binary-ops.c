@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "dma-queue.h"
+#include "hvx-reduce.h"
 #include "hvx-utils.h"
 
 #define GGML_COMMON_DECL_C
@@ -993,6 +994,7 @@ static void binary_thread_chunked(const htp_thread_t * th, unsigned int nth, uns
     dma_queue_flush(dma_q);
 }
 
+
 static int execute_op_binary(struct htp_ops_context * octx) {
     const struct htp_tensor * src0 = octx->src[0];
     const struct htp_tensor * src1 = octx->src[1];
@@ -1380,7 +1382,127 @@ static int execute_op_binary(struct htp_ops_context * octx) {
     return HTP_STATUS_OK;
 }
 
+
+// --- MoE top-k weight normalisation (fused SUM_ROWS + CLAMP + DIV, opt-in) --------------------
+//
+// The MoE router graph builds:
+//     weights = get_rows(probs, ids)                      // (k, n_tokens)
+//     s       = clamp(sum_rows(weights), min, max)        // (1, n_tokens)
+//     out     = weights / s
+// Two fusions (htp-fusion.cpp: fuse_sum_rows_clamp + fuse_rows_norm_div) collapse the last three
+// ops into this one, which recomputes the column sum itself and therefore does not need the
+// intermediate (1, n_tokens) tensor at all.
+//
+// op_params[15] == HTP_BINARY_VARIANT_ROWNORM (see binary-ops.h) selects this path; op_params[0]/[1]
+// carry the clamp min/max as f32 bit patterns (copied from the CLAMP node's op_params by the fusion).
+// Numerics are bit-identical to the unfused chain: same reduce (hvx_reduce_sum_f32) and same
+// per-element IEEE division (hvx_div_scalar_f32).
+
+struct binop_rows_norm_ctx {
+    struct htp_ops_context * octx;
+    float                    cmin;
+    float                    cmax;
+    uint32_t                 col_start;
+    uint32_t                 ncols;
+};
+
+static void binop_rows_norm_thread(const htp_thread_t * th, unsigned int nth, unsigned int ith, void * data) {
+    const struct binop_rows_norm_ctx * c = (const struct binop_rows_norm_ctx *) data;
+    const struct htp_tensor * src = c->octx->src[0];
+    const struct htp_tensor * dst = c->octx->dst;
+
+    const uint32_t k     = src->ne[0];
+    const uint32_t ncols = c->ncols;
+    const uint32_t per   = (ncols + nth - 1) / nth;
+    const uint32_t t0    = c->col_start + ith * per;
+    const uint32_t t1    = MIN(t0 + per, c->col_start + ncols);
+    if (t0 >= t1) {
+        return;
+    }
+
+    struct htp_thread_trace * tr = th->trace;
+    htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) t0);
+
+    for (uint32_t t = t0; t < t1; t++) {
+        const float * s = (const float *) ((const uint8_t *) src->data + (size_t) t * src->nb[1]);
+        float *       d = (float *)       ((uint8_t *)       dst->data + (size_t) t * dst->nb[1]);
+
+        float sum = hvx_reduce_sum_f32((const uint8_t *) s, k);
+        if (sum < c->cmin) {
+            sum = c->cmin;
+        } else if (sum > c->cmax) {
+            sum = c->cmax;
+        }
+        hvx_div_scalar_f32((uint8_t *) d, (const uint8_t *) s, sum, k);
+    }
+
+    htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) t0);
+}
+
+static int op_binary_rows_norm(struct htp_ops_context * octx) {
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * dst  = octx->dst;
+
+    if (!src0 || !dst) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+    if (src0->type != HTP_TYPE_F32 || dst->type != HTP_TYPE_F32) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src0->ne[0] == 0 || src0->ne[0] > 64 || src0->ne[0] != dst->ne[0]) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+    if (dst->ne[1] != src0->ne[1]) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+    if (!htp_tensor_is_contiguous(src0, (uint32_t) sizeof(float)) ||
+        !htp_tensor_is_contiguous(dst, (uint32_t) sizeof(float))) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+    if (htp_tensor_is_extended(src0) || htp_tensor_is_extended(dst)) {
+        return HTP_STATUS_NO_SUPPORT;
+    }
+
+    struct binop_rows_norm_ctx ctx;
+    ctx.octx = octx;
+    memcpy(&ctx.cmin, &octx->op_params[0], sizeof(float));
+    memcpy(&ctx.cmax, &octx->op_params[1], sizeof(float));
+    ctx.col_start = 0;
+    ctx.ncols     = src0->ne[1];
+
+    // Match the regular binary DIV row partition. Each MDEV rank owns a disjoint, cache-line
+    // aligned range of columns; without this every rank would write the full destination.
+    if (octx->ctx->mdev.count > 1) {
+        uint32_t cols_per_chunk = 0;
+        htp_tensor_mdev_rows_per_chunk(dst, sizeof(float), src0->ne[0] * sizeof(float), &cols_per_chunk);
+        const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(
+            src0->ne[1], cols_per_chunk, octx->ctx->mdev.idx, octx->ctx->mdev.count,
+            &octx->ctx->mdev.count_div);
+        ctx.col_start = range.start;
+        ctx.ncols     = range.count;
+    }
+
+    if (ctx.ncols == 0) {
+        return HTP_STATUS_OK;
+    }
+
+    const uint32_t max_hvx = octx->ctx->n_hvx > 0 ? octx->ctx->n_hvx : 1;
+    const uint32_t n_hvx   = ctx.ncols < max_hvx ? ctx.ncols : max_hvx;
+
+    if (!htp_ops_context_set_n_hvx(octx, n_hvx)) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+
+    work_queue_run(octx->ctx->hvx_queue, binop_rows_norm_thread, &ctx, n_hvx);
+    return HTP_STATUS_OK;
+}
+
 int op_binary(struct htp_ops_context * octx) {
+    // fused MoE weight normalisation (SUM_ROWS + CLAMP + DIV) - see htp-fusion.cpp
+    if (octx->op_params[15] == HTP_BINARY_VARIANT_ROWNORM) {
+        return op_binary_rows_norm(octx);
+    }
+
     const uint32_t src0_type = octx->src[0]->type;
     if ((src0_type == HTP_TYPE_F32) || (src0_type == HTP_TYPE_F16)) {
         return execute_op_binary(octx);

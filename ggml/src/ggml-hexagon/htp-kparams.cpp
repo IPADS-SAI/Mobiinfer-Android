@@ -1,6 +1,7 @@
 #define _USE_MATH_DEFINES
 
 #include "htp-kparams.h"
+#include "htp-mm-dispatch.h"
 #include "htp-opnode.h"
 #include "ggml-impl.h"
 
@@ -609,8 +610,6 @@ static bool htp_matmul_is_hmx_eligible(
     bool is_matmul_id,
     bool is_batched
 ) {
-    GGML_UNUSED(dst);
-
     if (src1->type != GGML_TYPE_F32 && (src1->type != GGML_TYPE_F16 || is_matmul_id)) {
         return false;
     }
@@ -620,6 +619,14 @@ static bool htp_matmul_is_hmx_eligible(
     const int ne11  = src1->ne[1];
     const int ne12  = src1->ne[2];
     const int wtype = src0->type;
+
+    if (ggml_hexagon_tensor_is_q3k_compact(src0) &&
+            (!is_matmul_id || ne00 > (int) HTP_MM_HMX_ROUTED_MAX_K ||
+             src1->view_offs % 128 != 0 || src1->nb[0] != sizeof(float) ||
+             (ne11 > 1 && src1->nb[1] % 128 != 0) || src1->nb[2] % 128 != 0 ||
+             (dst && dst->view_offs % 128 != 0))) {
+        return false;
+    }
 
     if (ne01 % HTP_TENSOR_TILE_N_ROWS != 0 && is_matmul_id) {
         return false;
@@ -651,6 +658,13 @@ static bool htp_matmul_is_hmx_eligible(
     }
 
     return true;
+}
+
+// Dense (MUL_MAT / MUL_MAT+ADD) narrow-batch dispatch: try HVX before HMX.
+// The decision logic (including the measured anchors and the device-dependent crossover)
+// lives in htp-mm-dispatch.h so that it can be unit tested on the host.
+static int htp_matmul_dense_hvx_max_rows(const struct ggml_hexagon_session * sess) {
+    return htp_mm_dispatch_dense_hvx_max_rows((int) htp_session_n_hvx(sess), opt_mm_dense_hvx_max_rows);
 }
 
 static bool htp_kparams_solve_hmx_mm(
@@ -703,7 +717,18 @@ static bool htp_kparams_solve_hmx_mm(
         }
     }
 
-    if (!use_grouped) {
+    if (is_matmul_id && ggml_hexagon_tensor_is_q3k_compact(src0)) {
+        // Routed chunks are selected from the actual expert counts on the DSP.
+        // Admission and the DSP fallback share the same minimum serial layout.
+        m_chunk = HTP_MM_HMX_TILE_N_ROWS;
+        n_chunk = HTP_MM_HMX_TILE_N_COLS;
+        act_hvx_selected = n_hvx;
+        vtcm_size = htp_mm_hmx_get_2d_vtcm_size(wtype, ne00_padded, m_chunk, n_chunk,
+                                               false, 0, aligned_tile_size, 0);
+        if (act_hvx_selected <= 0 || vtcm_size > vtcm_budget) {
+            return false;
+        }
+    } else if (!use_grouped) {
         int m_id_rows = 0;
         if (dst && is_matmul_id) {
             const int n_experts = ne02 > 0 ? ne02 : 1;
@@ -721,7 +746,10 @@ static bool htp_kparams_solve_hmx_mm(
     }
 
     kparams->n_hmx              = 1;
-    kparams->pipeline           = pipeline ? 1 : 0;
+    kparams->pipeline           = pipeline || (is_matmul_id && opt_moe_hmx_pipeline);
+    // Opt-in only, default off: lets the DSP fall back to the legacy serial HMX
+    // skeleton for compact Q3_K experts (GGML_HEXAGON_MOE_HMX_SERIAL=1).
+    kparams->moe_hmx_serial     = (is_matmul_id && opt_moe_hmx_serial) ? 1 : 0;
     kparams->m_chunk            = m_chunk;
     kparams->n_chunk            = n_chunk;
     kparams->n_hvx              = n_hvx;
@@ -869,6 +897,17 @@ static void htp_kparams_solve_hvx_mm(
     kparams->kernel_type = HTP_MM_KERNEL_UNSUPPORTED;
 }
 
+// MoE (MUL_MAT_ID) HVX-first window policy - the single place that maps a session's HVX
+// context count to the largest token count we still try HVX first on. Callers: the kparams
+// solver below and the session-open log in ggml-hexagon.cpp, so a device log always shows
+// the window the solver actually uses.
+int htp_moe_hvx_first_window(uint32_t n_hvx) {
+    if (opt_mm_moe_hvx_first_max_nrows > 0) {
+        return opt_mm_moe_hvx_first_max_nrows;
+    }
+    return n_hvx >= HTP_MOE_HVX_WINDOW_NHVX_PLATEAU ? HTP_MOE_HVX_WINDOW_PLATEAU : HTP_MM_MOE_HMX_MIN_NROWS;
+}
+
 static bool htp_kparams_solve_matmul_impl(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * src0,
@@ -900,8 +939,51 @@ static bool htp_kparams_solve_matmul_impl(
     const bool   is_batched   = (ne02 * ne03 > 1 || ne12 * ne13 > 1);
     const size_t vtcm_budget  = htp_session_vtcm_size(sess);
 
-    const bool hmx_enabled = (htp_session_n_hmx(sess) > 0) && (opt_mm_select >= 2);
-    if (hmx_enabled && htp_matmul_is_hmx_eligible(src0, src1, dst, is_matmul_id, is_batched)) {
+    const bool hmx_enabled  = (htp_session_n_hmx(sess) > 0) && (opt_mm_select >= 2);
+    const bool hmx_eligible = hmx_enabled && htp_matmul_is_hmx_eligible(src0, src1, dst, is_matmul_id, is_batched);
+
+    // MoE (MUL_MAT_ID) small-batch preference.
+    //
+    // For MUL_MAT_ID, `ne12` is the number of tokens (src1 is [K, n_expert_used, n_tokens, 1]).
+    // HMX pads every expert's M to the hard 32-row tile (HTP_MM_HMX_TILE_N_ROWS), while a
+    // decode/verify batch gives each expert only ~1-2 rows, so the padded work dominates.
+    // Single-op measurements on vivo SM8850 (see exps/hmx-threshold-20261106/README.md):
+    // HVX is 3.9x faster at n=5 and 4.4x at n=12.
+    //
+    // The window is the largest n_tokens for which HVX is *tried first*; whether a concrete
+    // shape actually fits the session VTCM budget is decided by the HVX layout solve below
+    // (an UNSUPPORTED verdict falls back to HMX), and shapes above the window keep the
+    // previous HMX-first order. The cap scales with the number of HVX contexts, so it is
+    // derived from the session (v79/SM8750: 6 HVX -> 32, n=18/32 -76.1%/-67.4% vs HMX-first
+    // in the same-binary A/B; v81/SM8850: 8 HVX -> 32) and can be forced with
+    // GGML_HEXAGON_MOE_HVX_FIRST_MAX_NROWS for one-binary sweeps.
+    //
+    // When both kernels are possible, try HVX first and keep HMX as the fallback for shapes
+    // HVX cannot serve (wide batch with large K). n > window keeps the previous HMX-first order.
+    // The window only widens where HMX is otherwise eligible (n > 4), and an HVX "unsupported"
+    // verdict still falls through to the HMX solve below, so that fallback stays intact.
+    const int moe_hvx_max = htp_moe_hvx_first_window(htp_session_n_hvx(sess));
+    // Dense (MUL_MAT / MUL_MAT+ADD) narrow-batch preference: for 5 <= m <= max_rows,
+    // try HVX before HMX. max_rows is derived from n_hvx by htp-mm-dispatch.h
+    // (v81 / 8 HVX -> 5; v79 / 6 HVX -> 4, i.e. the rule stays inactive there), and the
+    // same binary can sweep it with GGML_HEXAGON_MM_DENSE_HVX_MAX_ROWS
+    // (-1 = auto, 0 = never, >0 = explicit m limit). MUL_MAT_ID never takes this branch:
+    // it has the MoE window above.
+    const bool moe_hvx_first = is_matmul_id && ne12 <= moe_hvx_max;
+    const bool dense_hvx_first = !is_matmul_id && htp_mm_dispatch_dense_prefer_hvx(
+            (int) htp_session_n_hvx(sess), opt_mm_dense_hvx_max_rows, ne11,
+            (ne01 + HTP_TENSOR_TILE_N_ROWS - 1) / HTP_TENSOR_TILE_N_ROWS);
+    if (hmx_eligible && (moe_hvx_first || dense_hvx_first)) {
+        htp_kparams_solve_hvx_mm(sess, src0, src1, dst, wtype, is_tiled, ne02, ne03, ne10, ne11, ne12, ne13,
+                                 is_matmul_id, src2_row_size, vtcm_budget, kparams);
+        if (kparams->kernel_type != HTP_MM_KERNEL_UNSUPPORTED) {
+            goto finalize;
+        }
+        // HVX cannot serve this shape - retry with HMX below.
+        memset(kparams, 0, sizeof(*kparams));
+    }
+
+    if (hmx_eligible) {
         if (htp_kparams_solve_hmx_mm(sess, src0, src1, dst, wtype, ne00_padded, ne01_tiled, ne02, ne11, ne12, ne11_padded, is_matmul_id, is_batched, src2_size, vtcm_budget, kparams)) {
             goto finalize;
         }

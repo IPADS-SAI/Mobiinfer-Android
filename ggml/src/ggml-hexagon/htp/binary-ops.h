@@ -10,6 +10,11 @@
 #include "htp-ops.h"
 #include "htp-vtcm.h"
 
+// Opt-in variants selected through the op's op_params[15] (ggml zeroes op_params for ADD/SUB/MUL/DIV,
+// so 0 always means "plain binary op"). Used by the MoE weight-normalisation fusion.
+#define HTP_BINARY_VARIANT_NONE     0
+#define HTP_BINARY_VARIANT_ROWNORM  2   // dst = src0 / clamp(sum_rows(src0)); min/max in op_params[0]/[1]
+
 enum htp_binary_kernel_type {
     HTP_BINARY_KERNEL_SAME_SHAPE = 0,
     HTP_BINARY_KERNEL_ROW_BCAST,

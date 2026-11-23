@@ -19,8 +19,11 @@ extern "C" {
 #define HTP_MM_HMX_TILE_SIZE   (32 * 32 * sizeof(__fp16)) // 2048 bytes
 #define HTP_MM_HMX_TILE_N_ELMS 1024
 #define HTP_MM_HMX_MIN_NROWS   4
+#define HTP_MM_HMX_ROUTED_MAX_K (INT32_MAX / HTP_MM_HMX_TILE_SIZE)
 
-// MoE（MUL_MAT_ID）专用的 HMX 准入阈值：**M(token 数) <= 该值走 HVX**。
+// MoE（MUL_MAT_ID）的保守 HVX-first 上界（token 数）。它只在会话的 HVX context 少于
+// HTP_MOE_HVX_WINDOW_NHVX_PLATEAU 时作为回退；>= 该门槛的会话使用
+// HTP_MOE_HVX_WINDOW_PLATEAU=32（见 htp-common.h 的 htp_moe_hvx_first_window）。
 //
 // 为什么和 dense matmul 的 HTP_MM_HMX_MIN_NROWS 分开：HMX 的 M tile 是硬性 32 行
 // （HTP_MM_HMX_TILE_N_ROWS），而 `hmx_mm_op_matmul_id()` 对**每个专家**做
@@ -28,13 +31,15 @@ extern "C" {
 // **1.6 行**（实测：n=5 时每层 24.7 个不同专家、5 个 token），padding 到 32
 // 就是 20 倍放大。HVX 按 K 维切线程、按行处理，没有这个浪费。
 //
-// 实测（test-backend-ops perf，q3_K / n_mats=88 / n_used=8 / m=512 / k=2048，
-// `exps/hmx-threshold-20261106/`）：
-//   n<=4  : HMX 未准入（沿用旧阈值），HVX 108~193us
-//   n=5   : HMX 1022us vs HVX 263us  → HMX **慢 3.9 倍**
-//   n=12  : HMX 2086us vs HVX 476us  → HMX 慢 4.4 倍
-//   n>=13 : HVX **不支持**（VTCM 装不下），只能走 HMX
-// 所以 MoE 的合理分界就是「HVX 能支持的最大 n」= 12。
+// 12 来自 #27 在 6 HVX context 上的测量（test-backend-ops perf，q3_K / n_mats=88 /
+// n_used=8 / m=512 / k=2048，`exps/hmx-threshold-20261106/`）：
+//   n<=4  : HMX 未准入（沿用 dense 的 HTP_MM_HMX_MIN_NROWS = 4），HVX 108~193 us
+//   n=5   : HMX 1022 us vs HVX 263 us  → HMX 慢 3.9 倍
+//   n=12  : HMX 2086 us vs HVX 476 us  → HMX 慢 4.4 倍
+// 但 n>=13 并非「HVX 装不下」：同二进制 A/B（nubia v79, 6 HVX）实测 n=18 -76.1%、
+// n=32 -67.4%、n=64 不变。真正装不下的是非广播 `down` @ n=64（tiled activation
+// ≈9.4 MiB > 8 MB），由 solver 判 UNSUPPORTED 后回退 HMX。因此 6+ HVX context 的
+// 会话把窗口放宽到 32；12 只保留给 context 更少的会话。
 #define HTP_MM_MOE_HMX_MIN_NROWS 12
 
 #define HTP_MM_WEIGHT_TILE_K_Q2_0             64
@@ -78,7 +83,7 @@ enum htp_mm_kernel_type {
 struct htp_mm_kernel_params {
     uint8_t  kernel_type;        // enum htp_mm_kernel_type
     uint8_t  pipeline;           // 1 = pipelined execution, 0 = standard
-    uint8_t  unused;             // reserved
+    uint8_t  moe_hmx_serial;     // 1 = opt-in legacy serial HMX skeleton for compact Q3_K routed matmul
     uint8_t  n_hmx;              // 1 = use HMX, 0 = use HVX
 
     uint8_t  n_hvx;              // Number of threads to spawn

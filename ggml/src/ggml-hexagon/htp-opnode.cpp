@@ -27,6 +27,12 @@
 #include <stdio.h>
 
 std::string htp_opnode::name() const {
+    // fused MoE weight normalisation (SUM_ROWS+CLAMP+DIV -> one op, see htp-fusion.cpp). The opcode is
+    // HTP_OP_DIV so the generic binary-op naming below would report "DIV_NX", which hides the rewrite.
+    if (opcode == HTP_OP_DIV && params[15] == HTP_BINARY_VARIANT_ROWNORM && !fused.empty()) {
+        return "SUM_ROWS+CLAMP+DIV";
+    }
+
     switch (opcode) {
         case HTP_OP_MDEV_GROUP:    return "MDEV_GROUP";
         case HTP_OP_CPY_FENCE:     return "CPY+FENCE";

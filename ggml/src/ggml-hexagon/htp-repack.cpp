@@ -1064,28 +1064,132 @@ static bool hexagon_recover_k_scales(const ggml_half * prod, int n, int lmin, in
     return false;
 }
 
+static inline void repack_q3_K_quant_tile(uint8_t * tile, const block_q3_K * b, int row, int kt_local) {
+    uint8_t * lo_pl  = tile;
+    uint8_t * neg_pl = tile + 256;
+
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    repack_neon_q2_3_k_low2(b->qs, kt_local, lo_pl, row);
+    repack_neon_q3_k_hmask(b->hmask, kt_local, neg_pl, row);
+#else
+    for (int lk = 0; lk < 32; lk++) {
+        const int e   = kt_local * 32 + lk;
+        const int g   = lk >> 2;
+        const int pos = row * 4 + (lk & 3);
+        lo_pl[(g >> 2) * 128 + pos] |= (uint8_t) (q2_3_K_get_low2(b->qs, e) << ((g & 3) * 2));
+        if (!q3_K_get_hbit(b, e)) {
+            neg_pl[pos] |= (uint8_t) (1 << g);
+        }
+    }
+#endif
+}
+
+static void unpack_q3_K_quant_tile(block_q3_K & block, const uint8_t * tile, int row, int kt) {
+    const uint8_t * low = tile;
+    const uint8_t * negative = tile + 256;
+    for (int lane = 0; lane < 32; lane++) {
+        const int group = lane / 4;
+        const int index = row * 4 + (lane % 4);
+        const uint8_t quant = (low[(group / 4) * 128 + index] >> ((group % 4) * 2)) & 3;
+        block.qs[(kt / 4) * 32 + lane] |= quant << (2 * (kt % 4));
+        if (((negative[index] >> group) & 1) == 0) {
+            block.hmask[lane] |= 1 << kt;
+        }
+    }
+}
+
+// The compact layout is a plain re-packing of Q3_K super-blocks, so its constants
+// must stay in sync with block_q3_K: 32 rows of one 256-value super-block per group,
+// and 8 k32 tiles of (256 B low-2-bit quants + 128 B sign bits) per group.
+static_assert(32 * sizeof(block_q3_K) == HTP_Q3K_COMPACT_GROUP_BYTES,
+              "HTP_Q3K_COMPACT_GROUP_BYTES must match 32 block_q3_K");
+static_assert(8 * (256 + 128) == HTP_Q3K_COMPACT_QUANTS_BYTES,
+              "HTP_Q3K_COMPACT_QUANTS_BYTES must match 8 k32 quant tiles");
+static_assert(HTP_Q3K_COMPACT_QUANTS_BYTES + 32 * sizeof(ggml_half) + 12 * 32 == HTP_Q3K_COMPACT_GROUP_BYTES,
+              "group must be quants + 32 fp16 multipliers + 12x32 scale bytes");
+static_assert(HTP_Q3K_COMPACT_SCALES_OFFSET == HTP_Q3K_COMPACT_QUANTS_BYTES + 32 * sizeof(ggml_half),
+              "HTP_Q3K_COMPACT_SCALES_OFFSET must follow the multipliers");
+
+void htp_repack_q3k_compact(void * dst, const void * raw, int64_t ne0, int64_t ne1) {
+    GGML_ASSERT(ne0 > 0 && ne0 <= UINT32_MAX && ne0 % QK_K == 0 && ne1 > 0);
+    const size_t blocks_per_row = ne0 / QK_K;
+    const size_t slab_size = htp_q3k_compact_slab_size((uint32_t) ne0);
+    const uint64_t slab_count = ((uint64_t) ne1 + 31) / 32;
+    GGML_ASSERT(slab_size > 0 && slab_count <= SIZE_MAX / slab_size);
+
+    const auto * blocks = (const block_q3_K *) raw;
+    auto * slab = (uint8_t *) dst;
+    for (int64_t n = 0; n < ne1; n += 32, slab += slab_size) {
+        const int rows = (int) std::min<int64_t>(32, ne1 - n);
+        memset(slab, 0, slab_size);
+        for (size_t kb = 0; kb < blocks_per_row; kb++) {
+            uint8_t * group = slab + kb * HTP_Q3K_COMPACT_GROUP_BYTES;
+            uint8_t * multipliers = group + HTP_Q3K_COMPACT_QUANTS_BYTES;
+            uint8_t * scales = group + HTP_Q3K_COMPACT_SCALES_OFFSET;
+
+            for (int row = 0; row < rows; row++) {
+                const block_q3_K * b = blocks + ((size_t) n + row) * blocks_per_row + kb;
+                for (int kt = 0; kt < 8; kt++) {
+                    repack_q3_K_quant_tile(group + kt * (HTP_Q3K_COMPACT_QUANTS_BYTES / 8), b, row, kt);
+                }
+                memcpy(multipliers + row * sizeof(b->d), &b->d, sizeof(b->d));
+                for (size_t i = 0; i < sizeof(b->scales); i++) {
+                    scales[i * 32 + row] = b->scales[i];
+                }
+            }
+
+            // A zero signed scale is encoded as 32. Together with a +0 multiplier,
+            // this makes the expanded padding match the tiled layout's +0 scales.
+            if (rows < 32) {
+                for (int i = 8; i < 12; i++) {
+                    memset(scales + i * 32 + rows, 0xAA, 32 - rows);
+                }
+            }
+        }
+    }
+}
+
+void htp_unpack_q3k_compact(void * raw, const ggml_tensor * tensor, size_t offset, size_t size) {
+    GGML_ASSERT(offset <= ggml_nbytes(tensor) && size <= ggml_nbytes(tensor) - offset);
+    const size_t blocks_per_row = tensor->ne[0] / QK_K;
+    const size_t rows_per_slot = tensor->ne[1];
+    const size_t slab_size = htp_q3k_compact_slab_size((uint32_t) tensor->ne[0]);
+    const size_t slot_size = ((rows_per_slot + 31) / 32) * slab_size;
+    auto * dst = static_cast<uint8_t *>(raw);
+    const auto * packed = static_cast<const uint8_t *>(tensor->data);
+
+    while (size != 0) {
+        const size_t block_index = offset / sizeof(block_q3_K);
+        const size_t row_index = block_index / blocks_per_row;
+        const size_t slot = row_index / rows_per_slot;
+        const size_t slot_row = row_index % rows_per_slot;
+        const size_t row = slot_row % 32;
+        const uint8_t * group = packed + slot * slot_size + (slot_row / 32) * slab_size
+            + (block_index % blocks_per_row) * HTP_Q3K_COMPACT_GROUP_BYTES;
+        block_q3_K block = {};
+        for (int kt = 0; kt < 8; kt++) {
+            unpack_q3_K_quant_tile(block, group + kt * (HTP_Q3K_COMPACT_QUANTS_BYTES / 8), row, kt);
+        }
+        memcpy(&block.d, group + HTP_Q3K_COMPACT_QUANTS_BYTES + row * sizeof(block.d), sizeof(block.d));
+        for (size_t i = 0; i < sizeof(block.scales); i++) {
+            block.scales[i] = group[HTP_Q3K_COMPACT_SCALES_OFFSET + i * 32 + row];
+        }
+        const size_t inside = offset % sizeof(block);
+        const size_t bytes = (std::min)(size, sizeof(block) - inside);
+        memcpy(dst, reinterpret_cast<const uint8_t *>(&block) + inside, bytes);
+        dst += bytes;
+        offset += bytes;
+        size -= bytes;
+    }
+}
+
 static void repack_q3_K_tiled(ggml_tensor * t, const void * data, size_t offset, size_t size) {
     repack_kquant_to_tiled_grid<block_q3_K>(t, data, offset, size, HTP_TENSOR_TILE_SIZE_Q3_K,
         [](uint8_t * tile, const block_q3_K * b, int row, int kt_local) {
             const float d     = GGML_FP16_TO_FP32(b->d);
-            uint8_t * lo_pl   = tile;
-            uint8_t * neg_pl  = tile + 256;
             ggml_half * sc_pl = (ggml_half *) (tile + 384);
 
-#if defined(__ARM_NEON) || defined(__aarch64__)
-            repack_neon_q2_3_k_low2(b->qs, kt_local, lo_pl, row);
-            repack_neon_q3_k_hmask(b->hmask, kt_local, neg_pl, row);
-#else
-            for (int lk = 0; lk < 32; lk++) {
-                const int e   = kt_local * 32 + lk;
-                const int g   = lk >> 2;
-                const int pos = row * 4 + (lk & 3);
-                lo_pl[(g >> 2) * 128 + pos] |= (uint8_t) (q2_3_K_get_low2(b->qs, e) << ((g & 3) * 2));
-                if (!q3_K_get_hbit(b, e)) {
-                    neg_pl[pos] |= (uint8_t) (1 << g);
-                }
-            }
-#endif
+            repack_q3_K_quant_tile(tile, b, row, kt_local);
             for (int sub = 0; sub < 2; sub++) {
                 sc_pl[sub * 32 + row] = GGML_FP32_TO_FP16(d * (float) q3_K_get_scale(b->scales, kt_local * 2 + sub));
             }
@@ -1098,24 +1202,9 @@ static void repack_tiled_q3_K(void * data, const ggml_tensor * t, size_t offset,
             ggml_half sub_scales[16];
             for (int kt_local = 0; kt_local < 8; kt_local++) {
                 const uint8_t *   tile   = sb_tiles + kt_local * tile_size;
-                const uint8_t *   lo_pl  = tile;
-                const uint8_t *   neg_pl = tile + 256;
                 const ggml_half * sc_pl  = (const ggml_half *) (tile + 384);
 
-                for (int lk = 0; lk < 32; lk++) {
-                    const int e   = kt_local * 32 + lk;
-                    const int g   = lk >> 2;
-                    const int pos = row * 4 + (lk & 3);
-                    const uint8_t lo = (lo_pl[(g >> 2) * 128 + pos] >> ((g & 3) * 2)) & 3;
-
-                    const int c = e / 128;
-                    const int j = (e % 128) / 32;
-                    const int l = e % 32;
-                    b->qs[c * 32 + l] |= (uint8_t) (lo << (2 * j));
-                    if (!((neg_pl[pos] >> g) & 1)) {
-                        b->hmask[l] |= (uint8_t) (1 << (c * 4 + j));
-                    }
-                }
+                unpack_q3_K_quant_tile(*b, tile, row, kt_local);
 
                 for (int sub = 0; sub < 2; sub++) {
                     sub_scales[kt_local * 2 + sub] = sc_pl[sub * 32 + row];

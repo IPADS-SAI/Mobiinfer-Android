@@ -53,6 +53,10 @@ struct sum_rows_context {
     size_t          dst_stride;
     uint32_t        rows_per_hvx;
     uint32_t        total_rows;
+    // opt-in: clamp the summed value (fused SUM_ROWS + CLAMP, see htp-fusion.cpp). Default off.
+    uint32_t        clamp;
+    float           cmin;
+    float           cmax;
 };
 
 static void sum_rows_thread_f32(const htp_thread_t * th, unsigned int nth, unsigned int ith, void *data) {
@@ -89,7 +93,11 @@ static void sum_rows_thread_f32(const htp_thread_t * th, unsigned int nth, unsig
             hex_l2fetch((const uint8_t *) src_local + src_stride, src_stride, src_stride, 1);
         }
 
-        *dst_local = hvx_reduce_sum_f32((const uint8_t *) src_local, ne00);
+        float sum = hvx_reduce_sum_f32((const uint8_t *) src_local, ne00);
+        if (smctx->clamp) {
+            sum = sum < smctx->cmin ? smctx->cmin : (sum > smctx->cmax ? smctx->cmax : sum);
+        }
+        *dst_local = sum;
     }
 
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, (uint16_t) start_row);
@@ -143,7 +151,18 @@ int op_sum_rows(struct htp_ops_context * octx) {
         .dst_stride      = nb1,
         .rows_per_hvx    = rows_per_hvx,
         .total_rows      = nrows,
+        .clamp           = 0,
+        .cmin            = 0.0f,
+        .cmax            = 0.0f,
     };
+
+    // opt-in: fused SUM_ROWS + CLAMP. op_params[15] is 0 for a plain SUM_ROWS (ggml zeroes op_params),
+    // so the default path below is unchanged.
+    if (octx->op_params[15] == HTP_SUM_ROWS_FLAG_CLAMP) {
+        memcpy(&smctx.cmin, &octx->op_params[0], sizeof(float));
+        memcpy(&smctx.cmax, &octx->op_params[1], sizeof(float));
+        smctx.clamp = 1;
+    }
 
     work_queue_run(octx->ctx->hvx_queue, sum_rows_thread_f32, &smctx, n_hvx);
 

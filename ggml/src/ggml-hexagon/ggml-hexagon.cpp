@@ -58,10 +58,13 @@
 #include "htp/htp-ops.h"
 #include "htp_iface.h"
 #include "htp-drv.h"
+#include "ggml-hexagon-oppoll.h"
+#include "ggml-hexagon-rtt.h"
 #include "htp-repack.h"
 #include "htp-common.h"
 #include "htp-kparams.h"
 #include "htp-fusion.h"
+#include "htp-caps.h"
 
 using intvec  = std::vector<int>;
 using uintvec = std::vector<unsigned int>;
@@ -90,6 +93,7 @@ size_t opt_vmem       = HTP_OP_MAX_VMEM_DEFAULT;  // max available va space for 
 int    opt_etm        = 0;
 int    opt_verbose    = 0;
 int    opt_profile    = 0; // profiling mode (0-disabled, 1-basic, 2-pmu)
+int    opt_opbufstat  = 0; // GGML_HEXAGON_OPBUFSTAT: emit per-batch op-buffer JSONL
 bool   opt_hostbuf    = true;
 bool   opt_dma64      = false;
 int    opt_power_mode = HTP_POWER_MODE_BURST; // DCVS/HMX power profile requested at session start
@@ -133,6 +137,17 @@ size_t opt_mbuf_static = 1ul * 1024 * 1024 * 1024; // max static (weight/KV) buf
 size_t opt_mbuf_total  = 0;                        // total buffer space limit (0 = unconstrained)
 
 int    opt_mm_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
+bool   opt_moe_hmx_pipeline = false;
+bool   opt_moe_hmx_serial   = false; // opt-in A/B escape hatch: legacy serial HMX skeleton for compact Q3_K experts
+// MUL_MAT_ID HVX-first window. 0 = auto: derive from the number of HVX contexts the
+// session reports (v81/SM8850: 8 -> 32, v79/SM8750: 6 -> 12, i.e. unchanged vs #27).
+// Override with GGML_HEXAGON_MOE_HVX_FIRST_MAX_NROWS so one binary can sweep the
+// crossover. The window only ever *tries* HVX first; shapes HVX cannot stage still
+// fall back to HMX in the same solver.
+int    opt_mm_moe_hvx_first_max_nrows = 0;
+// PR-06: dense MUL_MAT narrow-batch window (-1 = derive from n_hvx, 0 = never,
+// >0 = explicit m limit).  Independent of the MUL_MAT_ID window above.
+int    opt_mm_dense_hvx_max_rows   = -1;
 int    opt_fa_select     = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 int    opt_fa_split      = 1; // 1 = head-split + team-split when n_kv_heads < N_cores (default), 0 = off
 int    opt_li_select     = 2; // 2 = HMX -> HVX, 1 = HVX, 0 = CPU (unsupported)
@@ -148,9 +163,23 @@ static u32vec opt_pmu_evt { 0x3, 0x111, 0x100, 0x105, 0x240, 0x256, 0x7D, 0x8C }
 int    opt_opbatch   = 2048; // max number of ops in a batch
 int    opt_opqueue   = 8;    // max number of pending batches
 int    opt_optrace   = 0;    // trace buffer size per thread (0 means default)
-int    opt_oppoll    = 0;    // polling for batch completions
+int    opt_oppoll    = 0;    // batch completion polling: 0=block, 1=spin, 2=auto (decode spin, prefill/load block)
 int    opt_opfusion  = 1;    // enable/disable op fusion
+// MoE top-k weight normalisation fusion (SUM_ROWS+CLAMP+DIV -> one op). Verified on op13 v79:
+// 3 ops -> 1 op per layer, output bit-identical to the unfused chain (exps/op-bench-20261120/
+// SMALL_OPS.md §18/§19). Only fires when the SUM_ROWS -> CLAMP -> DIV triple is in the same graph and
+// the clamp bounds come from the CLAMP node's own op_params (guards in htp-fusion.cpp).
+// GGML_HEXAGON_FUSE_WNORM=0 disables it (kept for bisection).
+int    opt_fuse_wnorm       = 1;
+
 int    opt_rt_repack = 1;    // runtime repacking: 0 = disabled, 1 = all tileable weights (default)
+
+// Host-only RTT trace (GGML_HEXAGON_RTT_TRACE=<path>).  NULL/empty = disabled;
+// the hot path then only costs one branch and performs no clock/IO/allocation.
+// GGML_HEXAGON_RTT_TRACE_V2=1 additionally emits the v2 graph attribution
+// fields and the exit summary; unset/0 keeps v1 byte-identical.
+static const char * opt_rtt_trace    = NULL;
+static int          opt_rtt_trace_v2 = 0;
 
 static std::regex* opt_opfilter = NULL; // regex of ops to not claim
 
@@ -190,6 +219,7 @@ static void ggml_hexagon_dump_op_supp(const char * sess_name, const struct ggml_
 static const char * htp_event_name(uint16_t id) {
     switch (id) {
         case HTP_TRACE_EVT_DMA:            return "DMA";
+        case HTP_TRACE_EVT_DMA_WAIT:       return "DMA_WAIT";
         case HTP_TRACE_EVT_HVX_COMP:       return "HVX_COMP";
         case HTP_TRACE_EVT_HVX_A_QUANT:    return "HVX_A_QUANT";
         case HTP_TRACE_EVT_HVX_A_PREP:     return "HVX_A_PREP";
@@ -209,6 +239,7 @@ static const char * htp_event_name(uint16_t id) {
         case HTP_TRACE_EVT_HVX_GDN_STATE:  return "HVX_GDN_STATE";
         case HTP_TRACE_EVT_HVX_GDN_REM:    return "HVX_GDN_REM";
         case HTP_TRACE_EVT_HMX_COMP:       return "HMX_COMP";
+        case HTP_TRACE_EVT_HMX_WAIT:       return "HMX_WAIT";
         case HTP_TRACE_EVT_L2FLUSH:        return "L2FLUSH";
         case HTP_TRACE_EVT_INIT:           return "INIT";
         case HTP_TRACE_EVT_BUFF:           return "BUFF";
@@ -269,6 +300,80 @@ static void ggml_hexagon_dump_trace_events(const char * sess_name, const htp_opb
     }
 }
 
+// ** host-side P0 op-buffer counters (GGML_HEXAGON_OPBUFSTAT, T-0304)
+//
+// Disabled by default: when opt_opbufstat == 0 nothing below is called, no
+// line is formatted and no aggregate is updated.  When enabled, every batch
+// response produces one pure-JSON line on stderr (no "ggml-hex:" prefix, so
+// bench/opbuf_stats.py can parse the stream directly) and process exit emits
+// one aggregate line.
+//
+// Fields mirror struct htp_opbuf_stats.  The aggregate sums every counter
+// except max_vmem, which is reported as the maximum observed (it is a
+// per-session constant, not an additive quantity).
+
+struct ggml_hexagon_opbuf_totals {
+    uint64_t              batches = 0;
+    struct htp_opbuf_stats sums   = {};
+    uint64_t              max_vmem_max = 0;
+};
+
+static ggml_hexagon_opbuf_totals g_opbuf_totals;
+static std::mutex                g_opbuf_mutex;
+
+static void ggml_hexagon_opbufstat_emit(const htp_opbatch_rsp & rsp) {
+    const htp_opbuf_stats & s = rsp.opbuf;
+
+    std::lock_guard<std::mutex> lock(g_opbuf_mutex);
+    fprintf(stderr,
+            "{\"seq\":%llu,\"n_bufs\":%u,\"reuse\":%u,\"drop_n\":%u,\"drop_bytes\":%llu,"
+            "\"map_n\":%u,\"map_bytes\":%llu,\"m_vmem\":%llu,\"e_vmem\":%llu,"
+            "\"max_vmem\":%llu,\"defrag\":%u,\"scan_cmp\":%llu}\n",
+            (unsigned long long) rsp.seq,
+            s.n_bufs, s.b_reuse, s.drop_n, (unsigned long long) s.drop_bytes,
+            s.map_n, (unsigned long long) s.map_bytes,
+            (unsigned long long) s.m_vmem, (unsigned long long) s.e_vmem,
+            (unsigned long long) s.max_vmem, s.defrag_n,
+            (unsigned long long) s.scan_cmp);
+    fflush(stderr);
+
+    g_opbuf_totals.batches++;
+    htp_opbuf_stats_add(&g_opbuf_totals.sums, &s);
+    if (s.max_vmem > g_opbuf_totals.max_vmem_max) {
+        g_opbuf_totals.max_vmem_max = s.max_vmem;
+    }
+}
+
+static void ggml_hexagon_opbufstat_total(void) {
+    if (!opt_opbufstat) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_opbuf_mutex);
+    const htp_opbuf_stats & s = g_opbuf_totals.sums;
+    fprintf(stderr,
+            "{\"opbuf_total\":{\"batches\":%llu,\"n_bufs\":%llu,\"reuse\":%llu,"
+            "\"drop_n\":%llu,\"drop_bytes\":%llu,\"map_n\":%llu,\"map_bytes\":%llu,"
+            "\"m_vmem\":%llu,\"e_vmem\":%llu,\"max_vmem\":%llu,\"defrag\":%llu,"
+            "\"scan_cmp\":%llu}}\n",
+            (unsigned long long) g_opbuf_totals.batches,
+            (unsigned long long) s.n_bufs, (unsigned long long) s.b_reuse,
+            (unsigned long long) s.drop_n, (unsigned long long) s.drop_bytes,
+            (unsigned long long) s.map_n, (unsigned long long) s.map_bytes,
+            (unsigned long long) s.m_vmem, (unsigned long long) s.e_vmem,
+            (unsigned long long) g_opbuf_totals.max_vmem_max,
+            (unsigned long long) s.defrag_n, (unsigned long long) s.scan_cmp);
+    fflush(stderr);
+}
+
+static void ggml_hexagon_opbufstat_register(void) {
+    static bool registered = false;
+    if (!registered) {
+        atexit(ggml_hexagon_opbufstat_total);
+        registered = true;
+    }
+}
+
 // ** backend sessions
 
 struct ggml_hexagon_opbatch;
@@ -299,6 +404,23 @@ struct ggml_hexagon_event {
     uint32_t               seq          = 0;
 };
 
+// ** host-only RTT trace (GGML_HEXAGON_RTT_TRACE, schema ggml.hex.rtt.v1)
+//
+// v1 measures the wall-clock interval between the host handing a batch to
+// dspqueue_write() and dspqueue_read() returning the matching rsp.seq.  It is
+// an upper bound for DSP execution: it also contains host submit bookkeeping
+// and queue wait.  It is NOT the pure DSP execution time.
+//
+// The slot struct and the JSON formatters live in ggml-hexagon-rtt.h so the
+// v1/v2 wire format can be unit-tested on the host (tests/test-hexagon-rtt.cpp).
+// v2 is opt-in via GGML_HEXAGON_RTT_TRACE_V2=1 and only appends fields.
+
+static inline uint64_t ggml_hexagon_rtt_now_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000000000ull + (uint64_t) ts.tv_nsec;
+}
+
 struct ggml_hexagon_session {
     std::string      name;
     remote_handle64  handle;
@@ -323,6 +445,8 @@ struct ggml_hexagon_session {
     uint32_t n_threads   = 0;
     uint32_t n_hvx       = 0;
     uint32_t n_hmx       = 0;
+    mutable uint32_t capabilities = 0;
+    mutable std::once_flag capabilities_once;
     uint64_t vtcm_size   = 0;
     size_t   max_vmem    = 0;
     uint32_t fence_seq   = 0;
@@ -330,6 +454,52 @@ struct ggml_hexagon_session {
     std::atomic<uint64_t> batch_req_seq{0};
     std::atomic<uint64_t> batch_rsp_seq{0};
     std::atomic<uint32_t> last_error{HTP_STATUS_OK};
+
+    // GGML_HEXAGON_OPPOLL=2 (auto).  n_tokens/poll_decode describe the graph
+    // currently being enqueued; flush_batch() snapshots poll_decode per
+    // response sequence (batch_spin) so a batch keeps the hint it was
+    // submitted with, and sub-sessions inherit exactly that hint.  If an open
+    // op batch already holds ops from an earlier graph, open_batch_poll is
+    // ANDed in so a prefill+decode mix never spins.
+    uint32_t n_tokens        = 0;
+    bool     poll_decode     = false;
+    bool     open_batch_poll = false;
+    std::unordered_map<uint64_t, uint8_t> batch_spin;
+
+    // Host-only RTT trace.  Everything is inert when rtt_enabled == false:
+    // no FILE, no ring allocation, no clock_gettime, no fprintf.
+    bool        rtt_enabled    = false;
+    FILE *      rtt_fp         = nullptr;
+    std::string rtt_path;
+    uint32_t    rtt_session_id = 0;
+    uint64_t    rtt_dropped    = 0;
+    std::unique_ptr<ggml_hexagon_rtt_slot[]> rtt_ring;
+
+    // v2 (GGML_HEXAGON_RTT_TRACE_V2=1) graph attribution.  cur_graph_* is the
+    // graph currently being enqueued (graph_compute entry).  batch_graph_* is
+    // snapshotted when a batch opens, so a batch that spans several graphs is
+    // attributed to the first graph (the one that opened it).  Nothing here is
+    // touched unless rtt_enabled && opt_rtt_trace_v2.
+    uint64_t cur_graph_uid         = 0;
+    uint64_t cur_graph_prep_ns     = 0;
+    uint32_t cur_graph_nodes       = 0;
+    bool     cur_graph_cache_hit   = false;
+
+    uint64_t batch_graph_uid       = 0;
+    uint64_t batch_graph_prep_ns   = 0;
+    uint32_t batch_graph_nodes     = 0;
+    bool     batch_graph_cache_hit = false;
+
+    uint64_t rtt_n_graphs     = 0;
+    uint64_t rtt_n_cache_hits = 0;
+    uint64_t rtt_prep_ns      = 0;
+    std::unordered_set<uint64_t> rtt_unique_uids;
+
+    void rtt_init();
+    void rtt_close();
+    void rtt_note_write(uint64_t seq, uint64_t t_write_ns, uint64_t t_write_ret_ns, uint32_t n_ops, uint32_t oppoll);
+    void rtt_note_poll(uint64_t seq);
+    void rtt_note_done(const htp_opbatch_rsp & rsp, uint64_t t_done_ns);
 
     uint64_t                cached_uid = 0;
     std::vector<htp_opnode> cached_nodes;
@@ -343,6 +513,27 @@ struct ggml_hexagon_session {
     ~ggml_hexagon_session() noexcept(true);
 
     const char* c_name() const { return name.c_str(); }
+
+    uint32_t query_capabilities() const {
+        std::call_once(capabilities_once, [this] {
+            uint32_t flags  = 0;
+            const int caps_err = htp_iface_capabilities(handle, &flags);
+            if (caps_err == AEE_SUCCESS) {
+                capabilities = flags;
+            } else {
+                // A mixed host/skel deployment can load a skel that predates the query. Keep the
+                // legacy unfused chain rather than assuming the new descriptor variant exists.
+                capabilities = 0;
+                HEX_VERBOSE("ggml-hex: %s skel capabilities unavailable (0x%x); ROWNORM fusion disabled\n",
+                            this->c_name(), (unsigned) caps_err);
+            }
+        });
+        return capabilities;
+    }
+
+    bool supports_compact_q3k() const {
+        return query_capabilities() & HTP_CAP_BIT_Q3K_COMPACT;
+    }
 
     void allocate(const ggml_hexagon_device_config & config) noexcept(false);
     void release() noexcept(true);
@@ -393,6 +584,18 @@ uint32_t     htp_session_n_hvx(const struct ggml_hexagon_session * sess) { retur
 uint32_t     htp_session_n_hmx(const struct ggml_hexagon_session * sess) { return sess->n_hmx; }
 uint32_t     htp_session_mdev_count(const struct ggml_hexagon_session * sess) { return sess->mdev.count; }
 
+bool htp_session_has_capability(const struct ggml_hexagon_session * sess, uint32_t cap) {
+    if (!sess || (sess->query_capabilities() & cap) != cap) {
+        return false;
+    }
+    for (const auto & sub : sess->mdev.sessions) {
+        if (!sub || (sub->query_capabilities() & cap) != cap) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // ** backend buffers
 
 struct ggml_backend_hexagon_device_context {
@@ -429,6 +632,54 @@ struct ggml_backend_hexagon_buffer_type_context {
     ggml_backend_hexagon_device_context * dev_ctx;
     std::string                           name;
 };
+
+// Pre-allocation compact marker. A tensor's `extra` field is shared with other
+// backends, so an unallocated tensor must not be classified by arbitrary bits
+// there. The mark API stores a unique token instead; buffer_init_tensor()
+// consumes it and converts it into real HTP_TENSOR_* flags.
+static std::mutex g_pending_compact_mutex;
+static std::unordered_map<const struct ggml_tensor *, uintptr_t> g_pending_compact;
+static std::atomic<size_t> g_pending_compact_count{0};
+static std::atomic<uintptr_t> g_pending_compact_next{0};
+
+static uintptr_t ggml_hexagon_pending_compact_token() {
+    constexpr uintptr_t high_bit = (uintptr_t) 1 << (sizeof(uintptr_t) * 8 - 1);
+    uintptr_t token = 0;
+    do {
+        token = g_pending_compact_next.fetch_add(1, std::memory_order_relaxed) + 1;
+    } while (token == 0);
+    return high_bit | token;
+}
+
+bool ggml_hexagon_tensor_is_pending_compact(const struct ggml_tensor * t) {
+    if (!t || g_pending_compact_count.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_pending_compact_mutex);
+    const auto it = g_pending_compact.find(t);
+    return it != g_pending_compact.end() && it->second != 0 && (uintptr_t) t->extra == it->second;
+}
+
+void ggml_hexagon_tensor_mark_pending_compact(struct ggml_tensor * t) {
+    const uintptr_t token = ggml_hexagon_pending_compact_token();
+    {
+        std::lock_guard<std::mutex> lock(g_pending_compact_mutex);
+        const auto inserted = g_pending_compact.emplace(t, token).second;
+        if (inserted) {
+            g_pending_compact_count.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            g_pending_compact[t] = token;
+        }
+        t->extra = (void *) token;
+    }
+}
+
+void ggml_hexagon_tensor_forget_pending_compact(struct ggml_tensor * t) {
+    std::lock_guard<std::mutex> lock(g_pending_compact_mutex);
+    if (g_pending_compact.erase(t) != 0) {
+        g_pending_compact_count.fetch_sub(1, std::memory_order_relaxed);
+    }
+}
 
 struct ggml_hexagon_rpcmem_block {
     uint8_t * base = nullptr;
@@ -646,6 +897,16 @@ static void * ggml_backend_hexagon_buffer_get_base(ggml_backend_buffer_t buffer)
     return sbuf->base();
 }
 
+static size_t ggml_hexagon_tiled_row_size(ggml_type type, int64_t ne0, bool compact) {
+    return compact ? htp_q3k_compact_slab_size((uint32_t) ne0) / 32 :
+        htp_tiled_row_size(type, hex_round_up(ne0, 32));
+}
+
+static size_t ggml_hexagon_expert_slot_size(const ggml_tensor * tensor) {
+    return ggml_hexagon_tiled_row_size(tensor->type, tensor->ne[0], ggml_hexagon_tensor_is_q3k_compact(tensor)) *
+        hex_round_up(tensor->ne[1], 32);
+}
+
 static enum ggml_status ggml_backend_hexagon_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
     auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(buffer->context);
     auto sess = sbuf->sess;
@@ -653,7 +914,12 @@ static enum ggml_status ggml_backend_hexagon_buffer_init_tensor(ggml_backend_buf
     HEX_VERBOSE("ggml-hex: %s init-tensor %s : base %p data %p nbytes %zu\n", sess->c_name(),
                 tensor->name, (void *) sbuf->base(), tensor->data, ggml_nbytes(tensor));
 
-    tensor->extra = (void *) (uintptr_t) 0;
+    // Capture the compact state (including a pending token) before consuming
+    // the mark. The token is not a flag word; it is converted to the real
+    // HTP_TENSOR_Q3K_COMPACT bit after `extra` is cleared.
+    const bool compact = ggml_hexagon_tensor_is_q3k_compact(tensor);
+    ggml_hexagon_tensor_forget_pending_compact(tensor);
+    tensor->extra = nullptr;
 
     // Runtime MoE expert slots are uploaded pre-tiled (see upload_moe_expert):
     // mark them up-front so graph repacking leaves them alone and the op
@@ -661,11 +927,12 @@ static enum ggml_status ggml_backend_hexagon_buffer_init_tensor(ggml_backend_buf
     auto dev_ctx = static_cast<ggml_backend_hexagon_buffer_type_context *>(buffer->buft->context)->dev_ctx;
     if (buffer->buft == &dev_ctx->alloc_only_buffer_type && htp_is_tiled_weight_type(tensor->type)) {
         ggml_hexagon_tensor_set_flags(tensor, HTP_TENSOR_TILED | HTP_TENSOR_WEIGHT);
+        if (compact) {
+            ggml_hexagon_tensor_set_flags(tensor, HTP_TENSOR_Q3K_COMPACT);
+        }
         if (tensor->view_src) {
-            const int64_t ne0 = hex_round_up(tensor->ne[0], 32);
-            const int64_t ne1 = hex_round_up(tensor->ne[1], 32);
             const size_t raw_stride   = ggml_row_size(tensor->type, tensor->ne[0]) * tensor->ne[1];
-            const size_t tiled_stride = htp_tiled_row_size(tensor->type, ne0) * ne1;
+            const size_t tiled_stride = ggml_hexagon_expert_slot_size(tensor);
             GGML_ASSERT(raw_stride && tensor->view_offs % raw_stride == 0);
             tensor->data = (uint8_t *) tensor->view_src->data + (tensor->view_offs / raw_stride) * tiled_stride;
         }
@@ -711,7 +978,11 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
         return;
     }
 
-    htp_unpack_tensor_tiled(data, tensor, offset, size);
+    if (flags & HTP_TENSOR_Q3K_COMPACT) {
+        htp_unpack_q3k_compact(data, tensor, offset, size);
+    } else {
+        htp_unpack_tensor_tiled(data, tensor, offset, size);
+    }
 }
 
 static bool ggml_backend_hexagon_buffer_cpy_tensor(ggml_backend_buffer_t      buffer,
@@ -782,7 +1053,11 @@ static void ggml_backend_hexagon_buffer_get_tensor_2d(ggml_backend_buffer_t buff
     GGML_ASSERT((offset + temp_size) <= ggml_nbytes(tensor));
 
     std::vector<uint8_t> temp_buf(temp_size);
-    htp_unpack_tensor_tiled(temp_buf.data(), tensor, offset, temp_size);
+    if (flags & HTP_TENSOR_Q3K_COMPACT) {
+        htp_unpack_q3k_compact(temp_buf.data(), tensor, offset, temp_size);
+    } else {
+        htp_unpack_tensor_tiled(temp_buf.data(), tensor, offset, temp_size);
+    }
 
     for (size_t i = 0; i < n_copies; i++) {
         memcpy((uint8_t *) data + i * stride_data, temp_buf.data() + i * stride_tensor, size);
@@ -942,13 +1217,18 @@ static size_t ggml_backend_hexagon_buffer_type_get_alloc_size(ggml_backend_buffe
     if (bt_ctx && buft == &bt_ctx->dev_ctx->alloc_only_buffer_type && htp_is_tiled_weight_type(t->type)) {
         // Runtime MoE expert slots are always uploaded pre-tiled: claim the
         // tiled layout at allocation time so supports_op/op encoding agree
-        // before the first expert is uploaded.
-        ggml_hexagon_tensor_set_flags(const_cast<struct ggml_tensor *>(t), HTP_TENSOR_TILED | HTP_TENSOR_WEIGHT);
-        const int64_t ne0 = hex_round_up(t->ne[0], 32);
-        const int64_t ne1 = hex_round_up(t->ne[1], 32);
-        const size_t tiled_size = htp_tiled_row_size(t->type, ne0) * ne1 * t->ne[2] * t->ne[3];
+        // before the first expert is uploaded. A pending compact mark stores a
+        // token in `extra`; keep it intact until buffer_init_tensor() converts
+        // it, otherwise a compact slot would be sized as the larger tiled one.
+        if (!ggml_hexagon_tensor_is_pending_compact(t)) {
+            ggml_hexagon_tensor_set_flags(const_cast<struct ggml_tensor *>(t), HTP_TENSOR_TILED | HTP_TENSOR_WEIGHT);
+        }
+        const size_t tiled_size = ggml_hexagon_expert_slot_size(t) * t->ne[2] * t->ne[3];
         // F16/BF16/F32 tiles are stored as fp16: a small F32 tensor can shrink.
         return std::max(tiled_size, ggml_nbytes(t));
+    }
+    if (ggml_hexagon_tensor_is_q3k_compact(t)) {
+        return ggml_hexagon_expert_slot_size(t) * t->ne[2] * t->ne[3];
     }
     if (opt_rt_repack != 0 && !ggml_backend_buft_is_host(buft) && ggml_op_is_empty(t->op) && htp_is_tiled_weight_tensor(t)) {
         int64_t ne0 = hex_round_up(t->ne[0], 32);
@@ -1231,6 +1511,14 @@ static bool ggml_backend_buffer_is_hexagon(const struct ggml_backend_buffer * b)
     return b->buft->iface.get_alignment == ggml_backend_hexagon_buffer_type_get_alignment;
 }
 
+bool ggml_hexagon_tensor_extra_is_owned(const struct ggml_tensor * t) {
+    if (!t || !t->buffer || !ggml_backend_buffer_is_hexagon(t->buffer)) {
+        return false;
+    }
+    auto * bt_ctx = static_cast<ggml_backend_hexagon_buffer_type_context *>(t->buffer->buft->context);
+    return bt_ctx && t->buffer->buft == &bt_ctx->dev_ctx->alloc_only_buffer_type;
+}
+
 struct ggml_hexagon_opbatch {
     ggml_hexagon_session*            sess;
 
@@ -1338,9 +1626,8 @@ struct ggml_hexagon_opbatch {
             } else {
                 h.nb[0] = t->nb[0];
             }
-            const int64_t ne0_padded = hex_round_up(t->ne[0], 32);
             const int64_t ne1_padded = hex_round_up(t->ne[1], 32);
-            h.nb[1] = htp_tiled_row_size(t->type, ne0_padded);
+            h.nb[1] = ggml_hexagon_tiled_row_size(t->type, t->ne[0], flags & HTP_TENSOR_Q3K_COMPACT);
             h.nb[2] = h.nb[1] * ne1_padded;
             h.nb[3] = h.nb[2] * h.ne[2];
             h.size  = h.nb[3] * h.ne[3];
@@ -1352,7 +1639,7 @@ struct ggml_hexagon_opbatch {
             h.size  = ggml_nbytes(t);
         }
 
-        h.flags = flags & (HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED | HTP_TENSOR_FENCE);
+        h.flags = flags & (HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED | HTP_TENSOR_FENCE | HTP_TENSOR_Q3K_COMPACT);
     }
 
     static uint64_t hash_tensor(const ggml_tensor * t, const htp_tensor & shape) {
@@ -1761,8 +2048,27 @@ void ggml_hexagon_session::flush_pending(bool all) {
         struct dspqueue_buffer dbuf;
         uint32_t               n_dbufs;
 
-        // Read response packet from queue
-        const uint32_t timeo = opt_oppoll ? 0 : DSPQUEUE_TIMEOUT;
+        // Read response packet from queue.
+        //
+        // 0 = always block, 1 = always spin, 2 = spin only for batches whose
+        // graph was classified as decode (poll_decode).  The per-batch record
+        // lives on every session that waits for this response, so a sub-session
+        // cannot fall back to the parent's newest hint.  A missing record (only
+        // possible for a batch submitted before this code existed) blocks,
+        // which is the conservative side.
+        bool batch_poll_decode = false;
+        if (opt_oppoll == 2) {
+            const uint64_t next_seq = this->batch_rsp_seq.load() + 1;
+            const auto it = this->batch_spin.find(next_seq);
+            batch_poll_decode = (it != this->batch_spin.end() && it->second != 0);
+        }
+        const uint32_t timeo = ggml_hexagon_oppoll_spin(opt_oppoll, batch_poll_decode) ? 0 : DSPQUEUE_TIMEOUT;
+
+        // Record the first host poll for the next expected sequence only once;
+        // busy polling must not keep overwriting this timestamp.
+        if (this->rtt_enabled) {
+            this->rtt_note_poll(this->batch_rsp_seq.load() + 1);
+        }
 
         int err = dspqueue_read(this->queue, &flags, 1, &n_dbufs, &dbuf, sizeof(rsp), &rsp_size, (uint8_t *) &rsp, timeo);
         if (err == AEE_EEXPIRED || err == AEE_EWOULDBLOCK) {
@@ -1773,10 +2079,26 @@ void ggml_hexagon_session::flush_pending(bool all) {
             GGML_ABORT("ggml-hex: dspqueue_read failed: 0x%08x\n", (unsigned) err);
         }
 
-        // Basic sanity checks
-        if (rsp_size != sizeof(rsp) || n_dbufs != 1) {
-            GGML_ABORT("ggml-hex: %s dspcall : bad response : size %u dspbufs %u\n", this->c_name(), rsp_size, n_dbufs);
+        // Basic sanity checks.  A size mismatch is also what an old skel
+        // (built before the T-0304 counters were appended) returns; say so
+        // explicitly instead of silently reading a shorter structure.
+        if (!htp_opbatch_rsp_size_ok(rsp_size, n_dbufs)) {
+            GGML_ABORT("ggml-hex: %s dspcall : response ABI mismatch: got size %u dspbufs %u, "
+                       "expected size %zu (abi_magic 0x%08x v%u); host lib and DSP skel were built "
+                       "from different headers -- rebuild libggml-htp-v79.so/libggml-htp-v81.so "
+                       "and the host library together\n",
+                       this->c_name(), rsp_size, n_dbufs, sizeof(rsp),
+                       (unsigned) HTP_OPBATCH_ABI_MAGIC, (unsigned) HTP_OPBUF_STATS_VERSION);
         }
+        if (!htp_opbatch_rsp_magic_ok(rsp.abi_magic)) {
+            GGML_ABORT("ggml-hex: %s dspcall : response ABI magic mismatch: got 0x%08x, expected "
+                       "0x%08x (v%u, size %u); stale DSP skel -- rebuild the skel and host lib "
+                       "from the same headers\n",
+                       this->c_name(), (unsigned) rsp.abi_magic,
+                       (unsigned) HTP_OPBATCH_ABI_MAGIC, (unsigned) HTP_OPBUF_STATS_VERSION, rsp_size);
+        }
+
+        const uint64_t rtt_t_done_ns = this->rtt_enabled ? ggml_hexagon_rtt_now_ns() : 0;
 
         if (rsp.status > HTP_STATUS_OK) {
             GGML_LOG_ERROR("ggml-hex: %s dspcall : dsp-rsp %s\n", this->c_name(), status_to_str(rsp.status));
@@ -1790,6 +2112,18 @@ void ggml_hexagon_session::flush_pending(bool all) {
 
         GGML_ASSERT(rsp.seq == this->batch_rsp_seq + 1);
         this->batch_rsp_seq = rsp.seq;
+
+        if (opt_opbufstat) {
+            ggml_hexagon_opbufstat_emit(rsp);
+        }
+
+        if (opt_oppoll == 2) {
+            this->batch_spin.erase(rsp.seq);
+        }
+
+        if (this->rtt_enabled) {
+            this->rtt_note_done(rsp, rtt_t_done_ns);
+        }
 
         if (!all) break;
     }
@@ -1815,6 +2149,18 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
     dspqueue_buffer dbuf{};
 
     const uint64_t seq = ++this->batch_req_seq;
+
+    // =2 auto: snapshot this batch's spin decision on the parent and on every
+    // sub-session that will dspqueue_read() the same seq.  Reading the hint
+    // later from the session would let a following decode graph turn a queued
+    // prefill batch into a spin.
+    if (opt_oppoll == 2) {
+        const uint8_t spin = this->poll_decode ? 1 : 0;
+        this->batch_spin[seq] = spin;
+        for (auto & sub : this->mdev.sessions) {
+            sub->batch_spin[seq] = spin;
+        }
+    }
 
     op_batch->update_mdev_group(this->mdev.idx);
 
@@ -1845,12 +2191,27 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
 
     HEX_VERBOSE("ggml-hex: %s queue-opbatch: %p size %u\n", this->c_name(), dbuf.ptr, dbuf.size);
 
+    uint64_t rtt_t_write_ns = 0;
+    if (this->rtt_enabled) {
+        rtt_t_write_ns = ggml_hexagon_rtt_now_ns();
+    }
+
     int err = dspqueue_write(this->queue, 0, 1, &dbuf, sizeof(req), (const uint8_t*) &req, DSPQUEUE_TIMEOUT);
     if (err != 0) {
         GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x\n", this->c_name(), (unsigned) err);
     }
 
+    if (this->rtt_enabled) {
+        // n_ops is still valid here: op_batch->reset() below clears it.
+        this->rtt_note_write(seq, rtt_t_write_ns, ggml_hexagon_rtt_now_ns(),
+                             (uint32_t) op_batch->n_ops, (uint32_t) opt_oppoll);
+    }
+
     op_batch->reset();
+
+    // The next ops (if any) still belong to the graph that was just being
+    // enqueued, so its combined hint describes the newly opened batch.
+    this->open_batch_poll = this->poll_decode;
 }
 
 void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
@@ -1882,6 +2243,15 @@ void ggml_hexagon_session::enqueue_op(const htp_opnode & node) {
     }
 
     if (op_batch->empty()) {
+        // v2: a batch belongs to the graph that opened it.  Snapshot here (not
+        // at flush time) so ops from a following graph cannot retag a batch
+        // that is still open; rtt_note_write() copies this into the slot.
+        if (this->rtt_enabled && opt_rtt_trace_v2) {
+            this->batch_graph_uid       = this->cur_graph_uid;
+            this->batch_graph_prep_ns   = this->cur_graph_prep_ns;
+            this->batch_graph_nodes     = this->cur_graph_nodes;
+            this->batch_graph_cache_hit = this->cur_graph_cache_hit;
+        }
         start_batch();
         if (!op_batch->fit_tensors(node)) {
             GGML_ABORT("ggml-hex: %s op does not fit into empty batch (vmem/tensor/buffer limit exceeded)\n", c_name());
@@ -1990,6 +2360,21 @@ ggml_hexagon_shared_buffer * ggml_hexagon_session::mmap_tensor(const ggml_tensor
         sbuf->mmap(extended);
     }
     return sbuf;
+}
+
+// Fusion runs before enqueue_op() maps the tensors, so mirror mmap_tensor()'s choice for an
+// unmapped buffer. Once mapped, report the actual flag: the fused kernel cannot access extended
+// (DMA64) buffers and must not replace a chain whose destination is one of them.
+bool htp_session_tensor_is_extended(const struct ggml_hexagon_session * sess, const struct ggml_tensor * t) {
+    if (!sess || !t || !t->buffer || !t->buffer->context) {
+        return false;
+    }
+    const auto * sbuf = static_cast<const ggml_hexagon_shared_buffer *>(t->buffer->context);
+    if (sbuf->mapped) {
+        return sbuf->extended;
+    }
+    const bool is_weight = ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+    return opt_dma64 && !sbuf->pinned && is_weight;
 }
 
 bool ggml_hexagon_session::clone_buffer(const ggml_hexagon_shared_buffer * sbuf)
@@ -2261,6 +2646,20 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
             this->n_hmx              = (opt_nhmx != 0) ? 1 : 0;
             this->vtcm_size          = opt_vtcm_size > 0 ? opt_vtcm_size : 8 * 1024 * 1024;
         }
+
+        // Logged here (not in ggml_hexagon_init) because llama.cpp installs its ggml log
+        // callback only after backend registration, so init-time INFO lines are dropped.
+        // Same policy function as the kparams solver -> the log states what will be used.
+        const int moe_hvx_window = htp_moe_hvx_first_window(this->n_hvx);
+        if (opt_mm_moe_hvx_first_max_nrows > 0) {
+            GGML_LOG_INFO("ggml-hex: %s MoE HVX-first window = %d (env GGML_HEXAGON_MOE_HVX_FIRST_MAX_NROWS)\n",
+                          this->c_name(), moe_hvx_window);
+        } else {
+            GGML_LOG_INFO("ggml-hex: %s MoE HVX-first window = %d (auto: n_hvx %u %s %d)\n",
+                          this->c_name(), moe_hvx_window, this->n_hvx,
+                          this->n_hvx >= HTP_MOE_HVX_WINDOW_NHVX_PLATEAU ? ">=" : "<",
+                          HTP_MOE_HVX_WINDOW_NHVX_PLATEAU);
+        }
     }
 
     // Enable FastRPC QoS mode
@@ -2348,6 +2747,144 @@ void ggml_hexagon_session::allocate(const ggml_hexagon_device_config & config) n
     }
 }
 
+void ggml_hexagon_session::rtt_init() {
+    if (this->rtt_enabled) {
+        return;
+    }
+    const char * path = opt_rtt_trace;
+    if (path == NULL || path[0] == '\0') {
+        return; // disabled: no allocation, no open, no log
+    }
+
+    FILE * fp = fopen(path, "a");
+    if (fp == NULL) {
+        GGML_LOG_WARN("ggml-hex: %s cannot open GGML_HEXAGON_RTT_TRACE '%s'; RTT tracing disabled\n",
+                      this->c_name(), path);
+        return;
+    }
+    // Line buffering keeps each JSONL record in one append write when multiple
+    // sessions share a path (v1 does not add cross-session locking).
+    setvbuf(fp, NULL, _IOLBF, 0);
+
+    std::unique_ptr<ggml_hexagon_rtt_slot[]> ring(
+        new (std::nothrow) ggml_hexagon_rtt_slot[GGML_HEXAGON_RTT_RING]());
+    if (!ring) {
+        fclose(fp);
+        GGML_LOG_WARN("ggml-hex: %s cannot allocate RTT ring; RTT tracing disabled\n", this->c_name());
+        return;
+    }
+
+    this->rtt_ring       = std::move(ring);
+    this->rtt_fp         = fp;
+    this->rtt_path       = path;
+    this->rtt_session_id = this->session_id;
+    this->rtt_dropped    = 0;
+    this->rtt_enabled    = true;
+
+    GGML_LOG_INFO("ggml-hex: %s RTT trace -> %s\n", this->c_name(), path);
+}
+
+void ggml_hexagon_session::rtt_close() {
+    if (!this->rtt_enabled) {
+        return;
+    }
+    this->rtt_enabled = false;
+    if (this->rtt_fp != NULL) {
+        fflush(this->rtt_fp);
+        fclose(this->rtt_fp);
+        this->rtt_fp = NULL;
+    }
+    if (this->rtt_dropped > 0) {
+        GGML_LOG_WARN("ggml-hex: %s RTT trace dropped %llu record(s)\n",
+                      this->c_name(), (unsigned long long) this->rtt_dropped);
+    } else {
+        GGML_LOG_INFO("ggml-hex: %s RTT trace closed: %s\n", this->c_name(), this->rtt_path.c_str());
+    }
+    // v2-only exit summary; v1 keeps the default log byte-identical (no new line).
+    if (opt_rtt_trace_v2) {
+        GGML_LOG_INFO("ggml-hex: %s RTT graph summary: graphs=%llu cache_hits=%llu prep_ms=%.3f unique_uids=%zu\n",
+                      this->c_name(),
+                      (unsigned long long) this->rtt_n_graphs,
+                      (unsigned long long) this->rtt_n_cache_hits,
+                      (double) this->rtt_prep_ns / 1e6,
+                      this->rtt_unique_uids.size());
+    }
+    this->rtt_ring.reset();
+}
+
+void ggml_hexagon_session::rtt_note_write(uint64_t seq, uint64_t t_write_ns, uint64_t t_write_ret_ns,
+                                          uint32_t n_ops, uint32_t oppoll) {
+    if (!this->rtt_enabled || !this->rtt_ring) {
+        return;
+    }
+    ggml_hexagon_rtt_slot & slot = this->rtt_ring[seq % GGML_HEXAGON_RTT_RING];
+    if (slot.used) {
+        // Ring wrap: the oldest batch never got a response record.
+        ++this->rtt_dropped;
+    }
+    slot = ggml_hexagon_rtt_slot();
+    slot.seq            = seq;
+    slot.t_write_ns     = t_write_ns;
+    slot.t_write_ret_ns = t_write_ret_ns;
+    slot.n_ops          = n_ops;
+    slot.oppoll         = oppoll;
+    slot.used           = true;
+    if (opt_rtt_trace_v2) {
+        // Snapshot of the graph that opened this batch (see enqueue_op()).
+        slot.graph_uid       = this->batch_graph_uid;
+        slot.graph_prep_ns   = this->batch_graph_prep_ns;
+        slot.graph_nodes     = this->batch_graph_nodes;
+        slot.graph_cache_hit = this->batch_graph_cache_hit;
+    }
+}
+
+void ggml_hexagon_session::rtt_note_poll(uint64_t seq) {
+    if (!this->rtt_enabled || !this->rtt_ring) {
+        return;
+    }
+    ggml_hexagon_rtt_slot & slot = this->rtt_ring[seq % GGML_HEXAGON_RTT_RING];
+    if (!slot.used || slot.seq != seq || slot.has_first_poll) {
+        return;
+    }
+    slot.t_first_poll_ns = ggml_hexagon_rtt_now_ns();
+    slot.has_first_poll  = true;
+}
+
+void ggml_hexagon_session::rtt_note_done(const htp_opbatch_rsp & rsp, uint64_t t_done_ns) {
+    if (!this->rtt_enabled || !this->rtt_ring || this->rtt_fp == NULL) {
+        return;
+    }
+    ggml_hexagon_rtt_slot & slot = this->rtt_ring[rsp.seq % GGML_HEXAGON_RTT_RING];
+
+    if (!slot.used || slot.seq != rsp.seq) {
+        // Missing slot (ring wrapped or unexpected seq): never fabricate times
+        // or graph identity.  v2 emits the same record with null graph fields.
+        ++this->rtt_dropped;
+        ggml_hexagon_rtt_slot dropped;
+        dropped.seq        = rsp.seq;
+        dropped.n_ops_rsp  = rsp.n_ops;
+        dropped.rsp_status = rsp.status;
+        dropped.oppoll     = (uint32_t) opt_oppoll;
+        dropped.dropped    = true;
+        const std::string line = opt_rtt_trace_v2
+                                     ? ggml_hexagon_rtt_json_v2(dropped, this->rtt_session_id)
+                                     : ggml_hexagon_rtt_json_v1(dropped, this->rtt_session_id);
+        fwrite(line.data(), 1, line.size(), this->rtt_fp);
+        return;
+    }
+
+    slot.t_done_ns  = t_done_ns;
+    slot.n_ops_rsp  = rsp.n_ops;
+    slot.rsp_status = rsp.status;
+
+    const std::string line = opt_rtt_trace_v2
+                                 ? ggml_hexagon_rtt_json_v2(slot, this->rtt_session_id)
+                                 : ggml_hexagon_rtt_json_v1(slot, this->rtt_session_id);
+    fwrite(line.data(), 1, line.size(), this->rtt_fp);
+
+    slot.used = false;
+}
+
 void ggml_hexagon_session::release() noexcept(true) {
     GGML_LOG_INFO("ggml-hex: releasing session: %s\n", this->name.c_str());
 
@@ -2362,6 +2899,10 @@ void ggml_hexagon_session::release() noexcept(true) {
             GGML_ABORT("ggml-hex: htp_iface_stop failed: 0x%08x\n", (unsigned) err);
         }
     }
+
+    // Flush/close the host-only RTT trace after the DSP queue is stopped and
+    // before dspqueue_close().
+    this->rtt_close();
 
     delete this->op_batch;
     delete this->op_queue;
@@ -2418,6 +2959,10 @@ ggml_hexagon_session::ggml_hexagon_session(const ggml_hexagon_device_config & co
 
     try {
         allocate(config);
+        // v1 traces the main queue only; mdev sub-sessions are not traced.
+        if (this->mdev.idx == 0) {
+            this->rtt_init();
+        }
         if (this->mdev.idx == 0 && !config.mdev_group.empty()) {
             for (size_t i = 0; i < config.mdev_group.size(); i++) {
                 this->mdev.sessions.push_back(std::make_unique<ggml_hexagon_session>(
@@ -2475,6 +3020,36 @@ static void ggml_hexagon_graph_repack(const ggml_cgraph * graph, ggml_hexagon_se
     }
 }
 
+// GGML_HEXAGON_OPPOLL=2: collect the activation row count of a compute node.
+// MUL_MAT keeps src[1] = activations (src[0] = weights) also after op fusion
+// (_NX/_ADD only changes the opcode, not node->op).  For MUL_MAT, ne[1..3] are
+// the token/batch dims; their product is the number of rows the DSP processes.
+//
+// MUL_MAT_ID is different: src[1] is the expert activation, e.g. the down
+// projection's [n_ff, n_expert_used, n_tokens], so src[1]->ne[1] is the number
+// of experts used (top-8 => 8), not the token count.  The token count is the
+// ids tensor src[2]->ne[1] ([n_expert_used, n_tokens, 1, 1]).  A missing ids
+// tensor is recorded as 0 rows (block); it must not fall back to src[1].
+// Any conflicting row count makes the hint conservative (block), see
+// ggml-hexagon-oppoll.h.  The batch-level AND in graph_compute() stays as the
+// conservative amplification it always was.
+static void ggml_hexagon_oppoll_add_htp_node(ggml_hexagon_oppoll_hint & hint, const htp_opnode & node) {
+    const ggml_tensor * t = node.node;
+    if (t == nullptr || t->src[1] == nullptr) {
+        return;
+    }
+    if (t->op == GGML_OP_MUL_MAT_ID) {
+        const ggml_tensor * ids = t->src[2];
+        ggml_hexagon_oppoll_add_node(hint, GGML_HEXAGON_OPPOLL_OP_MUL_MAT_ID,
+                                     t->src[1]->ne, ids ? ids->ne : nullptr);
+        return;
+    }
+    if (t->op != GGML_OP_MUL_MAT) {
+        return;
+    }
+    ggml_hexagon_oppoll_add_node(hint, GGML_HEXAGON_OPPOLL_OP_MUL_MAT, t->src[1]->ne, nullptr);
+}
+
 static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
 
@@ -2488,9 +3063,33 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
     std::vector<htp_opnode> computed_nodes;
 
     bool cache_hit = (graph->uid != 0 && sess->cached_uid == graph->uid);
+
+    // v2 graph attribution.  Only reached with the trace on and V2=1, so the
+    // disabled path keeps its single `if (rtt_enabled)` checks and never calls
+    // clock_gettime()/allocates/formats a string.
+    const bool rtt_graph_v2 = sess->rtt_enabled && opt_rtt_trace_v2;
+    if (rtt_graph_v2) {
+        sess->cur_graph_uid       = graph->uid;
+        sess->cur_graph_cache_hit = cache_hit;
+        sess->cur_graph_nodes     = (uint32_t) graph->n_nodes;
+        sess->cur_graph_prep_ns   = 0;
+        ++sess->rtt_n_graphs;
+        if (graph->uid != 0) {
+            sess->rtt_unique_uids.insert(graph->uid);
+        }
+        if (cache_hit) {
+            ++sess->rtt_n_cache_hits;
+        }
+    }
+
     if (cache_hit) {
         nodes_ptr = &sess->cached_nodes;
     } else {
+        uint64_t rtt_prep_t0_ns = 0;
+        if (rtt_graph_v2) {
+            rtt_prep_t0_ns = ggml_hexagon_rtt_now_ns();
+        }
+
         ggml_hexagon_graph_repack(graph, sess);
 
         htp_fusion_tag_graph(graph);
@@ -2521,6 +3120,34 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         } else {
             nodes_ptr = &computed_nodes;
         }
+
+        if (rtt_graph_v2) {
+            const uint64_t rtt_prep_ns = ggml_hexagon_rtt_now_ns() - rtt_prep_t0_ns;
+            sess->cur_graph_prep_ns = rtt_prep_ns;
+            sess->rtt_prep_ns      += rtt_prep_ns;
+        }
+    }
+
+    // =2 auto: decide before enqueue_op()/flush_batch() can submit the first
+    // batch.  The hint is per graph (and snapshot per batch in flush_batch),
+    // so a 4-row verify graph spins while a 128-token prefill blocks.  A graph
+    // with no compute nodes leaves the open batch state untouched.
+    if (opt_oppoll == 2 && !nodes_ptr->empty()) {
+        ggml_hexagon_oppoll_hint hint;
+        for (const auto & node : *nodes_ptr) {
+            ggml_hexagon_oppoll_add_htp_node(hint, node);
+        }
+        bool graph_poll = hint.poll_decode();
+        if (sess->op_batch->n_ops > 0) {
+            // Ops from an earlier graph are still open in this batch; spin only
+            // if both graphs are decode-sized (conservative if either is not).
+            graph_poll = graph_poll && sess->open_batch_poll;
+        }
+        sess->poll_decode     = graph_poll;
+        sess->open_batch_poll = graph_poll;
+        sess->n_tokens        = hint.have_candidate ? (uint32_t) hint.n_tokens : 0;
+        HEX_VERBOSE("ggml-hex: oppoll=2 poll_decode=%d n_tokens=%d\n",
+                    sess->poll_decode ? 1 : 0, (int) sess->n_tokens);
     }
 
     for (const auto & node : *nodes_ptr) {
@@ -3111,7 +3738,11 @@ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, cons
     } else {
         supp = ggml_backend_hexagon_buffer_type_get_alloc_size(&dev_ctx->buffer_type, op) <= sess->max_vmem;
         for (int i = 0; supp && i < GGML_MAX_SRC; i++) {
-            if (op->src[i] && ggml_backend_hexagon_buffer_type_get_alloc_size(&dev_ctx->buffer_type, op->src[i]) > sess->max_vmem) {
+            if (!op->src[i]) {
+                continue;
+            }
+            if ((ggml_hexagon_tensor_is_q3k_compact(op->src[i]) && (i != 0 || op->op != GGML_OP_MUL_MAT_ID)) ||
+                    ggml_backend_hexagon_buffer_type_get_alloc_size(&dev_ctx->buffer_type, op->src[i]) > sess->max_vmem) {
                 supp = false;
             }
         }
@@ -3373,21 +4004,75 @@ static size_t ggml_backend_hexagon_pack_moe_expert(void * dst, const void * src,
     return bytes;
 }
 
-static bool ggml_backend_hexagon_upload_moe_expert(ggml_tensor * tensor, int32_t slot, const void * data, size_t size) {
+static size_t ggml_backend_hexagon_pack_moe_expert_compact(void * dst, const void * src, int type, int64_t ne0, int64_t ne1) {
+    if (type != GGML_TYPE_Q3_K) {
+        return ggml_backend_hexagon_pack_moe_expert(dst, src, type, ne0, ne1);
+    }
+    if (ne0 <= 0 || ne0 > UINT32_MAX || ne0 % ggml_blck_size(GGML_TYPE_Q3_K) != 0 ||
+            ne1 <= 0 || ne1 > UINT32_MAX - 31 || ((dst == nullptr) != (src == nullptr))) {
+        return 0;
+    }
+    const size_t slab_size = htp_q3k_compact_slab_size((uint32_t) ne0);
+    const uint64_t slab_count = ((uint64_t) ne1 + 31) / 32;
+    if (!slab_size || slab_count > SIZE_MAX / slab_size) {
+        return 0;
+    }
+    if (dst) {
+        htp_repack_q3k_compact(dst, src, ne0, ne1);
+    }
+    return slab_count * slab_size;
+}
+
+static bool ggml_backend_hexagon_mark_moe_expert_compact(ggml_backend_buffer_type_t buft, ggml_tensor * tensor) {
+    if (!buft || buft->iface.get_alloc_size != ggml_backend_hexagon_buffer_type_get_alloc_size ||
+            !tensor || tensor->type != GGML_TYPE_Q3_K || tensor->buffer || tensor->view_src ||
+            tensor->ne[2] <= 0 || tensor->ne[3] != 1 || !ggml_is_contiguous(tensor)) {
+        return false;
+    }
+    auto * bt_ctx = static_cast<ggml_backend_hexagon_buffer_type_context *>(buft->context);
+    if (!bt_ctx || buft != &bt_ctx->dev_ctx->alloc_only_buffer_type) {
+        return false;
+    }
+    const size_t slot_size = ggml_backend_hexagon_pack_moe_expert_compact(
+        nullptr, nullptr, tensor->type, tensor->ne[0], tensor->ne[1]);
+    if (!slot_size || (uint64_t) tensor->ne[2] > UINT32_MAX / slot_size) {
+        return false;
+    }
+    auto * sess = bt_ctx->dev_ctx->session();
+    if (!sess->supports_compact_q3k() ||
+            std::any_of(sess->mdev.sessions.begin(), sess->mdev.sessions.end(),
+                    [](const auto & peer) { return !peer->supports_compact_q3k(); })) {
+        GGML_LOG_ERROR("ggml-hex: compact Q3_K requires a compatible DSP skeleton\n");
+        return false;
+    }
+    ggml_hexagon_tensor_mark_pending_compact(tensor);
+    return true;
+}
+
+static size_t ggml_backend_hexagon_moe_expert_slot_size(const ggml_tensor * tensor) {
     if (!tensor || !tensor->buffer || !ggml_backend_buffer_is_hexagon(tensor->buffer) ||
-        slot < 0 || slot >= tensor->ne[2] || tensor->ne[3] != 1 ||
-        size != (size_t) tensor->nb[2] || !htp_is_tiled_weight_type(tensor->type)) return false;
-    // Upload writes packed tiled bytes, so the destination must be the alloc-only
-    // slot bank (raw GGUF / host buffers cannot hold the padded tiled layout).
-    auto bt_ctx = static_cast<ggml_backend_hexagon_buffer_type_context *>(tensor->buffer->buft->context);
-    if (tensor->buffer->buft != &bt_ctx->dev_ctx->alloc_only_buffer_type) return false;
-    // alloc-only view initialization converts GGUF offsets to padded DSP offsets.
+            tensor->ne[2] <= 0 || tensor->ne[3] != 1 || !htp_is_tiled_weight_type(tensor->type)) {
+        return 0;
+    }
+    auto * buft = tensor->buffer->buft;
+    auto * bt_ctx = static_cast<ggml_backend_hexagon_buffer_type_context *>(buft->context);
+    return buft == &bt_ctx->dev_ctx->alloc_only_buffer_type ? ggml_hexagon_expert_slot_size(tensor) : 0;
+}
+
+static bool ggml_backend_hexagon_upload_moe_expert(ggml_tensor * tensor, int32_t slot, const void * data, size_t size) {
+    const size_t stride = ggml_backend_hexagon_moe_expert_slot_size(tensor);
+    if (!stride || slot < 0 || slot >= tensor->ne[2] || size != (size_t) tensor->nb[2]) {
+        return false;
+    }
     ggml_tensor slice = *tensor;
-    const size_t stride = htp_tiled_row_size(tensor->type, hex_round_up(tensor->ne[0], 32)) * hex_round_up(tensor->ne[1], 32);
     slice.ne[2] = slice.ne[3] = 1;
     slice.data = (uint8_t *) tensor->data + (size_t) slot * stride;
     ggml_hexagon_tensor_set_flags(&slice, HTP_TENSOR_TILED | HTP_TENSOR_WEIGHT);
-    htp_repack_tensor_tiled(&slice, data, size);
+    if (ggml_hexagon_tensor_is_q3k_compact(tensor)) {
+        htp_repack_q3k_compact(slice.data, data, slice.ne[0], slice.ne[1]);
+    } else {
+        htp_repack_tensor_tiled(&slice, data, size);
+    }
     // flags live in `tensor->extra` (an integer now), so mirror them onto the
     // real tensor: a slice copy would not update it and graph repacking would
     // otherwise re-tile already-tiled bytes.
@@ -3395,20 +4080,8 @@ static bool ggml_backend_hexagon_upload_moe_expert(ggml_tensor * tensor, int32_t
     return true;
 }
 
-// Arch accessor for the Android app: it decides between the full and the
-// reduced (low-vmem) MoE layout from the DSP version, so it must be queryable
-// without opening a session. Kept as a get_proc_address export because the
-// backend is loaded as a shared library.
-static int ggml_backend_hexagon_get_arch(ggml_backend_reg_t reg) {
-    GGML_UNUSED(reg);
-    return opt_arch;
-}
-
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
-    if (strcmp(name, "ggml_backend_hexagon_get_arch") == 0) {
-        return (void *) ggml_backend_hexagon_get_arch;
-    }
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
         return (void *) ggml_backend_hexagon_split_buffer_type;
     }
@@ -3420,6 +4093,15 @@ static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, cons
     }
     if (strcmp(name, "ggml_backend_pack_moe_expert") == 0) {
         return (void *) ggml_backend_hexagon_pack_moe_expert;
+    }
+    if (strcmp(name, "ggml_backend_pack_moe_expert_compact") == 0) {
+        return (void *) ggml_backend_hexagon_pack_moe_expert_compact;
+    }
+    if (strcmp(name, "ggml_backend_mark_moe_expert_compact") == 0) {
+        return (void *) ggml_backend_hexagon_mark_moe_expert_compact;
+    }
+    if (strcmp(name, "ggml_backend_moe_expert_slot_size") == 0) {
+        return (void *) ggml_backend_hexagon_moe_expert_slot_size;
     }
     if (strcmp(name, "ggml_backend_upload_moe_expert") == 0) {
         return (void *) ggml_backend_hexagon_upload_moe_expert;
@@ -3572,14 +4254,20 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_opqueue  = getenv("GGML_HEXAGON_OPQUEUE");
     const char * str_oppoll   = getenv("GGML_HEXAGON_OPPOLL");
     const char * str_opfusion = getenv("GGML_HEXAGON_OPFUSION");
+    const char * str_fuse_wnorm = getenv("GGML_HEXAGON_FUSE_WNORM");
     const char * str_rt_repack = getenv("GGML_HEXAGON_RT_REPACK");
     const char * str_opfilter = getenv("GGML_HEXAGON_OPFILTER");
     const char * str_profile  = getenv("GGML_HEXAGON_PROFILE");
+    const char * str_opbufstat = getenv("GGML_HEXAGON_OPBUFSTAT");
     const char * str_etm      = getenv("GGML_HEXAGON_ETM");
     const char * str_nhvx     = getenv("GGML_HEXAGON_NHVX");
     const char * str_nhmx     = getenv("GGML_HEXAGON_NHMX");
     const char * str_vtcm_size = getenv("GGML_HEXAGON_VTCM_SIZE");
     const char * str_mm_select = getenv("GGML_HEXAGON_MM_SELECT");
+    const char * str_moe_hmx_pipeline = getenv("GGML_HEXAGON_MOE_HMX_PIPELINE");
+    const char * str_moe_hmx_serial = getenv("GGML_HEXAGON_MOE_HMX_SERIAL");
+    const char * str_moe_hvx_max = getenv("GGML_HEXAGON_MOE_HVX_FIRST_MAX_NROWS");
+    const char * str_mm_dense_hvx_max_rows   = getenv("GGML_HEXAGON_MM_DENSE_HVX_MAX_ROWS");
     const char * str_fa_select = getenv("GGML_HEXAGON_FA_SELECT");
     const char * str_fa_split  = getenv("GGML_HEXAGON_FA_SPLIT");
     const char * str_li_select = getenv("GGML_HEXAGON_LI_SELECT");
@@ -3594,6 +4282,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_hostbuf  = getenv("GGML_HEXAGON_HOSTBUF");
     const char * str_dma64    = getenv("GGML_HEXAGON_DMA64");
     const char * str_power_mode = getenv("GGML_HEXAGON_POWER_MODE");
+    const char * str_rtt_trace  = getenv("GGML_HEXAGON_RTT_TRACE");
+    const char * str_rtt_trace_v2 = getenv("GGML_HEXAGON_RTT_TRACE_V2");
 
     // Init Arch first since it affects other defaults
     if (!str_arch) {
@@ -3630,10 +4320,22 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_opbatch   = str_opbatch  ? strtoul(str_opbatch, NULL, 0)          : opt_opbatch;
     opt_opqueue   = str_opqueue  ? strtoul(str_opqueue, NULL, 0)          : opt_opqueue;
     opt_optrace   = str_optrace  ? strtoul(str_optrace, NULL, 0)          : (opt_opbatch * HTP_TRACE_MAX_EVENTS + 131072);
-    opt_oppoll    = str_oppoll   ? strtoul(str_oppoll,  NULL, 0)          : opt_oppoll;
+    if (str_oppoll) {
+        bool clamped = false;
+        opt_oppoll = ggml_hexagon_oppoll_normalize(strtol(str_oppoll, NULL, 0), clamped);
+        if (clamped) {
+            GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_OPPOLL=%s is unsupported, using 2 (auto)\n", str_oppoll);
+        }
+    }
     opt_opfusion  = str_opfusion ? atoi(str_opfusion)                     : opt_opfusion;
+    opt_fuse_wnorm = str_fuse_wnorm ? atoi(str_fuse_wnorm)                : opt_fuse_wnorm;
     opt_rt_repack = str_rt_repack ? atoi(str_rt_repack)                   : opt_rt_repack;
     opt_profile   = str_profile  ? atoi(str_profile)                      : 0;
+    opt_opbufstat = str_opbufstat ? (atoi(str_opbufstat) != 0)            : 0;
+    if (opt_opbufstat) {
+        ggml_hexagon_opbufstat_register();
+        GGML_LOG_INFO("ggml-hex: opbuf stats enabled (GGML_HEXAGON_OPBUFSTAT=1): per-batch JSONL on stderr\n");
+    }
     opt_etm       = str_etm      ? atoi(str_etm)                          : 0;
     if (str_power_mode) {
         int m = htp_power_mode_from_str(str_power_mode);
@@ -3647,6 +4349,28 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_nhmx      = str_nhmx     ? atoi(str_nhmx)                         : opt_nhmx;
     opt_vtcm_size = str_vtcm_size ? parse_size(str_vtcm_size)                 : opt_vtcm_size;
     opt_mm_select = str_mm_select ? atoi(str_mm_select)                   : opt_mm_select;
+    opt_moe_hmx_pipeline = str_moe_hmx_pipeline && strcmp(str_moe_hmx_pipeline, "1") == 0;
+    opt_moe_hmx_serial   = str_moe_hmx_serial   && strcmp(str_moe_hmx_serial, "1") == 0;
+    if (str_moe_hvx_max && str_moe_hvx_max[0] != '\0') {
+        // strict parse: a typo must leave the auto policy in place, not silently pick a
+        // prefix of the string. Values outside [4, 4096] (incl. strtol saturation) are rejected.
+        char * end = nullptr;
+        const long v = strtol(str_moe_hvx_max, &end, 10);
+        if (end == str_moe_hvx_max || *end != '\0' || v < 4 || v > 4096) {
+            GGML_LOG_WARN("ggml-hex: GGML_HEXAGON_MOE_HVX_FIRST_MAX_NROWS='%s' is not an integer in [4, 4096], using auto\n",
+                    str_moe_hvx_max);
+        } else {
+            opt_mm_moe_hvx_first_max_nrows = (int) v;
+        }
+    }
+    // PR-06: dense narrow-batch window (-1 = derive from n_hvx, 0 = never, >0 = explicit m limit).
+    opt_mm_dense_hvx_max_rows = str_mm_dense_hvx_max_rows
+        ? atoi(str_mm_dense_hvx_max_rows)                                 : opt_mm_dense_hvx_max_rows;
+    if (str_mm_dense_hvx_max_rows) {
+        GGML_LOG_INFO("ggml-hex: dense HVX-first max rows = %d%s\n", opt_mm_dense_hvx_max_rows,
+                      opt_mm_dense_hvx_max_rows <  0 ? " (auto)"      :
+                      opt_mm_dense_hvx_max_rows == 0 ? " (disabled)"  : "");
+    }
     opt_fa_select = str_fa_select ? atoi(str_fa_select)                   : opt_fa_select;
     opt_fa_split  = str_fa_split  ? atoi(str_fa_split)                   : opt_fa_split;
     opt_li_select = str_li_select ? atoi(str_li_select)                   : opt_li_select;
@@ -3673,6 +4397,10 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     }
     opt_vmem    = str_vmem    ? parse_size(str_vmem)   : opt_vmem;
     opt_hostbuf = str_hostbuf ? atoi(str_hostbuf) != 0 : opt_hostbuf;
+    // Host-only RTT trace: empty string means disabled (same as unset).
+    opt_rtt_trace = (str_rtt_trace && str_rtt_trace[0] != '\0') ? str_rtt_trace : NULL;
+    // v2 is additive and opt-in; defaults to v1 even when a trace path is set.
+    opt_rtt_trace_v2 = str_rtt_trace_v2 ? (atoi(str_rtt_trace_v2) != 0) : 0;
 
     // Parse device configuration
     const char * str_devices  = getenv("GGML_HEXAGON_DEVICES");

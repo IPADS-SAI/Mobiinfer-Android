@@ -17,6 +17,10 @@ enum htp_fusion_flags {
     HTP_FUSE_RMS_NORM_SCALE  = (1 << 11), // 2048
     HTP_FUSE_SSM_CONV_SILU   = (1 << 12), // 4096
     HTP_FUSE_RMS_NORM_MUL_ADD = (1 << 13), // 8192
+    HTP_FUSE_SORT_COPY       = (1 << 14), // 16384 - reserved, rule rejected (TOP_K kernel is slower; see htp-fusion.cpp)
+    HTP_FUSE_CONCAT_COPY     = (1 << 15), // 32768
+    HTP_FUSE_SUM_CLAMP       = (1 << 16), // 65536
+    HTP_FUSE_ROWNORM_DIV     = (1 << 17), // 131072
 };
 
 static inline bool htp_fusion_enabled(int flag) {
@@ -24,6 +28,10 @@ static inline bool htp_fusion_enabled(int flag) {
     if (opt_opfusion == 1) return true; // 1 enables all
     return (opt_opfusion & flag) != 0;
 }
+
+// Opt-in via env, default ON: MoE top-k weight normalisation fusion (SUM_ROWS+CLAMP+DIV -> one op).
+// Set GGML_HEXAGON_FUSE_WNORM=0 to disable (kept for bisection).
+extern int opt_fuse_wnorm;
 
 bool htp_fusion_can_stack(const struct ggml_tensor * a);
 bool htp_fusion_can_stack(const struct ggml_tensor * a, const struct ggml_tensor * b);

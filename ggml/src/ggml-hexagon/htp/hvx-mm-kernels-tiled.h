@@ -707,8 +707,7 @@ static inline HVX_Vector scale_q6_k_32x1(HVX_VectorPair v_sums, HVX_Vector v_sca
 }
 
 // Q3_K / Q2_K: low 2 bits of k-group g, see HTP_TENSOR_TILE_SIZE_Q3_K
-static inline HVX_Vector unpack_q3_k_low2(const HVX_Vector * restrict vptr, int g, HVX_Vector mask_03) {
-    HVX_Vector v = vptr[g >> 2];
+static inline HVX_Vector unpack_q3_k_low2_plane(HVX_Vector v, int g, HVX_Vector mask_03) {
     if ((g & 3) == 3) {
         return Q6_Vub_vlsr_VubR(v, 6);
     }
@@ -718,15 +717,23 @@ static inline HVX_Vector unpack_q3_k_low2(const HVX_Vector * restrict vptr, int 
     return Q6_V_vand_VV(v, mask_03);
 }
 
+static inline HVX_Vector unpack_q3_k_low2(const HVX_Vector * restrict vptr, int g, HVX_Vector mask_03) {
+    return unpack_q3_k_low2_plane(vptr[g >> 2], g, mask_03);
+}
+
 // Q3_K k-group g as signed bytes: low2 | 0xFC (= low2 - 4) where bit g of vector 2 is set
+static inline HVX_Vector unpack_q3_k_group_planes(HVX_Vector v_lo, HVX_Vector v_neg, int g, HVX_Vector mask_03) {
+    HVX_VectorPred q_neg = Q6_Q_vand_VR(v_neg, 0x01010101u << g);
+    return Q6_V_vandor_VQR(unpack_q3_k_low2_plane(v_lo, g, mask_03), q_neg, 0xFCFCFCFC);
+}
+
 static inline HVX_Vector unpack_q3_k_group(const HVX_Vector * restrict vptr, int g, HVX_Vector mask_03) {
-    HVX_VectorPred q_neg = Q6_Q_vand_VR(vptr[2], 0x01010101u << g);
-    return Q6_V_vandor_VQR(unpack_q3_k_low2(vptr, g, mask_03), q_neg, 0xFCFCFCFC);
+    return unpack_q3_k_group_planes(vptr[g >> 2], vptr[2], g, mask_03);
 }
 
 // same half split as accum_q6_k_32x1
 static inline HVX_VectorPair accum_q3_k_32x1(
-    const HVX_Vector * restrict vptr,
+    HVX_Vector v_q0, HVX_Vector v_q1, HVX_Vector v_neg,
     const HVX_Vector * restrict v_act
 ) {
     HVX_Vector v_sum_lo = Q6_V_vzero();
@@ -735,8 +742,8 @@ static inline HVX_VectorPair accum_q3_k_32x1(
 
     #pragma unroll
     for (int g = 0; g < 4; g++) {
-        HVX_Vector v_W_lo = unpack_q3_k_group(vptr, g,     mask_03);
-        HVX_Vector v_W_hi = unpack_q3_k_group(vptr, g + 4, mask_03);
+        HVX_Vector v_W_lo = unpack_q3_k_group_planes(v_q0, v_neg, g,     mask_03);
+        HVX_Vector v_W_hi = unpack_q3_k_group_planes(v_q1, v_neg, g + 4, mask_03);
         v_sum_lo = Q6_Vw_vrmpyacc_VwVbVb(v_sum_lo, v_W_lo, v_act[g]);
         v_sum_hi = Q6_Vw_vrmpyacc_VwVbVb(v_sum_hi, v_W_hi, v_act[g + 4]);
     }
@@ -1415,7 +1422,7 @@ static void tiled_vec_dot_q3_k_32x1(const uint32_t n, float * restrict s, const 
         const HVX_Vector * restrict vptr = (const HVX_Vector *) (tile_ptr + kt * 512);
         const HVX_Vector * restrict v_act = (const HVX_Vector *) (y_q + kt * 1152);
 
-        HVX_VectorPair v_sums = accum_q3_k_32x1(vptr, v_act);
+        HVX_VectorPair v_sums = accum_q3_k_32x1(vptr[0], vptr[1], vptr[2], v_act);
         v_sum_float = hvx_vec_add_f32_f32(v_sum_float, scale_q6_k_32x1(v_sums, vptr[3], v_act[8]));
     }
 
@@ -1424,6 +1431,65 @@ static void tiled_vec_dot_q3_k_32x1(const uint32_t n, float * restrict s, const 
     } else {
         hvx_vec_store_u(s, valid_rows * sizeof(float), v_sum_float);
     }
+}
+
+// Each compact tile uses two consecutive 32-byte columns of the scale bytes.
+static inline void q3_k_compact_load_scales(const uint8_t * group, HVX_VectorPred first_half,
+        HVX_Vector * v_d, HVX_Vector * v_low0, HVX_Vector * v_low1, HVX_Vector * v_high) {
+    const uint8_t * scales = group + HTP_Q3K_COMPACT_SCALES_OFFSET;
+    const HVX_Vector v_base = hvx_vmemu(group + HTP_Q3K_COMPACT_QUANTS_BYTES);
+    *v_d    = Q6_V_vmux_QVV(first_half, v_base, Q6_V_vror_VR(v_base, 64));
+    *v_low0 = hvx_vmemu(scales);
+    *v_low1 = hvx_vmemu(scales + 128);
+    *v_high = hvx_vmemu(scales + 256);
+}
+
+static inline HVX_Vector q3_k_compact_scales(HVX_Vector v_low, HVX_Vector v_high, HVX_Vector v_d, int kt) {
+    if (kt & 1) {
+        v_low  = Q6_V_vror_VR(v_low,  64);
+        v_high = Q6_V_vror_VR(v_high, 64);
+    }
+    if (kt >= 4) {
+        v_low = Q6_Vub_vlsr_VubR(v_low, 4);
+    }
+    v_low = Q6_V_vand_VV(v_low, Q6_Vb_vsplat_R(15));
+    v_high = Q6_Vub_vlsr_VubR(v_high, 2 * (kt / 2));
+    v_high = Q6_Vh_vasl_VhR(Q6_V_vand_VV(v_high, Q6_Vb_vsplat_R(3)), 4);
+
+    HVX_Vector v_scale = Q6_Vb_vsub_VbVb(Q6_V_vor_VV(v_low, v_high), Q6_Vb_vsplat_R(32));
+    HVX_Vector v_scale_h = Q6_V_lo_W(Q6_Wh_vunpack_Vb(v_scale));
+    // Match the legacy float product rounded to fp16, as in q2_k_unpack_scales.
+    return Q6_Vhf_equals_Wqf32(Q6_Wqf32_vmpy_VhfVhf(Q6_Vhf_equals_Vh(v_scale_h), v_d));
+}
+
+static void tiled_vec_dot_q3_k_compact_32x1(const uint32_t n, float * restrict s, const void * restrict vx, const void * restrict vy, uint32_t valid_rows, const float * restrict sz) {
+    const uint8_t * restrict group = vx;
+    const HVX_Vector * restrict v_act = vy;
+    const HVX_VectorPred first_half = Q6_Q_vsetq_R(64);
+    HVX_Vector v_sum_float = Q6_V_vzero();
+
+    for (uint32_t k = 0; k < n; k += 256, group += HTP_Q3K_COMPACT_GROUP_BYTES) {
+        HVX_Vector v_d, v_low0, v_low1, v_high;
+        q3_k_compact_load_scales(group, first_half, &v_d, &v_low0, &v_low1, &v_high);
+
+        #pragma unroll
+        for (int kt = 0; kt < 8; ++kt, v_act += 9) {
+            const uint8_t * tile = group + kt * (HTP_Q3K_COMPACT_QUANTS_BYTES / 8);
+            const HVX_Vector v_D = q3_k_compact_scales((kt & 2) ? v_low1 : v_low0, v_high, v_d, kt);
+            HVX_VectorPair v_sums = accum_q3_k_32x1(hvx_vmemu(tile), hvx_vmemu(tile + 128), hvx_vmemu(tile + 256), v_act);
+            // Keep the same fp32 rounding at each tile boundary as the legacy loop.
+            // The Hexagon compiler otherwise carries qf32 through the unrolled tiles.
+            HVX_Vector v_tile_sum = scale_q6_k_32x1(v_sums, v_D, v_act[8]);
+            __asm__ volatile("" : "+v"(v_tile_sum));
+            v_sum_float = hvx_vec_add_f32_f32(v_sum_float, v_tile_sum);
+            __asm__ volatile("" : "+v"(v_sum_float));
+        }
+    }
+
+    if (sz) {
+        v_sum_float = hvx_vec_add_f32_f32(v_sum_float, hvx_vmemu(sz));
+    }
+    hvx_vec_store_u(s, valid_rows * sizeof(float), v_sum_float);
 }
 
 static void tiled_vec_dot_q3_k_32x2(const uint32_t n, float * restrict s0, float * restrict s1, const void * restrict vx, const void * restrict vy0, const void * restrict vy1, uint32_t valid_rows, const float * restrict sz0, const float * restrict sz1) {
