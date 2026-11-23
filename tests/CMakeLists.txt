@@ -263,6 +263,7 @@ if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp)
     llama_build_and_test(test-quantize-fns.cpp)
+    llama_build_and_test(test-quantize-q1-0-weighted.cpp)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
 endif()
@@ -316,6 +317,13 @@ target_link_libraries(test-moe-ready PRIVATE Threads::Threads)
 llama_test(test-moe-ready)
 set_tests_properties(test-moe-ready PROPERTIES TIMEOUT 30)
 
+# LLAMA_MOE_EVICT / LLAMA_MOE_EVICT_LAYERS parsing; no model or backend needed.
+add_executable(test-moe-evict test-moe-evict.cpp)
+target_compile_features(test-moe-evict PRIVATE cxx_std_17)
+target_link_libraries(test-moe-evict PRIVATE Threads::Threads)
+llama_test(test-moe-evict)
+set_tests_properties(test-moe-evict PROPERTIES TIMEOUT 30)
+
 # Shared expert IO budget and exact-ticket priority inheritance; no model needed.
 add_executable(test-moe-io-admission test-moe-io-admission.cpp)
 target_link_libraries(test-moe-io-admission PRIVATE Threads::Threads)
@@ -327,3 +335,65 @@ add_executable(test-moe-live-union test-moe-live-union.cpp)
 target_include_directories(test-moe-live-union PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_test(test-moe-live-union)
 set_tests_properties(test-moe-live-union PROPERTIES TIMEOUT 30)
+
+# Graph-level acceptance test for the Hexagon (HTP) op-fusion rules that test-backend-ops cannot
+# cover (its cases are single-op graphs, so no consumer chain and no fusion). Runs each minimal
+# graph on HTP and on CPU and compares, and counts the backend's own "fused <NAME>" log lines.
+# See exps/op-bench-20261120/FUSION_TEST.md for the run protocol.
+if (GGML_HEXAGON)
+    add_executable(test-hexagon-fusion test-hexagon-fusion.cpp)
+    target_link_libraries(test-hexagon-fusion PRIVATE ggml)
+    if (LLAMA_TESTS_INSTALL)
+        install(TARGETS test-hexagon-fusion RUNTIME)
+    endif()
+endif()
+# R4a 预读读合并：空 batch / 连续/间隔 run / run > max / 跨层拒绝 /
+# 部分读整段回退 / MERGE_PREFETCH=0|1|2 语义（纯函数，不需要模型/后端）。
+add_executable(test-moe-prefetch-merge test-moe-prefetch-merge.cpp)
+target_include_directories(test-moe-prefetch-merge PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-moe-prefetch-merge)
+set_tests_properties(test-moe-prefetch-merge PROPERTIES TIMEOUT 30)
+
+# R4a 随机差分 + 系统化失败注入 + 8 线程并发 batch + 调用方边界约定。
+# 纯 host（固定 seed；TIMEOUT 60s 兜住并发死锁）。
+add_executable(test-moe-prefetch-merge-fuzz test-moe-prefetch-merge-fuzz.cpp)
+target_include_directories(test-moe-prefetch-merge-fuzz PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-moe-prefetch-merge-fuzz PRIVATE Threads::Threads)
+llama_test(test-moe-prefetch-merge-fuzz)
+set_tests_properties(test-moe-prefetch-merge-fuzz PROPERTIES TIMEOUT 60)
+
+# layer-window / evict / prefetch 配置解析（纯函数）：空串、非法项、越界层号、
+# 负 depth、BANK 太小、REFRESH 前置条件。不需要模型、后端或线程。
+add_executable(test-moe-config test-moe-config.cpp)
+target_include_directories(test-moe-config PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-moe-config)
+set_tests_properties(test-moe-config PROPERTIES TIMEOUT 30)
+
+# T-0326：opbuf 复用位图 64 位 helper（纯头文件）：0/31/32/63 边界、位独立性、
+# 越界索引安全、全 64 位置位/清除。不需要模型、后端或 DSP。
+add_executable(test-opbuf-mask test-opbuf-mask.cpp)
+target_include_directories(test-opbuf-mask PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-hexagon/htp)
+llama_test(test-opbuf-mask)
+set_tests_properties(test-opbuf-mask PROPERTIES TIMEOUT 30)
+
+# T-0327：RTT v1/v2 JSON 格式化（纯头文件）：v1 与历史 fprintf 逐字节一致、
+# v2 追加 graph 字段、dropped 记录字段为 null、数字不走科学计数/locale。
+add_executable(test-hexagon-rtt test-hexagon-rtt.cpp)
+target_include_directories(test-hexagon-rtt PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-hexagon)
+llama_test(test-hexagon-rtt)
+set_tests_properties(test-hexagon-rtt PROPERTIES TIMEOUT 30)
+
+# R4a 合并门控真值表（纯函数）：MERGE_READS × MERGE_PREFETCH × io_budget ×
+# read_mode × managed，n>1 的 162 组 + n==1 的 162 组；reason 优先级固定。
+add_executable(test-moe-merge-gate test-moe-merge-gate.cpp)
+target_include_directories(test-moe-merge-gate PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-moe-merge-gate)
+set_tests_properties(test-moe-merge-gate PROPERTIES TIMEOUT 30)
+
+# R4a demand 读路径硬化（纯函数 + 临时文件）：O_DIRECT 非对齐判据、缓冲回退、
+# 合并读 false/异常时非 managed 逐专家各读一次、managed 保持 fail-all + rethrow。
+add_executable(test-moe-merge-read-hardening test-moe-merge-read-hardening.cpp)
+target_include_directories(test-moe-merge-read-hardening PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_test(test-moe-merge-read-hardening)
+set_tests_properties(test-moe-merge-read-hardening PROPERTIES TIMEOUT 60)
+

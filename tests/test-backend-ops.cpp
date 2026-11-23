@@ -8614,6 +8614,95 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1));
+
+    // ---- exps/op-bench-20261120: real MiniCPM-V 4.7 (qwen35moe) shapes ----
+    // Shapes taken from vivo on-device `GGML_HEXAGON_PROFILE=1` op traces
+    // (2026-11-20, runs/prof2-h8-n8.err), not guesses:
+    //   MUL_MAT_ID(_NX) : q3_K, 88-slot window, top-8, b=true, gate/up (K=2048,N=512),
+    //                     down (K=512,N=2048)
+    //   MUL_MAT dense   : q8_0 attn_qkv 2048x8192, attn_output 2048x2048,
+    //                     ffn gate/up 2048x6144, ffn_down 6144x2048;
+    //                     q6_K vocab projection 248144x2048
+    // Keep this list small: every entry costs phone time in perf mode.
+    for (int64_t n_tok : {1, 4, 5}) {
+        // gate/up and down separately (they are two distinct dispatches in the graph)
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 88, 8, true, 512, n_tok, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 88, 8, true, 2048, n_tok, 512));
+        // gate+up fusion -> MUL_MAT_ID_NX
+        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_Q3_K, GGML_TYPE_F32, 88, 8, true, 512, n_tok, 2048, 2, false));
+    }
+    // top-k sweep at fixed n=4 (bandwidth vs per-op fixed cost): marginal us per used expert
+    for (int n_used : {1, 2, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 88, n_used, true, 512, 4, 2048));
+    }
+    // dense: vocab projection (q6_K) dominates prefill/verify, attn/ffn are q8_0
+    // (248144-wide vocab kept out of the eval list on purpose: MODE_TEST builds a
+    //  f32 CPU reference -> >2.4GB peak -> the phone gets OOM-killed; perf-only)
+    // (248144-wide vocab kept out of the eval list on purpose: MODE_TEST builds a
+    //  f32 CPU reference -> >2.4GB peak -> the phone gets OOM-killed; perf-only)
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   8192, 1, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   2048, 1, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   6144, 1, 2048, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32,   2048, 1, 6144, {1, 1}, {1, 1}));
+
+    // ---- exps/op-bench-20261120: GDN / FLASH_ATTN_EXT / SSM_CONV real shapes ----
+    // qwen35moe linear-attention (GDN) + sliding-window FA + conv, shapes from
+    // vivo on-device profile (runs/prof2-h8-n8.err) and dev-gdn-fa's op trace.
+    // GDN: 16 heads x 128, v_repeat=2, n_tok 1/2/4, snapshot K=1 vs K=n_tok
+    //      (K>1 = last-K state snapshots => the verify-path state cost).
+    for (int64_t n_tok : {1, 2, 4}) {
+        for (int64_t snap : {int64_t(1), n_tok}) {
+            if (snap > 1 && snap != n_tok) continue;
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32,
+                /*head_count*/ 16, /*head_size*/ 128, /*n_seq_tokens*/ n_tok, /*n_seqs*/ 1,
+                /*v_repeat*/ 2, /*permuted*/ false, /*kda*/ false, /*K*/ snap));
+        }
+    }
+    // FA: hd=256, 16 q heads / 2 kv heads (GQA 8x), KV=f16, causal mask,
+    //     n_tok 1/2/4 x seq 256/512/2048/4096
+    for (int64_t n_tok : {1, 2, 4}) {
+        for (int64_t seq : {256, 512, 2048, 4096}) {
+            test_cases.emplace_back(new test_flash_attn_ext(
+                /*hsk*/ 256, /*hsv*/ 256, /*nh*/ 2, /*nr23*/ {8, 1}, /*kv*/ seq, /*nb*/ n_tok,
+                /*mask*/ true, /*sinks*/ false, /*max_bias*/ 0.0f, /*logit_softcap*/ 0.0f,
+                GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+    // SSM_CONV: conv_kernel=4, d_conv=8192, n_tok 2/4 -> ne_a = {n_tok+3, 8192}
+    for (int64_t n_tok : {2, 4}) {
+        test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32,
+            /*ne_a*/ {n_tok + 3, 8192, 1, 1}, /*ne_b*/ {4, 8192, 1, 1}));
+    }
+
+    // audit: GDN real vivo shape is (16 heads, 128, v_repeat 2) with K>1 snapshot
+    // write-back (524288 = 128*128*32); dev-gdn's patch only fires when target_slot>0.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1, 1, 2, false, false, 4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 4, 1, 2, false, false, 4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 5, 1, 2, false, false, 4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 18, 1, 2, false, false, 4)); // largest vivo档
+
+    // ---- exps/op-bench-20261120: real MoE down projection is b=FALSE ----
+    // audit (2026-11-20): the on-device trace shows down's src1 is
+    //   [K=512, n_used=8, n_tok]  -> b=false, NOT the broadcast b=true path.
+    // gate/up IS b=true (src1 [K,1,n_tok]). Different dispatch branch -> must cover.
+    for (int64_t n_tok : {1, 4, 5}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 88, 8, false, 2048, n_tok, 512));
+    }
+
+    // ---- exps/op-bench-20261120: dense dispatch sweep (HMX vs HVX) ----
+    // dev-dense-matmul: main's HTP_MM_HMX_MIN_NROWS=4 sends n>=5 to HMX, and
+    // HMX looks slower than HVX at n=5 than at n=18 (padding overhead).
+    // Shapes are the real per-layer projections from the on-device profile.
+    // NOTE: the 248144-wide vocab projection (q6_K, and the draft q8_0 head) is
+    // deliberately kept OUT of the eval list: MODE_TEST materialises an f32 CPU
+    // reference (248144x2048 f32 = 2.03 GB) and the phone gets OOM-killed.
+    // Those shapes live in make_test_cases_perf() only (perf needs no reference).
+    for (int64_t n_tok : {1, 4, 5}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,   8192, n_tok, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,   8192, n_tok, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,   4096, n_tok, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32,    256, n_tok, 2048, {1, 1}, {1, 1})); // router logits
+    }
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
 
     // gpt-oss issue with Vulkan mmq_id
@@ -9288,6 +9377,48 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // ==== exps/op-bench-20261120: real MiniCPM-V 4.7 (qwen35moe) on-device shapes ====
+    // perf mode reads THIS list only; shapes come from GGML_HEXAGON_PROFILE on vivo
+    // (runs/prof2-h8-n8.err). Keep it lean: every case costs phone time.
+    // MoE: q3_K, 88-slot window, top-8. gate/up is b=true, down is b=FALSE.
+    for (int64_t n_tok : {1, 2, 4, 5}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 88, 8, true,  512, n_tok, 2048)); // gate/up
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 88, 8, false, 2048, n_tok, 512)); // down
+        test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_Q3_K, GGML_TYPE_F32, 88, 8, true, 512, n_tok, 2048, 2, false)); // -> MUL_MAT_ID_NX
+    }
+    // n_used (unique experts) sweep at the production n=4: slope vs intercept
+    for (int n_used : {1, 2, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 88, n_used, true, 512, 4, 2048));
+    }
+    // dense projections: q6_K vocab (DDR peak ruler), q4_K/q6_K GEMV, f32 router, q8_0 draft head
+    for (int64_t n_tok : {1, 4, 5, 18}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248144, n_tok, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,   8192, n_tok, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,   8192, n_tok, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,   4096, n_tok, 2048, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32,    256, n_tok, 2048, {1, 1}, {1, 1}));
+    }
+    for (int64_t n_tok : {1, 4}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 248144, n_tok, 256, {1, 1}, {1, 1}));
+    }
+    // GDN (linear attn): 16 heads x 128, v_repeat 2; K>1 = state snapshot write-back
+    for (int64_t n_tok : {1, 2, 4, 5}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_tok, 1, 2, false, false, 1));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_tok, 1, 2, false, false, n_tok));
+    }
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 18, 1, 2, false, false, 4));
+    // FLASH_ATTN_EXT: hd=256, 16 q / 2 kv heads, f16 KV, causal mask
+    for (int64_t n_tok : {1, 4}) {
+        for (int64_t seq : {256, 512, 2048, 4096}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, seq, n_tok, true, false,
+                                                            0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
+    // SSM_CONV: conv_kernel=4, d_conv=8192
+    for (int64_t n_tok : {2, 4}) {
+        test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {n_tok + 3, 8192, 1, 1}, {4, 8192, 1, 1}));
+    }
 
     // LEAKY_RELU at FFN activation width, for direct comparison with RELU
     for (int64_t n_tokens : {512, 2048}) {
