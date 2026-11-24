@@ -218,7 +218,7 @@
     <string name="tts_baselm_missing">BaseLM GGUF 文件不存在，请下载模型</string>
     <string name="tts_acoustic_missing">Acoustic GGUF 文件不存在，请下载模型</string>
     <string name="memory_budget_title">运行内存预算</string>
-    <string name="memory_budget_description">MiniCPM-V 4.7 专用，修改后会在下次发送消息时自动重新加载模型。默认预算为8.0 GB，调低预算会减少专家缓存；低 VMEM Hexagon 设备使用固定的紧凑缓存。1 GB = 10亿字节；实际占用随输入变化。上限按设备物理内存计算并为系统预留空间，最高13.0 GB；这不是操作系统强制的进程内存限制。</string>
+    <string name="memory_budget_description">MiniCPM-V 4.7 专用，修改后会在下次发送消息时自动重新加载模型。默认预算为8.0 GB，调低预算会减少专家缓存；低 VMEM Hexagon 设备使用固定的紧凑缓存。1 GB = 10亿字节；实际占用随输入变化。上限为设备物理内存减去3 GB（为系统预留），最高21.0 GB；但每层只有256个专家，专家缓存窗口到约16 GB后即已填满，再往上调不会再加速。这不是操作系统强制的进程内存限制。</string>
     <string name="memory_budget_value">%1$.1f GB</string>
     <string name="memory_budget_use_max">使用设备最大</string>
     <string name="context_size_title">上下文长度</string>
@@ -238,6 +238,8 @@
     <string name="model_running">运行中</string>
     <string name="eta_unknown">计算中…</string>
     <string name="model_desc_qwen35_35b">Qwen3.5 35B-A3B 端侧 MoE 模型；一键下载主模型、DFlash 草稿和 40 层专家</string>
+    <string name="model_desc_qwen35_35b_q2k">Qwen3.5 35B-A3B 端侧 MoE 低内存档；主模型与专家为 Q2_K，一键下载主模型、视觉投影、DFlash 草稿和 41 层专家</string>
+    <string name="model_desc_qwen35_35b_q3km">Qwen3.5 35B-A3B 端侧 MoE 中档精度；主模型与专家为 Q3_K_M（imatrix 加权），体积比 Q2_K 大约 33%，一键下载主模型、视觉投影、DFlash 草稿和 41 层专家</string>
     <string name="model_desc_qwen3_30b">Qwen3-30B-A3B 端侧 MoE 模型（qwen3moe）；一键下载主模型和 48 层专家</string>
     <string name="model_desc_sage_a1_5">Sage-A1.5 35B-A3B 端侧 MoE 模型（qwen35moe）；一键下载主模型、视觉投影和 41 层专家</string>
     <string name="eta_hours_minutes">%1$d小时%2$d分钟</string>

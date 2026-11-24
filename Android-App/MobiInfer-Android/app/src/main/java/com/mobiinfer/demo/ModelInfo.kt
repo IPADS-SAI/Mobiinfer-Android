@@ -75,6 +75,11 @@ data class ModelInfo(
      * so this is only used to include the draft in the "is the model complete"
      * check ([LlamaEngine.modelsExist]) - without it a missing draft would be
      * silently treated as a complete download.
+     *
+     * It must also stay in sync with the bundle's checksum manifest: a bundle
+     * whose manifest lists a draft the app does not name here would still
+     * report "complete" while the engine silently falls back to autoregressive
+     * decoding.
      */
     val draftFileName: String? = null,
     /**
@@ -233,9 +238,16 @@ data class ModelInfo(
                 ggufFileName = "dense/minicpm47-q2kdense-q1exp-30tps.gguf",
                 expertsDirectory = "experts",
                 expertsLayerCount = 40,
+                // Q4_K_M DSpark draft paired with this Q2_K dense, enumerated by
+                // the bundle's SHA256SUMS so the downloader fetches it too.
+                // Without it the runtime finds no draft next to the main GGUF
+                // and silently decodes autoregressively.
+                draftFileName = "dense/dspark-MiniCPM-V-4_7-q2k-q4km.gguf",
                 msRepo = "fengerhu1/MiniCPM-V-4.7-35B-A3B-gguf-hexagon-q2k",
                 bundleManifestFile = "SHA256SUMS",
-                totalBytes = 11_848_726_683L
+                // Same convention as the other bundles: the payload total in
+                // decimal GB, excluding the checksum manifest itself.
+                totalBytes = 12_085_731_803L
             ),
             // MiniCPM-V 4.7 stays the default (DEFAULT_MODEL pins it by id); the
             // Q2_K pack above is offered first because it is the smallest bundle
@@ -288,6 +300,46 @@ data class ModelInfo(
                 imageMaxTokens = 1024,
                 defaultImageScaleFactor = 1.0f,
                 totalBytes = 25_064_701_899L
+            ),
+            // Same Qwen3.5-35B-A3B Hexagon bundle at the low-memory tier: Q2_K
+            // dense weights and Q2_K/Q3_K experts, imatrix-weighted. 41 tiled
+            // layers, i.e. the 40 blocks plus the MTP layer.
+            ModelInfo(
+                id = "qwen35-35b-a3b-q2k",
+                displayName = "Qwen3.5-35B-A3B (Q2_K, NPU)",
+                descriptionResName = "model_desc_qwen35_35b_q2k",
+                ggufFileName = "models/qwen35-les-hexagon.gguf",
+                mmprojFileName = "models/mmproj-Qwen3.5-35B-A3B-Q8_0.gguf",
+                expertsDirectory = "experts-htp-tiled",
+                expertsLayerCount = 41,
+                draftFileName = "models/Qwen3.5-35B-A3B-DFlash-Q8_0.gguf",
+                msRepo = "fengerhu1/Qwen3.5-35B-A3B-gguf-hexagon-q2k",
+                bundleManifestFile = "SHA256SUMS",
+                imageMinTokens = 1024,
+                imageMaxTokens = 1024,
+                defaultImageScaleFactor = 1.0f,
+                totalBytes = 15_056_375_978L
+            ),
+            // Same Qwen3.5-35B-A3B Hexagon bundle at the mid quality tier: Q3_K_M
+            // dense weights and experts, imatrix-weighted. 41 tiled layers, i.e.
+            // the 40 blocks plus the MTP layer. Higher precision than the Q2_K
+            // tier at ~33% more disk; measured draft acceptance is slightly lower
+            // than Q2_K on A100, so this tier trades size for fidelity, not speed.
+            ModelInfo(
+                id = "qwen35-35b-a3b-q3km",
+                displayName = "Qwen3.5-35B-A3B (Q3_K_M, NPU)",
+                descriptionResName = "model_desc_qwen35_35b_q3km",
+                ggufFileName = "models/qwen35-les-hexagon.gguf",
+                mmprojFileName = "models/mmproj-Qwen3.5-35B-A3B-Q8_0.gguf",
+                expertsDirectory = "experts-htp-tiled",
+                expertsLayerCount = 41,
+                draftFileName = "models/Qwen3.5-35B-A3B-DFlash-Q8_0.gguf",
+                msRepo = "fengerhu1/Qwen3.5-35B-A3B-gguf-hexagon-q3km",
+                bundleManifestFile = "SHA256SUMS",
+                imageMinTokens = 1024,
+                imageMaxTokens = 1024,
+                defaultImageScaleFactor = 1.0f,
+                totalBytes = 20_437_552_395L
             ),
             // Qwen3-30B-A3B (qwen3moe) Hexagon bundle: text-only MoE, no draft and
             // no mmproj. Same hexagon-tiled-v1 expert layout (48 layers).
