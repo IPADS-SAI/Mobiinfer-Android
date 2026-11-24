@@ -306,9 +306,13 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
             p.speculative.draft.mparams.path = draft_path;
             p.speculative.draft.n_gpu_layers = 99;
             p.speculative.draft.devices = p.devices;
-            // DFlash is fastest at n_max=5; DSpark keeps the memory-config value.
+            // DFlash defaults to n_max=3; DSpark keeps the memory-config value.
+            // Measured on vivo (Qwen3.5-35B-A3B Q2_K/Q3_K_M, chat template,
+            // thinking=0, temp=0): acceptance falls off steeply with draft length
+            // (n_max=1/3/5/7 -> 85/75/63/45 %), so the longest drafts rarely land.
+            // An explicit runtime.json "draft_n_max" still overrides this.
             const int default_n_max = spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH
-                ? 5 : memory.draft;
+                ? 3 : memory.draft;
             p.speculative.draft.n_max = cfg_draft_n_max > 0 ? cfg_draft_n_max : default_n_max;
             if ((spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK ||
                  spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) &&
