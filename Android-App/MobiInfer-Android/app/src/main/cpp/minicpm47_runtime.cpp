@@ -261,7 +261,24 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
             draft_path = config.value("draft", std::string());
             spec_override = config.value("speculative_type", std::string());
         }
-        if (draft_path.empty()) {
+        // Qwen3.5 ships an MTP head inside the target GGUF. With an explicit
+        // "speculative_type": "mtp" the engine builds a second context on the
+        // *target* model and drafts with that head, so no draft GGUF is needed
+        // (and passing one would make the engine build the MTP context from the
+        // draft model instead, which has no MTP tensors).
+        std::string spec_probe = spec_override;
+        std::transform(spec_probe.begin(), spec_probe.end(), spec_probe.begin(),
+                       [](unsigned char c) { return (char) std::tolower(c); });
+        const bool mtp_self = spec_probe.find("mtp") != std::string::npos;
+
+        if (mtp_self) {
+            p.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
+            p.speculative.draft.mparams.path.clear();
+            p.speculative.draft.n_max = cfg_draft_n_max > 0 ? cfg_draft_n_max : memory.draft;
+            p.speculative.draft.cpuparams.n_threads = p.speculative.draft.cpuparams_batch.n_threads = 4;
+            LOGi("MiniCPM47 runtime: speculative type = draft-mtp (target MTP head, no draft model, n_max=%d)",
+                 p.speculative.draft.n_max);
+        } else if (draft_path.empty()) {
             std::error_code ec;
             for (const auto & entry : std::filesystem::directory_iterator(dir, ec)) {
                 if (!entry.is_regular_file()) continue;
@@ -275,7 +292,9 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
                 }
             }
         }
-        if (draft_path.empty()) {
+        if (mtp_self) {
+            // handled above
+        } else if (draft_path.empty()) {
             LOGw("MiniCPM47 runtime: no draft GGUF found in %s; disabling speculative decoding", dir.c_str());
             impl->dspark = false;
         } else {
