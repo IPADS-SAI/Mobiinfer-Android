@@ -8,7 +8,7 @@
 
 **在手机上本地运行 35B 级 MoE 大模型**
 
-[![Release](https://img.shields.io/badge/release-v0.4.6-blue)](https://github.com/IPADS-SAI/Mobiinfer-Android/releases)
+[![Release](https://img.shields.io/badge/release-v0.4.7-blue)](https://github.com/IPADS-SAI/Mobiinfer-Android/releases)
 [![Platform](https://img.shields.io/badge/platform-Android%20%7C%20Snapdragon-3DDC84)](#)
 [![Backend](https://img.shields.io/badge/backend-Hexagon%20NPU%20(HTP)-blue)](#)
 [![Base](https://img.shields.io/badge/built%20on-llama.cpp--omni-orange)](#)
@@ -22,6 +22,7 @@
 
 ## 最新动态
 
+- [2026.11.24] 📦 **发布 MobiInfer-Android v0.4.7，Qwen3.5-35B-A3B 增加 Q2_K / Q3_K_M 两档**
 - [2026.11.23] 🚀 **发布 MobiInfer-Android v0.4.6，Q2 tiled 专家包把 35B-A3B 解码推到 31.1 tok/s**
 - [2026.11.11] 🚀 **发布 MobiInfer-Android v0.4.5，MiniCPM-V 4.7 MoE 解码峰值 23.3 tok/s**
   - ⚡ **跨层专家流水**：专家读盘改走 O_DIRECT，提前 2 层提交 gate 预测（H+2），每专家独立任务队列 + 常驻读线程，把 I/O 藏进计算里；同机同 prompt 解码 23.3 tok/s。

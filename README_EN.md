@@ -8,7 +8,7 @@
 
 **Running a 35B-class MoE locally on a phone**
 
-[![Release](https://img.shields.io/badge/release-v0.4.6-blue)](https://github.com/IPADS-SAI/Mobiinfer-Android/releases)
+[![Release](https://img.shields.io/badge/release-v0.4.7-blue)](https://github.com/IPADS-SAI/Mobiinfer-Android/releases)
 [![Platform](https://img.shields.io/badge/platform-Android%20%7C%20Snapdragon-3DDC84)](#)
 [![Backend](https://img.shields.io/badge/backend-Hexagon%20NPU%20(HTP)-blue)](#)
 [![Base](https://img.shields.io/badge/built%20on-llama.cpp--omni-orange)](#)
@@ -22,6 +22,7 @@
 
 ## News
 
+- [2026.11.24] 📦 **MobiInfer-Android v0.4.7: Qwen3.5-35B-A3B gains Q2_K and Q3_K_M tiers**
 - [2026.11.23] 🚀 **MobiInfer-Android v0.4.6: the Q2 tiled expert pack lifts 35B-A3B decode to 31.1 tok/s**
 - [2026.11.11] 🚀 **MobiInfer-Android v0.4.5: MiniCPM-V 4.7 MoE decode peaks at 23.3 tok/s**
   - ⚡ **Cross-layer expert pipeline**: O_DIRECT expert reads, gate predictions submitted two layers ahead (H+2), one FIFO task per expert with resident reader threads — the I/O is hidden under compute. Same device, same prompt: 23.3 tok/s.
