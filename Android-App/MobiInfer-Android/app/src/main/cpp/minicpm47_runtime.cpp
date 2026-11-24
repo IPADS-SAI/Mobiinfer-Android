@@ -5,6 +5,7 @@
 #include "speculative.h"
 #include "chat.h"
 #include "log.h"
+#include <sys/system_properties.h> // TEMP-DIAG
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cctype>
@@ -92,8 +93,13 @@ struct MiniCPM47Runtime::Impl {
     int cache_slots = 0;
     int ready = 1;    // LLAMA_MOE_EXPERT_READY (runtime.json "ready")
     int refresh = 1;  // LLAMA_MOE_PREFETCH_REFRESH (runtime.json "refresh")
+    bool raw_prompt = false;  // runtime.json "raw_prompt" (skip chat template)
+    bool prompt_dump = false; // runtime.json "prompt_dump" (write prompt_dump.txt)
+    bool logits_dump = false; // runtime.json "logits_dump" (log top-8 of the last prompt row)
+    bool tdump = false;       // runtime.json "tdump" -> LLAMA_TDUMP (per-tensor activation dump)
     bool context_truncated = false;
-    std::array<double, 5> last_performance_stats = {0.0, 0.0, 0.0, 0.0, 0.0};
+    // [prompt_ms, prompt_n, decode_ms, decode_n, vision_encode_ms, draft_n, draft_n_accepted]
+    std::array<double, 7> last_performance_stats = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
 
     void finish() {
         if (!response.empty() || !reasoning.empty()) {
@@ -140,6 +146,7 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
     const auto dir = model.substr(0, model.find_last_of('/'));
     impl->directory = dir;
     int cfg_draft_n_max = -1;
+    int cfg_draft_n_min = -1; // TEMP-DIAG: spec probe (force n_max drafts per cycle)
     int cfg_batch       = 0;
     std::string cfg_layer_windows;
     std::string cfg_prewarm;
@@ -154,6 +161,11 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
         impl->benchmark_max_tokens = config.value("max_tokens", 0);
         impl->benchmark_eager_mmproj = config.value("eager_mmproj", true);
         cfg_draft_n_max = config.value("draft_n_max", -1);
+        cfg_draft_n_min = config.value("draft_n_min", -1); // TEMP-DIAG
+        impl->raw_prompt = config.value("raw_prompt", 0) != 0; // TEMP-DIAG
+        impl->prompt_dump = config.value("prompt_dump", 0) != 0; // TEMP-DIAG
+        impl->logits_dump = config.value("logits_dump", 0) != 0; // TEMP-DIAG
+        impl->tdump = config.value("tdump", 0) != 0; // TEMP-DIAG
         cfg_batch       = config.value("batch", 0);
         impl->ready     = config.value("ready", 1);
         impl->refresh   = config.value("refresh", 1);
@@ -306,14 +318,22 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
             p.speculative.draft.mparams.path = draft_path;
             p.speculative.draft.n_gpu_layers = 99;
             p.speculative.draft.devices = p.devices;
-            // DFlash defaults to n_max=3; DSpark keeps the memory-config value.
-            // Measured on vivo (Qwen3.5-35B-A3B Q2_K/Q3_K_M, chat template,
-            // thinking=0, temp=0): acceptance falls off steeply with draft length
-            // (n_max=1/3/5/7 -> 85/75/63/45 %), so the longest drafts rarely land.
-            // An explicit runtime.json "draft_n_max" still overrides this.
+            // DSpark keeps the memory-config value; DFlash defaults to n_max=5.
+            // Measured on vivo (Qwen3.5-35B-A3B Q2_K, same prompt, chat template,
+            // thinking=0, temp=0): per-round acceptance falls off with draft length
+            // (n_max=1/3/5/7 -> 85/76/63/45 %) but the accepted tokens per round
+            // (1.00/2.27/3.14/3.16) and the measured decode (17.80/19.27/21.02/19.92
+            // tok/s) both peak at n_max=5, so shorter drafts waste the verify pass
+            // and longer ones rarely land. An explicit runtime.json "draft_n_max"
+            // still overrides this.
             const int default_n_max = spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH
-                ? 3 : memory.draft;
+                ? 5 : memory.draft;
             p.speculative.draft.n_max = cfg_draft_n_max > 0 ? cfg_draft_n_max : default_n_max;
+            // TEMP-DIAG (task B): pin n_min so every cycle drafts exactly n_max tokens.
+            if (cfg_draft_n_min >= 0) {
+                p.speculative.draft.n_min = cfg_draft_n_min;
+                LOGi("MiniCPM47 runtime: TEMP-DIAG draft_n_min = %d", cfg_draft_n_min);
+            }
             if ((spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK ||
                  spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) &&
                 p.speculative.draft.n_max >= p.n_ubatch) {
@@ -362,6 +382,55 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
     setenv("LLAMA_MOE_PREFILL_WARM_ROWS", "0", 1);
     setenv("LLAMA_MOE_PREFETCH_MAX_ROWS", "8", 1);
     setenv("LLAMA_MOE_PREFILL_SORT_READS", "1", 1);
+    // TEMP-DIAG (task B): pass through one-binary HTP kernel selectors when set on
+    // the shell (adb shell setprop debug.mobiinfer.hex_env "..."). Never needed for
+    // normal use; unset property == no change.
+    {
+        static const char * const kPassKeys[] = {
+            "GGML_HEXAGON_MM_SELECT", "GGML_HEXAGON_MM_DENSE_HVX_MAX_ROWS",
+            "GGML_HEXAGON_MOE_HVX_FIRST_MAX_NROWS", "GGML_HEXAGON_OPFUSION",
+            "GGML_HEXAGON_VERBOSE", "GGML_HEXAGON_FA_SELECT", "GGML_HEXAGON_OPFILTER",
+            "GGML_HEXAGON_DIAG_MM", "LLAMA_SPEC_PROBE",
+        };
+        char spec_probe_prop[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.mobiinfer.hex_env", spec_probe_prop);
+        if (spec_probe_prop[0] != '\0') {
+            std::string spec(spec_probe_prop);
+            size_t pos = 0;
+            while (pos < spec.size()) {
+                const size_t end = spec.find_first_of(" ;,", pos);
+                std::string tok = spec.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+                const size_t eq = tok.find('=');
+                if (eq != std::string::npos && eq > 0) {
+                    for (const char * key : kPassKeys) {
+                        if (tok.compare(0, eq, key) == 0) {
+                            setenv(key, tok.c_str() + eq + 1, 1);
+                            LOGi("MiniCPM47 runtime: TEMP-DIAG %s", tok.c_str());
+                        }
+                    }
+                }
+                if (end == std::string::npos) {
+                    break;
+                }
+                pos = end + 1;
+            }
+        }
+        char spec_probe_path[PROP_VALUE_MAX] = {0};
+        __system_property_get("debug.mobiinfer.lm_probe", spec_probe_path);
+        if (spec_probe_path[0] != '\0') {
+            setenv("LM_PROBE", spec_probe_path, 1);
+            LOGi("MiniCPM47 runtime: TEMP-DIAG LM_PROBE=%s", spec_probe_path);
+        }
+    }
+    // TEMP-DIAG: per-tensor activation dump for the vivo-vs-A100 comparison.
+    if (impl->tdump) {
+        setenv("LLAMA_TDUMP", "1", 1);
+        const std::string td = impl->directory + "/tdump.log";
+        setenv("LLAMA_TDUMP_FILE", td.c_str(), 1);
+        LOGi("MiniCPM47 runtime: TEMP-DIAG LLAMA_TDUMP=1");
+    } else {
+        unsetenv("LLAMA_TDUMP");
+    }
     setenv("MB_MEDIA_EMBD_BATCH", "1", 1);
     setenv("LLAMA_DSPARK_MEDIA_FEATURES", "1", 1);
     setenv("LLAMA_DSPARK_TARGET_POSITIONS", "1", 1);
@@ -462,7 +531,7 @@ void MiniCPM47Runtime::submit(const std::string & text, int n_predict) {
     msg.role = "user";
     msg.content = impl->pending_media + text;
     impl->pending_media.clear();
-    impl->last_performance_stats = {0.0, 0.0, 0.0, 0.0, 0.0};
+    impl->last_performance_stats = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     impl->context_truncated = false;
     impl->reasoning_started = false;
     impl->reasoning_closed = false;
@@ -475,6 +544,30 @@ void MiniCPM47Runtime::submit(const std::string & text, int n_predict) {
     inputs.enable_thinking = impl->thinking;
     inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
     auto formatted = common_chat_templates_apply(meta.chat_params.tmpls.get(), inputs);
+    if (impl->raw_prompt) {
+        // A/B path: hand the raw user text to the model, exactly what
+        // `llama-cli -no-cnv -p "<text>"` feeds on the host (no chat template,
+        // no system turn, no assistant prefix). Only for measurement runs.
+        std::string raw;
+        for (const auto & m : impl->messages) {
+            if (m.role == "user") raw = m.content;
+        }
+        formatted.prompt = raw;
+        formatted.parser.clear();
+        LOGi("MiniCPM47 raw-prompt: %zu chars, no chat template", raw.size());
+    }
+    // TEMP-DIAG (prompt_dump=1): write the exact rendered prompt so the host
+    // reference run can be fed byte-identical input via `llama-cli -f`.
+    if (impl->prompt_dump) {
+        const std::string dump_path = impl->directory + "/prompt_dump.txt";
+        FILE * df = fopen(dump_path.c_str(), "wb");
+        if (df) {
+            fwrite(formatted.prompt.data(), 1, formatted.prompt.size(), df);
+            fclose(df);
+            LOGi("MiniCPM47 prompt-dump: %zu bytes -> %s (n_tokens will follow in BENCH)",
+                 formatted.prompt.size(), dump_path.c_str());
+        }
+    }
     impl->reader = std::make_unique<server_response_reader>(impl->server->get_response_reader());
     server_task task(SERVER_TASK_TYPE_COMPLETION);
     task.id = impl->reader->get_new_id();
@@ -536,12 +629,45 @@ std::string MiniCPM47Runtime::next(bool & done) {
             }
         }
         if (auto * final = dynamic_cast<server_task_result_cmpl_final *>(result.get())) {
+            // TEMP-DIAG (logits_dump=1): top-k of the target's LAST PREFLILL row.
+            // Two runs with byte-identical prompts then compare the seeded state:
+            // if these top-k agree, the first-token logits agree, and any later
+            // divergence comes from the decode path, not from prompt processing.
+            llama_context * ctx_tgt = impl->server->get_llama_context();
+            if (impl->logits_dump && ctx_tgt != nullptr) {
+                const float * lg = llama_get_logits_ith(ctx_tgt, -1);
+                if (lg) {
+                    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_tgt)));
+                    std::vector<std::pair<float,int>> top;
+                    top.reserve(8);
+                    for (int i = 0; i < n_vocab; ++i) {
+                        if ((int) top.size() < 8) {
+                            top.push_back({lg[i], i});
+                            if ((int) top.size() == 8) std::make_heap(top.begin(), top.end(), std::greater<>());
+                        } else if (lg[i] > top.front().first) {
+                            std::pop_heap(top.begin(), top.end(), std::greater<>());
+                            top.back() = {lg[i], i};
+                            std::push_heap(top.begin(), top.end(), std::greater<>());
+                        }
+                    }
+                    std::sort(top.begin(), top.end(), [](auto & a, auto & b) { return a.first > b.first; });
+                    char line[512];
+                    std::string out;
+                    for (size_t i = 0; i < top.size(); ++i) {
+                        snprintf(line, sizeof(line), "%d:%.6g ", (int) top[i].second, (double) top[i].first);
+                        out += line;
+                    }
+                    LOGi("MiniCPM47 LOGITS-TOP8 %s", out.c_str());
+                }
+            }
             impl->last_performance_stats = {
                 final->timings.prompt_ms,
                 static_cast<double>(final->timings.prompt_n),
                 final->timings.predicted_ms,
                 static_cast<double>(final->timings.predicted_n),
-                final->timings.vision_encode_ms
+                final->timings.vision_encode_ms,
+                static_cast<double>(final->timings.draft_n),
+                static_cast<double>(final->timings.draft_n_accepted)
             };
             impl->context_truncated = final->truncated;
             const int64_t wall = ggml_time_ms() - impl->request_start;
@@ -617,10 +743,10 @@ void MiniCPM47Runtime::restore(const std::vector<RestoreTurn> & turns) {
 }
 
 void MiniCPM47Runtime::resetPerformanceStats() {
-    impl->last_performance_stats = {0.0, 0.0, 0.0, 0.0, 0.0};
+    impl->last_performance_stats = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
 }
 
-std::array<double, 5> MiniCPM47Runtime::performanceStats() const {
+std::array<double, 7> MiniCPM47Runtime::performanceStats() const {
     return impl->last_performance_stats;
 }
 
