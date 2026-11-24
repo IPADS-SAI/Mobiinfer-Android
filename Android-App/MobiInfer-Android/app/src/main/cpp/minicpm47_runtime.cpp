@@ -306,7 +306,14 @@ MiniCPM47Runtime::MiniCPM47Runtime(const std::string & model, const std::string 
             p.speculative.draft.mparams.path = draft_path;
             p.speculative.draft.n_gpu_layers = 99;
             p.speculative.draft.devices = p.devices;
-            // DFlash is fastest at n_max=5; DSpark keeps the memory-config value.
+            // DSpark keeps the memory-config value; DFlash defaults to n_max=5.
+            // Measured on vivo (Qwen3.5-35B-A3B Q2_K, same prompt, chat template,
+            // thinking=0, temp=0): per-round acceptance falls off with draft length
+            // (n_max=1/3/5/7 -> 85/76/63/45 %) but the accepted tokens per round
+            // (1.00/2.27/3.14/3.16) and the measured decode (17.80/19.27/21.02/19.92
+            // tok/s) both peak at n_max=5, so shorter drafts waste the verify pass
+            // and longer ones rarely land. An explicit runtime.json "draft_n_max"
+            // still overrides this.
             const int default_n_max = spec_type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH
                 ? 5 : memory.draft;
             p.speculative.draft.n_max = cfg_draft_n_max > 0 ? cfg_draft_n_max : default_n_max;
