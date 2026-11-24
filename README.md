@@ -22,18 +22,20 @@
 
 ## 最新动态
 
-- [2026.11.24] 📦 **发布 MobiInfer-Android v0.4.7，Qwen3.5-35B-A3B 增加 Q2_K / Q3_K_M 两档**
-- [2026.11.23] 🚀 **发布 MobiInfer-Android v0.4.6，Q2 tiled 专家包把 35B-A3B 解码推到 31.1 tok/s**
-- [2026.11.11] 🚀 **发布 MobiInfer-Android v0.4.5，MiniCPM-V 4.7 MoE 解码峰值 23.3 tok/s**
-  - ⚡ **跨层专家流水**：专家读盘改走 O_DIRECT，提前 2 层提交 gate 预测（H+2），每专家独立任务队列 + 常驻读线程，把 I/O 藏进计算里；同机同 prompt 解码 23.3 tok/s。
-  - 🧵 **可与其他 App 并行推理**：MoE 推理不要求独占设备，其他应用在前台运行时仍可持续生成，吞吐保持 21.3–21.8 tok/s。
-  - 🧩 **Hexagon v85 支持**：v73 / v75 / v79 / v81 / v85 五份 skel 随包构建；后端同步上游 2026-11-10（repack、算子融合、长上下文 FA）。
-  - 🐛 修复低内存布局被误判导致 vision 回落 CPU、DSpark 关闭的回归；修复退出码 139。
-- [2026.11.02] 🎨 **支持 MOSS-Image 端侧文生图**：9B TE + fp16 5B DiT 在 Hexagon NPU 上运行。
+- [2026.11.24] 📦 发布 **MobiInfer-Android v0.4.7**，Qwen3.5-35B-A3B 三档精度可选，最小 15.1 GB
+- [2026.11.23] 🚀 发布 **MobiInfer-Android v0.4.6**，Q2 tiled 专家包让 35B-A3B 解码达到 31.1 tok/s
+- [2026.11.11] 🚀 发布 **MobiInfer-Android v0.4.5**，MiniCPM-V 4.7 解码 23.3 tok/s，可与其他 App 并行推理
+- [2026.11.02] 🎨 支持 **MOSS-Image 端侧文生图**，9B TE + fp16 5B DiT 在 Hexagon NPU 上运行
+
+<details>
+<summary>更早的更新</summary>
+
 - [2026.10.29] 🛠️ 发布 **MobiInfer-Android v0.3.1-alpha**，改进 Hexagon 内存布局与加载超时处理，补充 v73 skel，并增强映射失败和调试日志诊断。
-- [2026.10.22] 🔥 **Day-0 适配** InternScience 最新 **Sage-A1.5 35B-A3B**在手机上的运行，支持 41 层专家从 HTP tiled 包流式加载。
+- [2026.10.22] 🔥 **Day-0 适配** InternScience 最新 **Sage-A1.5 35B-A3B** 在手机上的运行，支持 41 层专家从 HTP tiled 包流式加载。
 - [2026.10.19] 🛠️ 支持 Qwen3-30B-A3B / Qwen3.5-MoE-35B-A3B，MoE 专家可走外置槽位与 LES。
 - [2026.10.17] 🚀 发布 **MobiInfer-Android v0.1**，支持模型管理、一键下载和端侧 NPU 推理。
+
+</details>
 
 ---
 

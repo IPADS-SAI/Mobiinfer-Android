@@ -22,17 +22,20 @@
 
 ## News
 
-- [2026.11.24] 📦 **MobiInfer-Android v0.4.7: Qwen3.5-35B-A3B gains Q2_K and Q3_K_M tiers**
-- [2026.11.23] 🚀 **MobiInfer-Android v0.4.6: the Q2 tiled expert pack lifts 35B-A3B decode to 31.1 tok/s**
-- [2026.11.11] 🚀 **MobiInfer-Android v0.4.5: MiniCPM-V 4.7 MoE decode peaks at 23.3 tok/s**
-  - ⚡ **Cross-layer expert pipeline**: O_DIRECT expert reads, gate predictions submitted two layers ahead (H+2), one FIFO task per expert with resident reader threads — the I/O is hidden under compute. Same device, same prompt: 23.3 tok/s.
-  - 🧵 **Runs alongside other apps**: MoE inference no longer needs exclusive access; generation keeps going while other apps are in the foreground, at 21.3–21.8 tok/s.
-  - 🧩 **Hexagon v85**: skels for v73 / v75 / v79 / v81 / v85 ship in the APK; backend synced to upstream 2026-11-10 (repack, op fusion, long-context FA).
-  - 🐛 Fixed a low-vmem misdetection that forced vision onto the CPU and silently disabled DSpark; fixed exit code 139.
-- [2026.11.02] 🎨 **On-device text-to-image with MOSS-Image**: 9B TE + fp16 5B DiT running on the Hexagon NPU.
-- [2026.10.22] 🔥 Day-0 support for InternScience's latest Sage-A1.5 35B-A3B, with 41 expert layers streamed from an HTP-tiled bundle.
+- [2026.11.24] 📦 Released **MobiInfer-Android v0.4.7**: Qwen3.5-35B-A3B in three tiers, down to 15.1 GB
+- [2026.11.23] 🚀 Released **MobiInfer-Android v0.4.6**: the Q2 tiled expert pack takes 35B-A3B decode to 31.1 tok/s
+- [2026.11.11] 🚀 Released **MobiInfer-Android v0.4.5**: MiniCPM-V 4.7 decodes at 23.3 tok/s and runs alongside other apps
+- [2026.11.02] 🎨 On-device text-to-image with **MOSS-Image**: 9B TE + fp16 5B DiT running on the Hexagon NPU
+
+<details>
+<summary>Earlier updates</summary>
+
+- [2026.10.29] 🛠️ Released **MobiInfer-Android v0.3.1-alpha** with a revised Hexagon memory layout, load-timeout handling, a v73 skel, and better diagnostics for mapping failures.
+- [2026.10.22] 🔥 **Day-0 support** for InternScience's latest **Sage-A1.5 35B-A3B**, with 41 expert layers streamed from an HTP-tiled bundle.
 - [2026.10.19] 🛠️ Added support for Qwen3-30B-A3B / Qwen3.5-MoE-35B-A3B, with MoE experts using external slots and LES.
-- [2026.10.17] 🚀 Released MobiInfer-Android v0.1 with model management, one-tap downloads, and on-device NPU inference.
+- [2026.10.17] 🚀 Released **MobiInfer-Android v0.1** with model management, one-tap downloads, and on-device NPU inference.
+
+</details>
 
 ---
 
